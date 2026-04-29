@@ -29,17 +29,161 @@ require_root() {
     [[ $EUID -eq 0 ]] || { bad "Must be run as root."; exit 1; }
 }
 
+# Map a binary name to its package name for a given distro family.
+# Prints the package name, or nothing if unknown.
+_pkg_for() {
+    local cmd="$1" family="$2"
+    # Most tools live in util-linux or their own same-named package across distros;
+    # the exceptions are called out explicitly per family below.
+    case "$family" in
+        debian)
+            case "$cmd" in
+                socat|cryptsetup|openssl|mdadm) echo "$cmd" ;;
+                wipefs|lsblk|blkdiscard|findmnt) echo util-linux ;;
+                dmsetup)  echo dmsetup ;;   # own package on Debian/Ubuntu
+                dd|shred) echo coreutils ;;
+            esac ;;
+        arch)
+            case "$cmd" in
+                socat|cryptsetup|openssl|mdadm) echo "$cmd" ;;
+                wipefs|lsblk|blkdiscard|findmnt) echo util-linux ;;
+                dmsetup)  echo device-mapper ;; # part of device-mapper on Arch
+                dd|shred) echo coreutils ;;
+            esac ;;
+        fedora)
+            case "$cmd" in
+                socat|openssl|mdadm) echo "$cmd" ;;
+                cryptsetup) echo cryptsetup ;;
+                wipefs|lsblk|blkdiscard|findmnt) echo util-linux ;;
+                dmsetup)  echo device-mapper ;;
+                dd|shred) echo coreutils ;;
+            esac ;;
+        opensuse)
+            case "$cmd" in
+                socat|cryptsetup|mdadm) echo "$cmd" ;;
+                openssl)  echo libopenssl-devel ;; # CLI lives here on openSUSE
+                wipefs|lsblk|blkdiscard|findmnt) echo util-linux ;;
+                dmsetup)  echo device-mapper ;;
+                dd|shred) echo coreutils ;;
+            esac ;;
+        alpine)
+            case "$cmd" in
+                socat|cryptsetup|openssl|mdadm) echo "$cmd" ;;
+                wipefs|lsblk|findmnt) echo util-linux ;;
+                blkdiscard) echo util-linux-misc ;;
+                dmsetup)  echo lvm2 ;;
+                dd|shred) echo coreutils ;;
+            esac ;;
+        void)
+            case "$cmd" in
+                socat|cryptsetup|openssl|mdadm) echo "$cmd" ;;
+                wipefs|lsblk|blkdiscard|findmnt) echo util-linux ;;
+                dmsetup)  echo device-mapper ;;
+                dd|shred) echo coreutils ;;
+            esac ;;
+        gentoo)
+            # Gentoo uses atoms; give the most direct one
+            case "$cmd" in
+                socat)      echo net-misc/socat ;;
+                cryptsetup) echo sys-fs/cryptsetup ;;
+                wipefs|lsblk|blkdiscard|findmnt|dmsetup) echo sys-apps/util-linux ;;
+                openssl)    echo dev-libs/openssl ;;
+                mdadm)      echo sys-fs/mdadm ;;
+                dd|shred)   echo sys-apps/coreutils ;;
+            esac ;;
+    esac
+}
+
 check_deps() {
-    local missing=()
-    for cmd in socat cryptsetup wipefs dmsetup lsblk openssl dd blkdiscard; do
-        command -v "$cmd" &>/dev/null || missing+=("$cmd")
-    done
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        bad "Missing required tools: ${missing[*]}"
-        echo "  On Debian/Ubuntu:  apt-get install ${missing[*]}" >&2
-        exit 1
+    # Required: wipe chain cannot run without these.
+    local required=(socat cryptsetup wipefs dmsetup lsblk blkdiscard openssl dd findmnt shred)
+    # Optional: only needed when WIPE_ALL_LUKS=true targets RAID arrays.
+    local optional=(mdadm)
+
+    local missing=() missing_opt=()
+    for cmd in "${required[@]}";  do command -v "$cmd" &>/dev/null || missing+=("$cmd");     done
+    for cmd in "${optional[@]}";  do command -v "$cmd" &>/dev/null || missing_opt+=("$cmd"); done
+
+    [[ ${#missing_opt[@]} -gt 0 ]] && \
+        warn "Optional (RAID wipe) tools not found: ${missing_opt[*]}"
+
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        good "All required tools present"
+        return 0
     fi
-    good "All required tools present"
+
+    bad "Missing required tools: ${missing[*]}"
+
+    # ── distro detection ──────────────────────────────────────────────────────
+    local id="" id_like="" family="" pm=""
+    if [[ -f /etc/os-release ]]; then
+        # shellcheck source=/dev/null
+        source /etc/os-release
+        id="${ID:-}"
+        id_like="${ID_LIKE:-}"
+    fi
+
+    # Resolve to a family, checking ID then ID_LIKE (space-separated list)
+    _resolve_family() {
+        local token="$1"
+        case "$token" in
+            debian|ubuntu|linuxmint|pop|elementary|kali|parrot|tails|raspbian)
+                echo debian ;;
+            arch|manjaro|endeavouros|garuda|artix|cachyos|blackarch)
+                echo arch ;;
+            fedora|rhel|centos|rocky|almalinux|ol|scientific)
+                echo fedora ;;
+            opensuse*|sles|sled)
+                echo opensuse ;;
+            alpine)
+                echo alpine ;;
+            void)
+                echo void ;;
+            gentoo)
+                echo gentoo ;;
+        esac
+    }
+
+    family=$(_resolve_family "$id")
+    if [[ -z "$family" ]]; then
+        # Walk ID_LIKE tokens left-to-right until we get a match
+        for token in $id_like; do
+            family=$(_resolve_family "$token")
+            [[ -n "$family" ]] && break
+        done
+    fi
+
+    # ── package manager map ───────────────────────────────────────────────────
+    case "$family" in
+        debian)  pm="apt-get install" ;;
+        arch)    pm="pacman -S" ;;
+        fedora)  pm="dnf install" ;;
+        opensuse) pm="zypper install" ;;
+        alpine)  pm="apk add" ;;
+        void)    pm="xbps-install -S" ;;
+        gentoo)  pm="emerge" ;;
+        *)
+            echo -e "${YLW}  Install the missing tools with your system package manager.${RST}" >&2
+            exit 1
+            ;;
+    esac
+
+    # ── collect unique package names for missing tools ────────────────────────
+    local pkgs=()
+    for cmd in "${missing[@]}"; do
+        local pkg
+        pkg=$(_pkg_for "$cmd" "$family")
+        [[ -n "$pkg" ]] && pkgs+=("$pkg")
+    done
+    # Deduplicate while preserving order
+    local seen="" unique_pkgs=()
+    for p in "${pkgs[@]}"; do
+        [[ "$seen" == *"|${p}|"* ]] && continue
+        seen+="|${p}|"; unique_pkgs+=("$p")
+    done
+
+    echo -e "  ${YLW}Install with:${RST}  ${BLD}${pm} ${unique_pkgs[*]}${RST}" >&2
+    exit 1
 }
 
 # ── install ───────────────────────────────────────────────────────────────────
