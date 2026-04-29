@@ -1,0 +1,21 @@
+[Unit]
+Description=Duressd — LUKS Duress Wipe Service
+Documentation=file:///usr/local/lib/duressd/
+After=basic.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/duressd/daemon
+Restart=on-failure
+RestartSec=5
+
+# Hardening — do NOT add ProtectSystem= or ReadOnlyPaths=; the wipe chain
+# must write to /dev block devices and run cryptsetup/wipefs/dd/mdadm as root.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+RuntimeDirectory=duressd
+RuntimeDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

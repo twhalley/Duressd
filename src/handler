@@ -1,0 +1,460 @@
+#!/bin/bash
+# Per-connection command handler — exec'd by socat with stdin/stdout wired to
+# the Unix socket. Reads one tab-separated command line, streams
+# PROGRESS/OK/ERROR lines back, then exits (closing the connection).
+set -euo pipefail
+trap '' SIGPIPE   # write failures after client disconnect are non-fatal
+
+RUNDIR=/run/duressd
+CFGFILE=/etc/duressd/config
+PASSPHRASE_LUKS=/etc/duressd/passphrase.luks
+LOCKFILE=$RUNDIR/lock
+STATEFILE=$RUNDIR/state
+
+LUKS_PART=/dev/disk/by-partlabel/TailsData
+LUKS_MAP=TailsData_unlocked
+MOUNT=/live/persistence/TailsData_unlocked
+
+# ── I/O helpers ───────────────────────────────────────────────────────────────
+prog()  { printf 'PROGRESS\t%s\t%s\n' "$1" "$2"; }
+ok()    { printf 'OK\t%s\n' "$*"; }
+die()   { printf 'ERROR\t%s\n' "$*"; exit 1; }
+
+get_state() { cat "$STATEFILE" 2>/dev/null || echo IDLE; }
+set_state() { echo "$1" > "$STATEFILE"; }
+
+load_config() {
+    [[ -f "$CFGFILE" ]] || return 1
+    # shellcheck source=/dev/null
+    source "$CFGFILE"
+}
+
+# ── passphrase verification ───────────────────────────────────────────────────
+# Argon2id via LUKS2 container — cryptsetup is already a hard dependency,
+# so this costs zero extra packages. The container stores one keyslot whose
+# KDF is argon2id; --test-passphrase runs the full KDF + verification.
+verify_luks() {
+    local pass="$1"
+    printf '%s' "$pass" | cryptsetup open --test-passphrase \
+        --key-file=- "$LUKS_PART" 2>/dev/null
+}
+
+verify_custom() {
+    local pass="$1"
+    [[ -f "$PASSPHRASE_LUKS" ]] || return 1
+    printf '%s' "$pass" | cryptsetup open --test-passphrase \
+        --key-file=- "$PASSPHRASE_LUKS" 2>/dev/null
+}
+
+verify_passphrase() {
+    local pass="$1"
+    case "${PASSWORD_TYPE:-}" in
+        luks)   verify_luks   "$pass" ;;
+        custom) verify_custom "$pass" ;;
+        *)      return 1 ;;
+    esac
+}
+
+# ── Argon2id keyslot bootstrap ────────────────────────────────────────────────
+# Creates an 8 MiB LUKS2 file-container whose sole purpose is to hold the
+# Argon2id keyslot for the custom duress passphrase.  8 MiB covers the default
+# LUKS2 header (4 MiB metadata + 4 MiB keyslots area) with nothing left for
+# data, which is exactly what we want.
+create_passphrase_luks() {
+    local pass="$1"
+    dd if=/dev/zero of="$PASSPHRASE_LUKS" bs=1M count=8 2>/dev/null
+    chmod 0600 "$PASSPHRASE_LUKS"
+    printf '%s' "$pass" | cryptsetup luksFormat \
+        --type luks2 --batch-mode \
+        --pbkdf argon2id \
+        --pbkdf-memory 131072 \
+        --pbkdf-time 3 \
+        --key-file=- \
+        "$PASSPHRASE_LUKS" 2>/dev/null
+}
+
+destroy_passphrase_luks() {
+    [[ -f "$PASSPHRASE_LUKS" ]] || return 0
+    cryptsetup luksErase --batch-mode "$PASSPHRASE_LUKS" 2>/dev/null || true
+    shred -u "$PASSPHRASE_LUKS" 2>/dev/null || rm -f "$PASSPHRASE_LUKS"
+}
+
+# ── device helpers ────────────────────────────────────────────────────────────
+get_parent_dev() {
+    local real_part
+    real_part=$(readlink -f "$LUKS_PART")
+    lsblk -ndo pkname "$real_part"
+}
+
+get_wipe_blocks() {
+    local part="$1"
+    local start size
+    read -r start size < <(lsblk -nbdo START,SIZE "$part")
+    local end_bytes=$(( start * 512 + size ))
+    echo $(( (end_bytes + 4*1024*1024 - 1) / (4*1024*1024) ))
+}
+
+# ── fast random write (AES-NI via openssl, 5-10x faster than /dev/urandom) ───
+rand_write() {
+    local dest="$1" seek="$2" count="$3"
+    local bytes=$(( count * 4 * 1024 * 1024 ))
+    openssl rand "$bytes" 2>/dev/null \
+        | dd of="$dest" bs=4M seek="$seek" count="$count" conv=fdatasync 2>/dev/null
+}
+
+# ── wipe phases ───────────────────────────────────────────────────────────────
+
+# Phase 1 — always: cryptographic destruction of TailsData persistence.
+# After luksErase the volume key is gone; plaintext is irrecoverable.
+phase1_persistence() {
+    umount --lazy "$MOUNT"                          2>/dev/null || true
+    # dmsetup --force: cryptsetup close fails with "device in use" after lazy
+    # umount; force-removes the dm-crypt target so nothing can read through it.
+    dmsetup remove --force "$LUKS_MAP"              2>/dev/null || true
+    wipefs -a "$LUKS_PART"
+    # luksErase may fail if wipefs already zeroed the LUKS magic — that is fine,
+    # the header is already gone; belt-and-suspenders only.
+    cryptsetup luksErase --batch-mode "$LUKS_PART"  2>/dev/null || true
+}
+
+# Phase 2 — optional: overwrite first 40 MiB of the LUKS partition with
+# crypto-random (plausible deniability, skipped when Phase 3B runs).
+phase2_overwrite_header() {
+    local part="$1"
+    rand_write "$part" 0 10
+    blkdiscard "$part" 2>/dev/null || true
+}
+
+# Phase 3A — optional: chunked random overwrite of the full USB device up to
+# the end of TailsData, then a full-device TRIM.
+phase3a_wipe_usb() {
+    local dev="$1" part="$2"
+    local total_blocks chunk=32 written=0 offset=0
+    total_blocks=$(get_wipe_blocks "$part")
+
+    wipefs -a "$dev"
+
+    while (( written < total_blocks )); do
+        local count=$(( total_blocks - written ))
+        (( count > chunk )) && count=$chunk
+        rand_write "$dev" "$offset" "$count"
+        written=$(( written + count ))
+        offset=$(( offset + count ))
+        prog $(( 40 + written * 50 / total_blocks )) "Wiping USB — block $written/$total_blocks"
+    done
+
+    blkdiscard "$dev" 2>/dev/null || true
+}
+
+# Phase 3B — optional: discover and wipe EVERY LUKS container on the system,
+# including containers on software RAID arrays (md devices), LVM volumes, and
+# loop devices.  Works by asking lsblk for the full device tree, checking each
+# node with `cryptsetup isLuks`, then running wipefs + luksErase + random
+# header overwrite on each one found.  After that, stops any remaining RAID
+# arrays and wipes their members' RAID superblocks so they cannot be reassembled.
+phase3b_wipe_all_luks() {
+    # Step 1 — tear down every active dm-crypt mapping so no device is "in use"
+    prog 30 "Closing all active dm-crypt mappings"
+    while IFS=$'\t' read -r name _; do
+        [[ -z "$name" ]] && continue
+        local mp
+        mp=$(findmnt -n -o TARGET --source "/dev/mapper/$name" 2>/dev/null || true)
+        [[ -n "$mp" ]] && umount --lazy "$mp" 2>/dev/null || true
+        dmsetup remove --force "$name" 2>/dev/null || true
+    done < <(dmsetup ls --target crypt 2>/dev/null)
+
+    # Step 2 — scan the full device tree (partitions, md arrays, LVM, loops …)
+    prog 35 "Scanning all block devices for LUKS headers"
+    local -a luks_devs=()
+    while IFS= read -r dev; do
+        [[ -b "$dev" ]] || continue
+        cryptsetup isLuks "$dev" 2>/dev/null && luks_devs+=("$dev")
+    done < <(lsblk -lnpo NAME 2>/dev/null)
+
+    local total=${#luks_devs[@]}
+    prog 40 "Found $total LUKS container(s)${luks_devs[*]:+: ${luks_devs[*]}}"
+
+    # Step 3 — wipe each container: wipefs destroys signatures, luksErase
+    # destroys all keyslots, random write clobbers the header region on-device.
+    local i=0
+    for dev in "${luks_devs[@]}"; do
+        (( i++ ))
+        local pct=$(( 40 + i * 40 / ( total > 0 ? total : 1 ) ))
+        prog "$pct" "[$i/$total] wipefs + luksErase + rand-overwrite: $dev"
+        wipefs -a "$dev"                                        2>/dev/null || true
+        cryptsetup luksErase --batch-mode "$dev"                2>/dev/null || true
+        openssl rand $(( 8 * 1024 * 1024 )) 2>/dev/null \
+            | dd of="$dev" bs=4M count=2 conv=fdatasync         2>/dev/null || true
+    done
+
+    # Step 4 — stop software RAID arrays so member drives become accessible
+    prog 82 "Stopping software RAID arrays"
+    local -a md_devs=()
+    while IFS= read -r dev; do
+        [[ "$dev" =~ ^/dev/md ]] && [[ -b "$dev" ]] && md_devs+=("$dev")
+    done < <(lsblk -lnpo NAME 2>/dev/null)
+    for md in "${md_devs[@]:-}"; do
+        [[ -b "$md" ]] || continue
+        mdadm --stop "$md" 2>/dev/null || true
+        wipefs -a "$md"    2>/dev/null || true
+    done
+
+    # Step 5 — wipe RAID superblocks on raw member drives; without this the
+    # array can be reconstructed by mdadm --assemble --scan after reboot.
+    prog 90 "Wiping RAID member superblocks"
+    while IFS= read -r dev; do
+        [[ -b "$dev" ]] || continue
+        local fstype
+        fstype=$(lsblk -ndo FSTYPE "$dev" 2>/dev/null || true)
+        [[ "$fstype" == "linux_raid_member" ]] && wipefs -a "$dev" 2>/dev/null || true
+    done < <(lsblk -lnpo NAME 2>/dev/null)
+
+    prog 95 "All LUKS containers wiped"
+}
+
+# Phase 4 — shutdown: sync, then ask systemd to power off with double --force
+# so it calls reboot(RB_POWER_OFF) directly rather than doing a graceful
+# shutdown sequence that would try to stop this very daemon.
+phase4_poweroff() {
+    sync
+    systemctl poweroff --force --force &
+    sleep 3
+    # Last resort — SysRq 'o' triggers an immediate hardware power-off
+    # that bypasses every layer of userspace.
+    echo o > /proc/sysrq-trigger 2>/dev/null || true
+}
+
+# ── wipe_real ─────────────────────────────────────────────────────────────────
+wipe_real() {
+    local parent_dev real_part
+    parent_dev=$(get_parent_dev)
+    real_part=$(readlink -f "$LUKS_PART")
+
+    set_state WIPING
+
+    prog 5 "Phase 1 — destroying TailsData persistence"
+    phase1_persistence
+
+    if [[ "${WIPE_ALL_LUKS:-false}" == true ]]; then
+        prog 25 "Phase 3B — wiping all LUKS containers system-wide"
+        phase3b_wipe_all_luks
+    else
+        if [[ "${OVERWRITE_LUKS_HEADER:-false}" == true \
+           && "${WIPE_FULL_USB:-false}" != true ]]; then
+            prog 25 "Phase 2 — overwriting LUKS header"
+            phase2_overwrite_header "$real_part"
+        fi
+        if [[ "${WIPE_FULL_USB:-false}" == true ]]; then
+            prog 35 "Phase 3A — wiping full USB device"
+            phase3a_wipe_usb "/dev/${parent_dev}" "$real_part"
+        fi
+    fi
+
+    prog 99 "Phase 4 — sync and power off"
+    set_state DONE
+    phase4_poweroff
+}
+
+# ── wipe_test — exercises the full chain on a throwaway LUKS container ────────
+wipe_test() {
+    local tmpfile
+    tmpfile=$(mktemp /tmp/duressd-test-XXXXXX)
+    local test_pass
+    test_pass=$(openssl rand -hex 16)
+
+    set_state TESTING
+
+    prog 10 "TEST: allocating 10 MiB scratch container"
+    dd if=/dev/zero of="$tmpfile" bs=1M count=10 2>/dev/null
+    printf '%s' "$test_pass" | cryptsetup luksFormat --batch-mode \
+        --type luks2 --key-file=- "$tmpfile" 2>/dev/null
+
+    # luksErase BEFORE wipefs in test mode — wipefs nukes the LUKS magic first
+    # and cryptsetup would then hang looking for a header that no longer exists.
+    prog 40 "TEST: running luksErase on scratch container"
+    printf '%s' "$test_pass" | cryptsetup luksErase --batch-mode \
+        --key-file=- "$tmpfile" 2>/dev/null
+
+    prog 70 "TEST: running wipefs on scratch container"
+    wipefs -a "$tmpfile" 2>/dev/null
+
+    prog 90 "TEST: cleaning up"
+    rm -f "$tmpfile"
+    set_state IDLE
+    prog 100 "TEST_COMPLETE"
+}
+
+# ── command handlers ──────────────────────────────────────────────────────────
+cmd_status() {
+    local state configured=false
+    local wipe_full_usb=false overwrite=false password_type=none wipe_all_luks=false
+    state=$(get_state)
+
+    if load_config 2>/dev/null; then
+        configured="${CONFIGURED:-false}"
+        wipe_full_usb="${WIPE_FULL_USB:-false}"
+        overwrite="${OVERWRITE_LUKS_HEADER:-false}"
+        password_type="${PASSWORD_TYPE:-none}"
+        wipe_all_luks="${WIPE_ALL_LUKS:-false}"
+    fi
+
+    ok "state=${state}" \
+       "configured=${configured}" \
+       "password_type=${password_type}" \
+       "wipe_full_usb=${wipe_full_usb}" \
+       "overwrite_luks_header=${overwrite}" \
+       "wipe_all_luks=${wipe_all_luks}"
+}
+
+cmd_configure() {
+    # argv: b64(luks_pass) b64(type) b64(duress_pass) wipe_full_usb overwrite wipe_all_luks
+    local luks_pass password_type duress_pass wipe_full_usb overwrite wipe_all_luks
+    luks_pass=$(printf '%s'     "${argv[0]}" | base64 -d)
+    password_type=$(printf '%s' "${argv[1]}" | base64 -d)
+    duress_pass=$(printf '%s'   "${argv[2]}" | base64 -d)
+    wipe_full_usb="${argv[3]}"
+    overwrite="${argv[4]}"
+    wipe_all_luks="${argv[5]}"
+
+    prog 10 "Verifying LUKS passphrase"
+    verify_luks "$luks_pass" || die "LUKS passphrase incorrect"
+
+    install -d -m 0700 -o root -g root /etc/duressd
+
+    if [[ "$password_type" == custom ]]; then
+        prog 40 "Hashing custom passphrase with Argon2id (this takes ~3 s)"
+        create_passphrase_luks "$duress_pass"
+    else
+        destroy_passphrase_luks
+    fi
+
+    prog 80 "Writing configuration"
+    cat > "$CFGFILE" <<EOF
+CONFIGURED=true
+PASSWORD_TYPE=${password_type}
+WIPE_FULL_USB=${wipe_full_usb}
+OVERWRITE_LUKS_HEADER=${overwrite}
+WIPE_ALL_LUKS=${wipe_all_luks}
+EOF
+    chmod 0600 "$CFGFILE"
+
+    prog 100 "PREP_COMPLETE"
+    ok "Configured"
+}
+
+cmd_unconfigure() {
+    local luks_pass
+    luks_pass=$(printf '%s' "${argv[0]}" | base64 -d)
+    verify_luks "$luks_pass" || die "LUKS passphrase incorrect"
+
+    prog 30 "Erasing Argon2id keyslot container"
+    destroy_passphrase_luks
+    prog 70 "Removing configuration"
+    rm -f "$CFGFILE"
+    ok "Configuration removed"
+}
+
+cmd_scan_luks() {
+    prog 5 "Scanning all block devices for LUKS headers"
+    local -a found=()
+    while IFS= read -r dev; do
+        [[ -b "$dev" ]] || continue
+        if cryptsetup isLuks "$dev" 2>/dev/null; then
+            found+=("$dev")
+            prog 50 "Found: $dev"
+        fi
+    done < <(lsblk -lnpo NAME 2>/dev/null)
+
+    local count=${#found[@]}
+    prog 100 "Scan complete — $count LUKS container(s) found"
+    ok "count=${count} devices=${found[*]:-none}"
+}
+
+cmd_wipe_unused() {
+    local luks_pass
+    luks_pass=$(printf '%s' "${argv[0]}" | base64 -d)
+    verify_luks "$luks_pass" || die "LUKS passphrase incorrect"
+
+    set_state PREP_WIPING
+    prog 0 "Filling unused persistence space with zeros"
+
+    local mountpoint
+    mountpoint=$(findmnt -n -o TARGET --source "/dev/mapper/${LUKS_MAP}" 2>/dev/null \
+                 || echo "$MOUNT")
+    local tmpfile="$mountpoint/.duressd-wipe-$$"
+
+    dd if=/dev/zero of="$tmpfile" bs=4M 2>/dev/null || true
+    sync
+    rm -f "$tmpfile"
+    sync
+
+    set_state IDLE
+    prog 100 "PREP_COMPLETE"
+    ok "Unused space wiped"
+}
+
+# ── lock acquisition ──────────────────────────────────────────────────────────
+acquire_lock() {
+    exec 9>"$LOCKFILE"
+    flock -n 9 || die "Service busy (state: $(get_state))"
+}
+
+# ── dispatch ──────────────────────────────────────────────────────────────────
+IFS= read -r -t 30 line || die "Read timeout"
+IFS=$'\t' read -ra parts <<< "$line"
+cmd="${parts[0]:-}"
+argv=("${parts[@]:1}")
+
+case "$cmd" in
+    STATUS)
+        cmd_status
+        ;;
+
+    TRIGGER)
+        [[ "${#argv[@]}" -ge 1 ]] || die "Missing passphrase"
+        pass=$(printf '%s' "${argv[0]}" | base64 -d)
+        prog 0 "Verifying passphrase"
+        load_config || die "Not configured"
+        verify_passphrase "$pass" || die "Passphrase incorrect"
+        acquire_lock
+        prog 3 "Passphrase accepted — starting destructive wipe"
+        wipe_real
+        ;;
+
+    TRIGGER_TEST)
+        [[ "${#argv[@]}" -ge 1 ]] || die "Missing passphrase"
+        pass=$(printf '%s' "${argv[0]}" | base64 -d)
+        prog 0 "Verifying passphrase"
+        load_config || die "Not configured"
+        verify_passphrase "$pass" || die "Passphrase incorrect"
+        acquire_lock
+        wipe_test
+        ok "Test complete — all phases passed"
+        ;;
+
+    CONFIGURE)
+        [[ "${#argv[@]}" -ge 6 ]] || die "Expected 6 arguments"
+        acquire_lock
+        cmd_configure
+        ;;
+
+    UNCONFIGURE)
+        [[ "${#argv[@]}" -ge 1 ]] || die "Missing passphrase"
+        acquire_lock
+        cmd_unconfigure
+        ;;
+
+    SCAN_LUKS)
+        cmd_scan_luks
+        ;;
+
+    WIPE_UNUSED)
+        [[ "${#argv[@]}" -ge 1 ]] || die "Missing passphrase"
+        acquire_lock
+        cmd_wipe_unused
+        ;;
+
+    *)
+        die "Unknown command: ${cmd}"
+        ;;
+esac

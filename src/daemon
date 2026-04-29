@@ -1,0 +1,16 @@
+#!/bin/bash
+# Entry point — run by systemd. Creates the Unix socket and forks a handler
+# subprocess per client connection via socat.
+set -euo pipefail
+
+RUNDIR=/run/duressd
+SOCKET=$RUNDIR/control.sock
+LIBDIR=/usr/local/lib/duressd
+
+install -d -m 0700 -o root -g root "$RUNDIR"
+rm -f "$SOCKET"
+echo IDLE > "$RUNDIR/state"
+
+exec socat \
+    "UNIX-LISTEN:${SOCKET},fork,mode=0600,unlink-close=0" \
+    "EXEC:${LIBDIR}/handler,nofork"

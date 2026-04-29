@@ -1,0 +1,426 @@
+#!/bin/bash
+# duressd — interactive CLI for the duressd wipe daemon.
+# Subcommand:  duressd <command>
+# Interactive: duressd  (no args → menu)
+set -euo pipefail
+
+SOCKET=/run/duressd/control.sock
+SERVICE=duressd
+
+# ── colours ───────────────────────────────────────────────────────────────────
+if [[ -t 2 ]]; then
+    RED=$'\033[1;31m'   YLW=$'\033[1;33m'   GRN=$'\033[1;32m'
+    CYN=$'\033[1;36m'   BLU=$'\033[1;34m'   MAG=$'\033[1;35m'
+    DIM=$'\033[2m'      BLD=$'\033[1m'       RST=$'\033[0m'
+else
+    RED='' YLW='' GRN='' CYN='' BLU='' MAG='' DIM='' BLD='' RST=''
+fi
+
+# ── banners ───────────────────────────────────────────────────────────────────
+banner_test() {
+    echo >&2
+    echo -e "${GRN}╔══════════════════════════════════════════╗${RST}" >&2
+    echo -e "${GRN}║       TEST MODE  —  NON-DESTRUCTIVE      ║${RST}" >&2
+    echo -e "${GRN}║   No real data will be touched.          ║${RST}" >&2
+    echo -e "${GRN}╚══════════════════════════════════════════╝${RST}" >&2
+    echo >&2
+}
+
+banner_real() {
+    echo >&2
+    echo -e "${RED}╔══════════════════════════════════════════╗${RST}" >&2
+    echo -e "${RED}║  ⚠   REAL WIPE  —  FULLY DESTRUCTIVE  ⚠ ║${RST}" >&2
+    echo -e "${RED}║  All LUKS data will be permanently       ║${RST}" >&2
+    echo -e "${RED}║  destroyed and the system powered off.   ║${RST}" >&2
+    echo -e "${RED}╚══════════════════════════════════════════╝${RST}" >&2
+    echo >&2
+}
+
+banner_header() {
+    echo -e "${BLU}${BLD}" >&2
+    echo "  ██████╗ ██╗   ██╗██████╗ ███████╗███████╗███████╗██████╗ " >&2
+    echo "  ██╔══██╗██║   ██║██╔══██╗██╔════╝██╔════╝██╔════╝██╔══██╗" >&2
+    echo "  ██║  ██║██║   ██║██████╔╝█████╗  ███████╗███████╗██║  ██║" >&2
+    echo "  ██║  ██║██║   ██║██╔══██╗██╔══╝  ╚════██║╚════██║██║  ██║" >&2
+    echo "  ██████╔╝╚██████╔╝██║  ██║███████╗███████║███████║██████╔╝" >&2
+    echo "  ╚═════╝  ╚═════╝ ╚═╝  ╚═╝╚══════╝╚══════╝╚══════╝╚═════╝ " >&2
+    echo -e "${RST}" >&2
+}
+
+# ── progress bar ──────────────────────────────────────────────────────────────
+# render_progress <color> <pct> <msg>
+render_progress() {
+    local color="$1" pct="$2" msg="$3"
+    local width=35 filled empty bar=""
+    filled=$(( pct * width / 100 ))
+    empty=$(( width - filled ))
+    local i
+    for (( i=0; i<filled; i++ )); do bar+="█"; done
+    for (( i=0; i<empty;  i++ )); do bar+="░"; done
+    printf '\r  %s[%s]%s %3d%%  %s%-45s%s' \
+        "$color" "$bar" "$RST" "$pct" "$DIM" "$msg" "$RST" >&2
+}
+
+# ── low-level transport ───────────────────────────────────────────────────────
+# send_cmd <color> <CMD> [args…]
+# Streams response lines; renders progress in-place; returns 0 on OK, 1 on ERROR.
+send_cmd() {
+    local color="$1"; shift
+    local cmd="$1";   shift
+    local line="$cmd"
+    for arg; do line+=$'\t'"$arg"; done
+
+    if [[ ! -S "$SOCKET" ]]; then
+        echo -e "${RED}Error:${RST} daemon socket not found at $SOCKET" >&2
+        echo -e "${DIM}  Is the service running?  systemctl status ${SERVICE}${RST}" >&2
+        return 1
+    fi
+
+    local rc=0 last_pct=0
+    while IFS=$'\t' read -r type rest; do
+        case "$type" in
+            PROGRESS)
+                local pct="${rest%%$'\t'*}"
+                local msg="${rest#*$'\t'}"
+                last_pct="$pct"
+                render_progress "$color" "$pct" "$msg"
+                ;;
+            OK)
+                render_progress "$color" 100 "Done"
+                printf '\n' >&2
+                echo -e "${color}  ✔  ${RST}${rest}" >&2
+                echo "$rest"   # stdout for callers who need to parse it
+                ;;
+            ERROR)
+                printf '\n' >&2
+                echo -e "${RED}  ✘  Error: ${rest}${RST}" >&2
+                rc=1
+                ;;
+        esac
+    done < <(printf '%s\n' "$line" | socat - "UNIX-CONNECT:${SOCKET}" 2>/dev/null)
+
+    return $rc
+}
+
+b64()      { printf '%s' "$1" | base64 -w0; }
+yn_bool()  { [[ "$1" =~ ^[Yy]$ ]] && echo true || echo false; }
+
+read_pass() {
+    local prompt="$1"
+    local pass
+    printf '%s' "${DIM}" >&2
+    IFS= read -rsp "  $prompt" pass
+    printf '%s\n' "${RST}" >&2
+    printf '%s' "$pass"
+}
+
+ask() {
+    local prompt="$1" default="${2:-}"
+    local ans
+    printf '%s' "${BLD}" >&2
+    read -rp "  $prompt" ans
+    printf '%s' "${RST}" >&2
+    echo "$ans"
+}
+
+section() { echo -e "\n${CYN}▶  $*${RST}" >&2; }
+info()    { echo -e "${DIM}  $*${RST}" >&2; }
+warn()    { echo -e "${YLW}  ⚠  $*${RST}" >&2; }
+good()    { echo -e "${GRN}  ✔  $*${RST}" >&2; }
+bad()     { echo -e "${RED}  ✘  $*${RST}" >&2; }
+
+# ── subcommands ───────────────────────────────────────────────────────────────
+cmd_status() {
+    section "Daemon status"
+    local result
+    result=$(send_cmd "$CYN" STATUS) || return 1
+
+    local state cfgd pt wfu olh wal
+    for pair in $result; do
+        case "${pair%%=*}" in
+            state)               state="${pair#*=}" ;;
+            configured)          cfgd="${pair#*=}" ;;
+            password_type)       pt="${pair#*=}" ;;
+            wipe_full_usb)       wfu="${pair#*=}" ;;
+            overwrite_luks_header) olh="${pair#*=}" ;;
+            wipe_all_luks)       wal="${pair#*=}" ;;
+        esac
+    done
+
+    local state_color="$GRN"
+    [[ "${state:-IDLE}" == WIPING ]] && state_color="$RED"
+    [[ "${state:-IDLE}" == TESTING ]] && state_color="$YLW"
+
+    echo >&2
+    printf '  %-28s %s\n' "State:" \
+        "${state_color}${BLD}${state:-IDLE}${RST}" >&2
+    printf '  %-28s %s\n' "Configured:" \
+        "$( [[ "${cfgd:-false}" == true ]] && echo "${GRN}yes${RST}" || echo "${RED}no${RST}" )" >&2
+    printf '  %-28s %s\n' "Password type:"          "${pt:-none}" >&2
+    printf '  %-28s %s\n' "Wipe full USB:"          "${wfu:-false}" >&2
+    printf '  %-28s %s\n' "Overwrite LUKS header:"  "${olh:-false}" >&2
+    printf '  %-28s %s\n' "Wipe all LUKS on system:""${wal:-false}" >&2
+    echo >&2
+}
+
+cmd_configure() {
+    section "Configure Duress Wipe"
+    echo >&2
+
+    local luks_pass
+    luks_pass=$(read_pass "LUKS admin passphrase: ")
+
+    echo >&2
+    info "Password type for the duress trigger:"
+    info "  1) Use LUKS passphrase itself  (same key = trigger)"
+    info "  2) Separate custom passphrase  (Argon2id — recommended)"
+    local choice
+    choice=$(ask "Choice [1/2]: ")
+
+    local password_type="" duress_pass=""
+    case "$choice" in
+        1)
+            password_type=luks
+            good "Password type: LUKS passphrase"
+            ;;
+        2)
+            password_type=custom
+            duress_pass=$(read_pass "Duress passphrase: ")
+            local confirm
+            confirm=$(read_pass "Confirm duress passphrase: ")
+            if [[ "$duress_pass" != "$confirm" ]]; then
+                bad "Passphrases do not match."; return 1
+            fi
+            good "Password type: custom (will be hashed with Argon2id)"
+            ;;
+        *)
+            bad "Invalid choice."; return 1
+            ;;
+    esac
+
+    echo >&2
+    info "Wipe options:"
+    local overwrite_luks_header wipe_full_usb wipe_all_luks
+    overwrite_luks_header=$(yn_bool "$(ask "Overwrite LUKS header with random data?     [y/N]: ")")
+    wipe_full_usb=$(yn_bool         "$(ask "Wipe entire USB device?  (slower)            [y/N]: ")")
+    wipe_all_luks=$(yn_bool         "$(ask "Wipe ALL LUKS containers on system? (RAID…)  [y/N]: ")")
+
+    [[ "$wipe_all_luks" == true ]] && \
+        warn "Wipe-all will destroy every LUKS container found (md, LVM, loop, …)"
+
+    echo >&2
+    info "Sending configuration to daemon…"
+    send_cmd "$CYN" CONFIGURE \
+        "$(b64 "$luks_pass")" \
+        "$(b64 "$password_type")" \
+        "$(b64 "$duress_pass")" \
+        "$wipe_full_usb" \
+        "$overwrite_luks_header" \
+        "$wipe_all_luks"
+}
+
+cmd_unconfigure() {
+    section "Remove Duress Configuration"
+    local luks_pass
+    luks_pass=$(read_pass "LUKS admin passphrase: ")
+    echo >&2
+    send_cmd "$YLW" UNCONFIGURE "$(b64 "$luks_pass")"
+}
+
+# ── test mode (green) ─────────────────────────────────────────────────────────
+# Also available as alias: dwipe_test
+cmd_test() {
+    banner_test
+    section "Test Wipe — dry run"
+    info "Creates a 10 MiB throwaway LUKS2 container and runs the full"
+    info "wipe chain (luksErase → wipefs) on it.  Your real data is safe."
+    echo >&2
+
+    local pass
+    pass=$(read_pass "Duress passphrase: ")
+    echo >&2
+    send_cmd "$GRN" TRIGGER_TEST "$(b64 "$pass")"
+}
+
+# ── real wipe (red) ───────────────────────────────────────────────────────────
+# Also available as alias: dwipe_real
+cmd_trigger() {
+    banner_real
+    section "Destructive Wipe"
+    warn "This will PERMANENTLY DESTROY all persistence data."
+    warn "The system will power off immediately when done."
+    warn "This CANNOT be undone."
+    echo >&2
+
+    local confirm
+    confirm=$(ask "Type ${RED}${BLD}WIPE${RST} to confirm: ")
+    if [[ "$confirm" != "WIPE" ]]; then
+        info "Aborted."; return 1
+    fi
+
+    local pass
+    pass=$(read_pass "Duress passphrase: ")
+    echo >&2
+    echo -e "${RED}${BLD}Starting wipe — system will power off when complete.${RST}" >&2
+    echo >&2
+    send_cmd "$RED" TRIGGER "$(b64 "$pass")"
+}
+
+cmd_wipe_unused() {
+    section "Wipe Unused Persistence Space"
+    info "Fills all free space in the persistence volume with zeros"
+    info "so deleted files cannot be recovered from unallocated sectors."
+    echo >&2
+    local luks_pass
+    luks_pass=$(read_pass "LUKS admin passphrase: ")
+    echo >&2
+    send_cmd "$CYN" WIPE_UNUSED "$(b64 "$luks_pass")"
+}
+
+cmd_scan() {
+    section "Scan system for LUKS containers"
+    info "Checks every block device (partitions, md RAID, LVM, loop…)"
+    info "and lists any that contain a LUKS header."
+    echo >&2
+    local result
+    result=$(send_cmd "$CYN" SCAN_LUKS) || return 1
+    echo >&2
+    local count devs
+    for pair in $result; do
+        case "${pair%%=*}" in
+            count)   count="${pair#*=}" ;;
+            devices) devs="${pair#*=}" ;;
+        esac
+    done
+    echo -e "  Found ${BLD}${count:-0}${RST} LUKS container(s): ${devs:-none}" >&2
+    echo >&2
+}
+
+# ── desktop shortcuts ─────────────────────────────────────────────────────────
+cmd_install_shortcuts() {
+    local desktop_dir="${HOME:-/root}/Desktop"
+    install -d "$desktop_dir"
+
+    # Test shortcut — green icon via category hint
+    cat > "$desktop_dir/duressd-test.desktop" <<'DESK'
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Duress — TEST Wipe
+GenericName=Duress Test
+Comment=Non-destructive dry run of the wipe chain (safe)
+Exec=x-terminal-emulator -e sh -c 'duressd test; read -rp "Press Enter to close" _'
+Icon=security-high
+Terminal=false
+Categories=Security;System;
+Keywords=wipe;luks;duress;test;
+DESK
+    chmod +x "$desktop_dir/duressd-test.desktop"
+
+    # Real wipe shortcut — warning icon
+    cat > "$desktop_dir/duressd-wipe.desktop" <<'DESK'
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Duress — REAL Wipe
+GenericName=Duress Real Wipe
+Comment=DESTRUCTIVE: permanently wipes LUKS persistence and powers off
+Exec=x-terminal-emulator -e sh -c 'duressd trigger; read -rp "Press Enter to close" _'
+Icon=security-low
+Terminal=false
+Categories=Security;System;
+Keywords=wipe;luks;duress;destroy;
+DESK
+    chmod +x "$desktop_dir/duressd-wipe.desktop"
+
+    good "Shortcuts written to $desktop_dir/"
+    info "  duressd-test.desktop  — green / non-destructive"
+    info "  duressd-wipe.desktop  — red   / destructive"
+}
+
+# ── service management ────────────────────────────────────────────────────────
+cmd_service() {
+    local action="${1:-status}"
+    section "Service: systemctl $action $SERVICE"
+    systemctl "$action" "$SERVICE"
+}
+
+# ── interactive menu ──────────────────────────────────────────────────────────
+cmd_menu() {
+    banner_header
+    while true; do
+        echo -e "${BLD}  Duress Wipe Service${RST}" >&2
+        echo -e "  ${DIM}$(systemctl is-active "$SERVICE" 2>/dev/null \
+            && echo "daemon running" || echo "daemon not running")${RST}" >&2
+        echo >&2
+        echo -e "  ${CYN}1${RST}  Status" >&2
+        echo -e "  ${CYN}2${RST}  Configure" >&2
+        echo -e "  ${CYN}3${RST}  Unconfigure" >&2
+        echo -e "  ${GRN}4${RST}  ${GRN}${BLD}Test wipe${RST}  ${DIM}(dry run — non-destructive)${RST}" >&2
+        echo -e "  ${CYN}5${RST}  Wipe unused space" >&2
+        echo -e "  ${CYN}6${RST}  Scan for LUKS containers" >&2
+        echo -e "  ${CYN}7${RST}  Install desktop shortcuts" >&2
+        echo -e "  ${RED}8${RST}  ${RED}${BLD}TRIGGER REAL WIPE${RST}  ${DIM}(destructive — powers off)${RST}" >&2
+        echo -e "  ${DIM}q  Quit${RST}" >&2
+        echo >&2
+        local choice
+        choice=$(ask "Choice: ")
+        case "$choice" in
+            1) cmd_status ;;
+            2) cmd_configure ;;
+            3) cmd_unconfigure ;;
+            4) cmd_test ;;
+            5) cmd_wipe_unused ;;
+            6) cmd_scan ;;
+            7) cmd_install_shortcuts ;;
+            8) cmd_trigger ;;
+            q|Q) echo >&2; exit 0 ;;
+            *) bad "Invalid choice." ;;
+        esac
+    done
+}
+
+# ── usage ─────────────────────────────────────────────────────────────────────
+usage() {
+    cat >&2 <<EOF
+
+${BLD}Usage:${RST} duressd [COMMAND]
+
+${BLD}Commands:${RST}
+  ${CYN}status${RST}               Show daemon state and configuration
+  ${CYN}configure${RST}            Set up duress passphrase and wipe options
+  ${CYN}unconfigure${RST}          Remove configuration (requires LUKS passphrase)
+  ${GRN}test${RST}                 ${GRN}Non-destructive dry-run of the wipe chain${RST}
+  ${CYN}wipe-unused${RST}          Fill free space in persistence volume with zeros
+  ${CYN}scan${RST}                 List all LUKS containers found on this system
+  ${CYN}install-shortcuts${RST}    Create desktop .desktop launchers for test + real wipe
+  ${CYN}service <action>${RST}     Pass action to systemctl (start/stop/status/restart)
+  ${RED}trigger${RST}              ${RED}DESTRUCTIVE: wipe persistence and power off${RST}
+
+${BLD}Aliases (set by install):${RST}
+  dwipe_test   →  duressd test
+  dwipe_real   →  duressd trigger
+
+With no command, opens the interactive menu.
+EOF
+    exit 1
+}
+
+# ── main ──────────────────────────────────────────────────────────────────────
+if [[ $# -eq 0 ]]; then
+    cmd_menu
+else
+    case "$1" in
+        status)              cmd_status ;;
+        configure)           cmd_configure ;;
+        unconfigure)         cmd_unconfigure ;;
+        test)                cmd_test ;;
+        wipe-unused)         cmd_wipe_unused ;;
+        scan)                cmd_scan ;;
+        install-shortcuts)   cmd_install_shortcuts ;;
+        service)             cmd_service "${2:-status}" ;;
+        trigger)             cmd_trigger ;;
+        -h|--help|help)      usage ;;
+        *)                   bad "Unknown command: $1"; usage ;;
+    esac
+fi
