@@ -30,8 +30,7 @@ banner_real() {
     echo >&2
     echo -e "${RED}╔══════════════════════════════════════════╗${RST}" >&2
     echo -e "${RED}║  ⚠   REAL WIPE  —  FULLY DESTRUCTIVE  ⚠ ║${RST}" >&2
-    echo -e "${RED}║  All LUKS data will be permanently       ║${RST}" >&2
-    echo -e "${RED}║  destroyed and the system powered off.   ║${RST}" >&2
+    echo -e "${RED}║  All LUKS volumes destroyed + power off  ║${RST}" >&2
     echo -e "${RED}╚══════════════════════════════════════════╝${RST}" >&2
     echo >&2
 }
@@ -48,7 +47,6 @@ banner_header() {
 }
 
 # ── progress bar ──────────────────────────────────────────────────────────────
-# render_progress <color> <pct> <msg>
 render_progress() {
     local color="$1" pct="$2" msg="$3"
     local width=35 filled empty bar=""
@@ -57,13 +55,13 @@ render_progress() {
     local i
     for (( i=0; i<filled; i++ )); do bar+="█"; done
     for (( i=0; i<empty;  i++ )); do bar+="░"; done
-    printf '\r  %s[%s]%s %3d%%  %s%-45s%s' \
+    printf '\r  %s[%s]%s %3d%%  %s%-50s%s' \
         "$color" "$bar" "$RST" "$pct" "$DIM" "$msg" "$RST" >&2
 }
 
 # ── low-level transport ───────────────────────────────────────────────────────
 # send_cmd <color> <CMD> [args…]
-# Streams response lines; renders progress in-place; returns 0 on OK, 1 on ERROR.
+# Streams PROGRESS in-place; returns 0 on OK, 1 on ERROR.
 send_cmd() {
     local color="$1"; shift
     local cmd="$1";   shift
@@ -76,20 +74,19 @@ send_cmd() {
         return 1
     fi
 
-    local rc=0 last_pct=0
+    local rc=0
     while IFS=$'\t' read -r type rest; do
         case "$type" in
             PROGRESS)
                 local pct="${rest%%$'\t'*}"
                 local msg="${rest#*$'\t'}"
-                last_pct="$pct"
                 render_progress "$color" "$pct" "$msg"
                 ;;
             OK)
                 render_progress "$color" 100 "Done"
                 printf '\n' >&2
                 echo -e "${color}  ✔  ${RST}${rest}" >&2
-                echo "$rest"   # stdout for callers who need to parse it
+                echo "$rest"
                 ;;
             ERROR)
                 printf '\n' >&2
@@ -102,8 +99,8 @@ send_cmd() {
     return $rc
 }
 
-b64()      { printf '%s' "$1" | base64 -w0; }
-yn_bool()  { [[ "$1" =~ ^[Yy]$ ]] && echo true || echo false; }
+b64()     { printf '%s' "$1" | base64 -w0; }
+yn_bool() { [[ "$1" =~ ^[Yy]$ ]] && echo true || echo false; }
 
 read_pass() {
     local prompt="$1"
@@ -115,7 +112,7 @@ read_pass() {
 }
 
 ask() {
-    local prompt="$1" default="${2:-}"
+    local prompt="$1"
     local ans
     printf '%s' "${BLD}" >&2
     read -rp "  $prompt" ans
@@ -129,51 +126,53 @@ warn()    { echo -e "${YLW}  ⚠  $*${RST}" >&2; }
 good()    { echo -e "${GRN}  ✔  $*${RST}" >&2; }
 bad()     { echo -e "${RED}  ✘  $*${RST}" >&2; }
 
-# ── subcommands ───────────────────────────────────────────────────────────────
+# ── status ────────────────────────────────────────────────────────────────────
 cmd_status() {
     section "Daemon status"
     local result
     result=$(send_cmd "$CYN" STATUS) || return 1
 
-    local state cfgd pt wfu olh wal
+    local state="" cfgd="" pt="" vdev="" olh="" wfd="" wcd=""
     for pair in $result; do
         case "${pair%%=*}" in
-            state)               state="${pair#*=}" ;;
-            configured)          cfgd="${pair#*=}" ;;
-            password_type)       pt="${pair#*=}" ;;
-            wipe_full_usb)       wfu="${pair#*=}" ;;
+            state)                 state="${pair#*=}" ;;
+            configured)            cfgd="${pair#*=}" ;;
+            password_type)         pt="${pair#*=}" ;;
+            verify_device)         vdev="${pair#*=}" ;;
             overwrite_luks_header) olh="${pair#*=}" ;;
-            wipe_all_luks)       wal="${pair#*=}" ;;
+            wipe_full_device)      wfd="${pair#*=}" ;;
+            wipe_countdown)        wcd="${pair#*=}" ;;
         esac
     done
 
-    local state_color="$GRN"
-    [[ "${state:-IDLE}" == WIPING ]] && state_color="$RED"
-    [[ "${state:-IDLE}" == TESTING ]] && state_color="$YLW"
+    local sc="$GRN"
+    [[ "${state:-IDLE}" == WIPING  ]] && sc="$RED"
+    [[ "${state:-IDLE}" == TESTING ]] && sc="$YLW"
 
     echo >&2
-    printf '  %-28s %s\n' "State:" \
-        "${state_color}${BLD}${state:-IDLE}${RST}" >&2
-    printf '  %-28s %s\n' "Configured:" \
+    printf '  %-30s %s\n' "State:"                "${sc}${BLD}${state:-IDLE}${RST}" >&2
+    printf '  %-30s %s\n' "Configured:" \
         "$( [[ "${cfgd:-false}" == true ]] && echo "${GRN}yes${RST}" || echo "${RED}no${RST}" )" >&2
-    printf '  %-28s %s\n' "Password type:"          "${pt:-none}" >&2
-    printf '  %-28s %s\n' "Wipe full USB:"          "${wfu:-false}" >&2
-    printf '  %-28s %s\n' "Overwrite LUKS header:"  "${olh:-false}" >&2
-    printf '  %-28s %s\n' "Wipe all LUKS on system:""${wal:-false}" >&2
+    printf '  %-30s %s\n' "Password type:"         "${pt:-none}" >&2
+    printf '  %-30s %s\n' "Verify device:"         "${vdev:-none}" >&2
+    printf '  %-30s %s\n' "Overwrite LUKS header:" "${olh:-false}" >&2
+    printf '  %-30s %s\n' "Wipe full device(s):"   "${wfd:-false}" >&2
+    printf '  %-30s %s\n' "Countdown (s):"         "${wcd:-0}" >&2
     echo >&2
 }
 
+# ── configure ─────────────────────────────────────────────────────────────────
 cmd_configure() {
     section "Configure Duress Wipe"
     echo >&2
 
     local luks_pass
-    luks_pass=$(read_pass "LUKS admin passphrase: ")
+    luks_pass=$(read_pass "Your LUKS passphrase (used to locate the encrypted device): ")
 
     echo >&2
     info "Password type for the duress trigger:"
-    info "  1) Use LUKS passphrase itself  (same key = trigger)"
-    info "  2) Separate custom passphrase  (Argon2id — recommended)"
+    info "  1) Same as LUKS passphrase  (simpler — one key to remember)"
+    info "  2) Separate custom duress passphrase  (Argon2id — recommended)"
     local choice
     choice=$(ask "Choice [1/2]: ")
 
@@ -191,7 +190,7 @@ cmd_configure() {
             if [[ "$duress_pass" != "$confirm" ]]; then
                 bad "Passphrases do not match."; return 1
             fi
-            good "Password type: custom (will be hashed with Argon2id)"
+            good "Password type: custom (Argon2id hash will be stored)"
             ;;
         *)
             bad "Invalid choice."; return 1
@@ -199,57 +198,76 @@ cmd_configure() {
     esac
 
     echo >&2
-    info "Wipe options:"
-    local overwrite_luks_header wipe_full_usb wipe_all_luks
-    overwrite_luks_header=$(yn_bool "$(ask "Overwrite LUKS header with random data?     [y/N]: ")")
-    wipe_full_usb=$(yn_bool         "$(ask "Wipe entire USB device?  (slower)            [y/N]: ")")
-    wipe_all_luks=$(yn_bool         "$(ask "Wipe ALL LUKS containers on system? (RAID…)  [y/N]: ")")
+    info "Wipe options — choose how thorough the wipe should be:"
+    info ""
+    info "  Phase 1 always runs: closes all dm-crypt mappings, then"
+    info "  wipefs + luksErase on every LUKS container found by lsblk."
+    info "  (Cryptographically sufficient — data is irrecoverable.)"
+    info ""
 
-    [[ "$wipe_all_luks" == true ]] && \
-        warn "Wipe-all will destroy every LUKS container found (md, LVM, loop, …)"
+    local overwrite_luks_header
+    overwrite_luks_header=$(yn_bool "$(ask \
+        "Phase 2 — overwrite LUKS header regions with 40 MiB of random data?  [y/N]: ")")
+    info "  Slower but overwrites raw header bytes for forensic plausible deniability."
+    echo >&2
+
+    local wipe_full_device
+    wipe_full_device=$(yn_bool "$(ask \
+        "Phase 3 — overwrite entire parent block device(s) + RAID teardown?   [y/N]: ")")
+    [[ "$wipe_full_device" == true ]] && \
+        warn "Phase 3 can take many minutes — it overwrites every sector."
+    echo >&2
+
+    local wipe_countdown
+    wipe_countdown=$(ask "Countdown before real wipe (seconds, 0 = disabled):               [0]: ")
+    [[ "$wipe_countdown" =~ ^[0-9]+$ ]] || wipe_countdown=0
+    if (( wipe_countdown > 0 )); then
+        good "A ${wipe_countdown}s countdown will run before each wipe — disconnect to abort"
+    fi
 
     echo >&2
-    info "Sending configuration to daemon…"
+    info "Sending configuration to daemon (Argon2id hash may take ~3 s)…"
     send_cmd "$CYN" CONFIGURE \
         "$(b64 "$luks_pass")" \
         "$(b64 "$password_type")" \
         "$(b64 "$duress_pass")" \
-        "$wipe_full_usb" \
         "$overwrite_luks_header" \
-        "$wipe_all_luks"
+        "$wipe_full_device" \
+        "$wipe_countdown"
 }
 
+# ── unconfigure ───────────────────────────────────────────────────────────────
 cmd_unconfigure() {
     section "Remove Duress Configuration"
-    local luks_pass
-    luks_pass=$(read_pass "LUKS admin passphrase: ")
+    warn "This erases the Argon2id keyslot and removes the config file."
+    local pass
+    pass=$(read_pass "Duress passphrase (or LUKS passphrase if type=luks): ")
     echo >&2
-    send_cmd "$YLW" UNCONFIGURE "$(b64 "$luks_pass")"
+    send_cmd "$YLW" UNCONFIGURE "$(b64 "$pass")"
 }
 
-# ── test mode (green) ─────────────────────────────────────────────────────────
-# Also available as alias: dwipe_test
+# ── test mode — green ─────────────────────────────────────────────────────────
+# Alias: dwipe_test
 cmd_test() {
     banner_test
-    section "Test Wipe — dry run"
-    info "Creates a 10 MiB throwaway LUKS2 container and runs the full"
-    info "wipe chain (luksErase → wipefs) on it.  Your real data is safe."
+    section "Test Wipe — dry run on a throwaway container"
+    info "Allocates a 10 MiB LUKS2 scratch file and runs the full wipe chain"
+    info "(luksErase → wipefs) on it.  No real device is touched."
     echo >&2
-
     local pass
     pass=$(read_pass "Duress passphrase: ")
     echo >&2
     send_cmd "$GRN" TRIGGER_TEST "$(b64 "$pass")"
 }
 
-# ── real wipe (red) ───────────────────────────────────────────────────────────
-# Also available as alias: dwipe_real
+# ── real wipe — red ───────────────────────────────────────────────────────────
+# Alias: dwipe_real
 cmd_trigger() {
     banner_real
     section "Destructive Wipe"
-    warn "This will PERMANENTLY DESTROY all persistence data."
-    warn "The system will power off immediately when done."
-    warn "This CANNOT be undone."
+    warn "PERMANENTLY destroys all LUKS-encrypted volumes on this system."
+    warn "System powers off immediately when done."
+    warn "THIS CANNOT BE UNDONE."
     echo >&2
 
     local confirm
@@ -261,31 +279,34 @@ cmd_trigger() {
     local pass
     pass=$(read_pass "Duress passphrase: ")
     echo >&2
-    echo -e "${RED}${BLD}Starting wipe — system will power off when complete.${RST}" >&2
+    echo -e "${RED}${BLD}Triggering wipe — system will power off when complete.${RST}" >&2
+    info "If a countdown is configured, press Ctrl-C now to abort."
     echo >&2
     send_cmd "$RED" TRIGGER "$(b64 "$pass")"
 }
 
+# ── wipe unused ───────────────────────────────────────────────────────────────
 cmd_wipe_unused() {
-    section "Wipe Unused Persistence Space"
-    info "Fills all free space in the persistence volume with zeros"
-    info "so deleted files cannot be recovered from unallocated sectors."
+    section "Wipe Unused Space on LUKS Volumes"
+    info "Fills all unallocated sectors on every mounted LUKS volume with zeros"
+    info "so deleted files cannot be recovered forensically."
     echo >&2
-    local luks_pass
-    luks_pass=$(read_pass "LUKS admin passphrase: ")
+    local pass
+    pass=$(read_pass "Duress passphrase (or LUKS passphrase if type=luks): ")
     echo >&2
-    send_cmd "$CYN" WIPE_UNUSED "$(b64 "$luks_pass")"
+    send_cmd "$CYN" WIPE_UNUSED "$(b64 "$pass")"
 }
 
+# ── scan ──────────────────────────────────────────────────────────────────────
 cmd_scan() {
     section "Scan system for LUKS containers"
-    info "Checks every block device (partitions, md RAID, LVM, loop…)"
-    info "and lists any that contain a LUKS header."
+    info "Walks every block device (partitions, md RAID, LVM, loop, NVMe…)"
+    info "and reports which ones carry a LUKS header."
     echo >&2
     local result
     result=$(send_cmd "$CYN" SCAN_LUKS) || return 1
     echo >&2
-    local count devs
+    local count="" devs=""
     for pair in $result; do
         case "${pair%%=*}" in
             count)   count="${pair#*=}" ;;
@@ -301,13 +322,11 @@ cmd_install_shortcuts() {
     local desktop_dir="${HOME:-/root}/Desktop"
     install -d "$desktop_dir"
 
-    # Test shortcut — green icon via category hint
     cat > "$desktop_dir/duressd-test.desktop" <<'DESK'
 [Desktop Entry]
 Version=1.0
 Type=Application
 Name=Duress — TEST Wipe
-GenericName=Duress Test
 Comment=Non-destructive dry run of the wipe chain (safe)
 Exec=x-terminal-emulator -e sh -c 'duressd test; read -rp "Press Enter to close" _'
 Icon=security-high
@@ -317,14 +336,12 @@ Keywords=wipe;luks;duress;test;
 DESK
     chmod +x "$desktop_dir/duressd-test.desktop"
 
-    # Real wipe shortcut — warning icon
     cat > "$desktop_dir/duressd-wipe.desktop" <<'DESK'
 [Desktop Entry]
 Version=1.0
 Type=Application
 Name=Duress — REAL Wipe
-GenericName=Duress Real Wipe
-Comment=DESTRUCTIVE: permanently wipes LUKS persistence and powers off
+Comment=DESTRUCTIVE: permanently destroys all LUKS volumes and powers off
 Exec=x-terminal-emulator -e sh -c 'duressd trigger; read -rp "Press Enter to close" _'
 Icon=security-low
 Terminal=false
@@ -333,9 +350,185 @@ Keywords=wipe;luks;duress;destroy;
 DESK
     chmod +x "$desktop_dir/duressd-wipe.desktop"
 
-    good "Shortcuts written to $desktop_dir/"
-    info "  duressd-test.desktop  — green / non-destructive"
-    info "  duressd-wipe.desktop  — red   / destructive"
+    good "Desktop shortcuts written to $desktop_dir/"
+    info "  duressd-test.desktop  — green (non-destructive)"
+    info "  duressd-wipe.desktop  — red   (destructive)"
+}
+
+# ── keyboard shortcuts ────────────────────────────────────────────────────────
+# Detects the running desktop environment and installs keybindings that open
+# a terminal running duressd test (Super+Shift+T) or duressd trigger (Super+Shift+W).
+# Real-wipe shortcut is intentionally disabled by default — enable it explicitly.
+cmd_install_keybindings() {
+    local de
+    de=$(detect_de)
+
+    local test_key="Super+Shift+t"
+    local real_key="Super+Shift+w"
+    local test_cmd="x-terminal-emulator -e sh -c 'duressd test; read -rp \"Press Enter\" _'"
+    local real_cmd="x-terminal-emulator -e sh -c 'duressd trigger; read -rp \"Press Enter\" _'"
+
+    section "Installing keyboard shortcuts (DE: ${de:-unknown})"
+    info "  Test wipe:  $test_key"
+    info "  Real wipe:  $real_key  ${YLW}(disabled by default — see below)${RST}"
+    echo >&2
+
+    case "$de" in
+        gnome)
+            _kb_gnome "$test_key" "$test_cmd" "Duress Test Wipe" "duressd-test"
+            warn "Real-wipe shortcut skipped. Enable manually in Settings → Keyboard → Custom Shortcuts."
+            ;;
+        kde)
+            _kb_kde "$test_key" "$test_cmd" "Duress Test Wipe"
+            warn "Real-wipe shortcut skipped. Add manually via System Settings → Shortcuts."
+            ;;
+        xfce)
+            _kb_xfce "$test_key" "$test_cmd"
+            _kb_xfce "$real_key" "$real_cmd"
+            warn "XFCE: log out and back in for shortcuts to take effect."
+            ;;
+        i3)
+            _kb_i3 "$test_key" "$test_cmd" "$real_key" "$real_cmd"
+            warn "i3: restart i3 (Mod+Shift+R) for bindings to take effect."
+            ;;
+        sway)
+            _kb_sway "$test_key" "$test_cmd" "$real_key" "$real_cmd"
+            warn "sway: reload config (Mod+Shift+C) for bindings to take effect."
+            ;;
+        xbindkeys)
+            _kb_xbindkeys "$test_key" "$test_cmd" "$real_key" "$real_cmd"
+            warn "xbindkeys: run 'xbindkeys --poll-rc' or restart xbindkeys."
+            ;;
+        *)
+            bad "Could not detect desktop environment."
+            info "Supported: GNOME, KDE Plasma, XFCE, i3, sway, xbindkeys"
+            info ""
+            info "Add these shortcuts manually in your DE settings:"
+            info "  Test:  $test_cmd"
+            info "  Real:  $real_cmd"
+            return 1
+            ;;
+    esac
+
+    good "Keyboard shortcuts installed for: $de"
+}
+
+detect_de() {
+    local xdg="${XDG_CURRENT_DESKTOP:-}"
+    if   [[ -n "${GNOME_DESKTOP_SESSION_ID:-}" ]] || [[ "$xdg" =~ GNOME  ]]; then echo gnome
+    elif [[ "$xdg" =~ KDE                      ]];                            then echo kde
+    elif [[ "$xdg" =~ XFCE                     ]];                            then echo xfce
+    elif [[ -n "${I3SOCK:-}"                    ]] || command -v i3   &>/dev/null; then echo i3
+    elif [[ -n "${SWAYSOCK:-}"                  ]] || command -v sway &>/dev/null; then echo sway
+    elif command -v xbindkeys &>/dev/null;                                     then echo xbindkeys
+    else echo unknown
+    fi
+}
+
+_kb_gnome() {
+    local key="$1" exec_cmd="$2" name="$3" id="$4"
+    local base="org.gnome.settings-daemon.plugins.media-keys"
+    local path="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/${id}/"
+
+    command -v gsettings &>/dev/null || { bad "gsettings not found"; return 1; }
+
+    gsettings set "${base}.custom-keybinding:${path}" name    "$name"
+    gsettings set "${base}.custom-keybinding:${path}" command "$exec_cmd"
+    gsettings set "${base}.custom-keybinding:${path}" binding "<${key//+/>}<${key##*+}>"
+
+    # Append to the list of active custom keybindings
+    local current
+    current=$(gsettings get "$base" custom-keybindings 2>/dev/null || echo '@as []')
+    # Add path if not already present
+    if [[ "$current" != *"$path"* ]]; then
+        local new_list
+        new_list=$(printf '%s' "$current" | sed "s|]|, '$path']|; s|@as \[\]|['$path']|")
+        gsettings set "$base" custom-keybindings "$new_list"
+    fi
+    good "GNOME shortcut: $key → $name"
+}
+
+_kb_kde() {
+    local key="$1" exec_cmd="$2" name="$3"
+    command -v kwriteconfig5 &>/dev/null || { bad "kwriteconfig5 not found"; return 1; }
+    local cfg="${HOME}/.config/kglobalshortcutsrc"
+    kwriteconfig5 --file "$cfg" --group "khotkeys" --key "${name}" "${key},none,${name}"
+    good "KDE shortcut written to $cfg (may require kquitapp5 kglobalaccel && kglobalaccel5 &)"
+    info "  Or add via System Settings → Shortcuts → Custom Shortcuts → Command/URL"
+    info "  Command: $exec_cmd"
+}
+
+_kb_xfce() {
+    local key="$1" exec_cmd="$2"
+    command -v xfconf-query &>/dev/null || { bad "xfconf-query not found"; return 1; }
+    # Convert Super+Shift+t → <Super><Shift>t
+    local xfce_key
+    xfce_key=$(printf '%s' "$key" | sed 's/\([A-Za-z]*\)+/<\1>/g; s/>$//')
+    xfconf-query -c xfce4-keyboard-shortcuts \
+        -p "/commands/custom/${xfce_key}" -n -t string -s "$exec_cmd" 2>/dev/null \
+        || xfconf-query -c xfce4-keyboard-shortcuts \
+           -p "/commands/custom/${xfce_key}" -s "$exec_cmd"
+    good "XFCE shortcut: $key → $exec_cmd"
+}
+
+_kb_i3() {
+    local test_key="$1" test_cmd="$2" real_key="$3" real_cmd="$4"
+    local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/i3/config"
+    [[ -f "$cfg" ]] || { bad "i3 config not found at $cfg"; return 1; }
+
+    # Convert Super+Shift+t → $mod+Shift+t
+    local i3_test i3_real
+    i3_test=$(printf '%s' "$test_key" | sed 's/Super/\$mod/')
+    i3_real=$(printf '%s' "$real_key" | sed 's/Super/\$mod/')
+    i3_test="${i3_test//+/ }"
+    i3_real="${i3_real//+/ }"
+
+    cat >> "$cfg" <<EOF
+
+# duressd shortcuts (added by duressd install-keybindings)
+bindsym ${i3_test} exec --no-startup-id ${test_cmd}
+bindsym ${i3_real} exec --no-startup-id ${real_cmd}
+EOF
+    good "i3 bindings appended to $cfg"
+}
+
+_kb_sway() {
+    local test_key="$1" test_cmd="$2" real_key="$3" real_cmd="$4"
+    local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/sway/config"
+    [[ -f "$cfg" ]] || { bad "sway config not found at $cfg"; return 1; }
+
+    local sw_test sw_real
+    sw_test=$(printf '%s' "$test_key" | sed 's/Super/\$mod/; s/+/ /g')
+    sw_real=$(printf '%s' "$real_key" | sed 's/Super/\$mod/; s/+/ /g')
+
+    cat >> "$cfg" <<EOF
+
+# duressd shortcuts (added by duressd install-keybindings)
+bindsym ${sw_test} exec ${test_cmd}
+bindsym ${sw_real} exec ${real_cmd}
+EOF
+    good "sway bindings appended to $cfg"
+}
+
+_kb_xbindkeys() {
+    local test_key="$1" test_cmd="$2" real_key="$3" real_cmd="$4"
+    local cfg="$HOME/.xbindkeysrc"
+
+    # Convert Super+Shift+t → Mod4+shift+t
+    local xbk_test xbk_real
+    xbk_test=$(printf '%s' "$test_key" | sed 's/Super/Mod4/; s/+/ + /g')
+    xbk_real=$(printf '%s' "$real_key" | sed 's/Super/Mod4/; s/+/ + /g')
+
+    cat >> "$cfg" <<EOF
+
+# duressd shortcuts (added by duressd install-keybindings)
+"${test_cmd}"
+  ${xbk_test}
+
+"${real_cmd}"
+  ${xbk_real}
+EOF
+    good "xbindkeys entries appended to $cfg"
 }
 
 # ── service management ────────────────────────────────────────────────────────
@@ -349,18 +542,23 @@ cmd_service() {
 cmd_menu() {
     banner_header
     while true; do
-        echo -e "${BLD}  Duress Wipe Service${RST}" >&2
-        echo -e "  ${DIM}$(systemctl is-active "$SERVICE" 2>/dev/null \
-            && echo "daemon running" || echo "daemon not running")${RST}" >&2
+        local svc_state
+        svc_state=$(systemctl is-active "$SERVICE" 2>/dev/null || echo inactive)
+        local svc_color="$GRN"
+        [[ "$svc_state" != active ]] && svc_color="$RED"
+
+        echo -e "${BLD}  duressd wipe service${RST}" >&2
+        echo -e "  daemon: ${svc_color}${svc_state}${RST}" >&2
         echo >&2
         echo -e "  ${CYN}1${RST}  Status" >&2
         echo -e "  ${CYN}2${RST}  Configure" >&2
         echo -e "  ${CYN}3${RST}  Unconfigure" >&2
-        echo -e "  ${GRN}4${RST}  ${GRN}${BLD}Test wipe${RST}  ${DIM}(dry run — non-destructive)${RST}" >&2
+        echo -e "  ${GRN}4${RST}  ${GRN}${BLD}Test wipe${RST}  ${DIM}(dry run — safe)${RST}" >&2
         echo -e "  ${CYN}5${RST}  Wipe unused space" >&2
         echo -e "  ${CYN}6${RST}  Scan for LUKS containers" >&2
         echo -e "  ${CYN}7${RST}  Install desktop shortcuts" >&2
-        echo -e "  ${RED}8${RST}  ${RED}${BLD}TRIGGER REAL WIPE${RST}  ${DIM}(destructive — powers off)${RST}" >&2
+        echo -e "  ${CYN}8${RST}  Install keyboard shortcuts" >&2
+        echo -e "  ${RED}9${RST}  ${RED}${BLD}TRIGGER REAL WIPE${RST}  ${DIM}(destructive)${RST}" >&2
         echo -e "  ${DIM}q  Quit${RST}" >&2
         echo >&2
         local choice
@@ -373,7 +571,8 @@ cmd_menu() {
             5) cmd_wipe_unused ;;
             6) cmd_scan ;;
             7) cmd_install_shortcuts ;;
-            8) cmd_trigger ;;
+            8) cmd_install_keybindings ;;
+            9) cmd_trigger ;;
             q|Q) echo >&2; exit 0 ;;
             *) bad "Invalid choice." ;;
         esac
@@ -387,17 +586,18 @@ usage() {
 ${BLD}Usage:${RST} duressd [COMMAND]
 
 ${BLD}Commands:${RST}
-  ${CYN}status${RST}               Show daemon state and configuration
-  ${CYN}configure${RST}            Set up duress passphrase and wipe options
-  ${CYN}unconfigure${RST}          Remove configuration (requires LUKS passphrase)
-  ${GRN}test${RST}                 ${GRN}Non-destructive dry-run of the wipe chain${RST}
-  ${CYN}wipe-unused${RST}          Fill free space in persistence volume with zeros
-  ${CYN}scan${RST}                 List all LUKS containers found on this system
-  ${CYN}install-shortcuts${RST}    Create desktop .desktop launchers for test + real wipe
-  ${CYN}service <action>${RST}     Pass action to systemctl (start/stop/status/restart)
-  ${RED}trigger${RST}              ${RED}DESTRUCTIVE: wipe persistence and power off${RST}
+  ${CYN}status${RST}                  Show daemon state and configuration
+  ${CYN}configure${RST}               Set up duress passphrase and wipe options
+  ${CYN}unconfigure${RST}             Remove configuration
+  ${GRN}test${RST}                    ${GRN}Non-destructive dry-run of the wipe chain${RST}
+  ${CYN}wipe-unused${RST}             Zero unallocated sectors on all mounted LUKS volumes
+  ${CYN}scan${RST}                    List every LUKS container on this system
+  ${CYN}install-shortcuts${RST}       Create desktop .desktop launchers
+  ${CYN}install-keybindings${RST}     Register keyboard shortcuts in the current DE
+  ${CYN}service <action>${RST}        Pass action to systemctl (start/stop/status/restart)
+  ${RED}trigger${RST}                 ${RED}DESTRUCTIVE: wipe all LUKS volumes and power off${RST}
 
-${BLD}Aliases (set by install):${RST}
+${BLD}Aliases:${RST}
   dwipe_test   →  duressd test
   dwipe_real   →  duressd trigger
 
@@ -411,16 +611,17 @@ if [[ $# -eq 0 ]]; then
     cmd_menu
 else
     case "$1" in
-        status)              cmd_status ;;
-        configure)           cmd_configure ;;
-        unconfigure)         cmd_unconfigure ;;
-        test)                cmd_test ;;
-        wipe-unused)         cmd_wipe_unused ;;
-        scan)                cmd_scan ;;
-        install-shortcuts)   cmd_install_shortcuts ;;
-        service)             cmd_service "${2:-status}" ;;
-        trigger)             cmd_trigger ;;
-        -h|--help|help)      usage ;;
-        *)                   bad "Unknown command: $1"; usage ;;
+        status)               cmd_status ;;
+        configure)            cmd_configure ;;
+        unconfigure)          cmd_unconfigure ;;
+        test)                 cmd_test ;;
+        wipe-unused)          cmd_wipe_unused ;;
+        scan)                 cmd_scan ;;
+        install-shortcuts)    cmd_install_shortcuts ;;
+        install-keybindings)  cmd_install_keybindings ;;
+        service)              cmd_service "${2:-status}" ;;
+        trigger)              cmd_trigger ;;
+        -h|--help|help)       usage ;;
+        *)                    bad "Unknown command: $1"; usage ;;
     esac
 fi
