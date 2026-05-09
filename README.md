@@ -67,16 +67,16 @@ duressd trigger          ← enter duress passphrase
 ### One-liner (recommended)
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/twhalley/Duressd/main/get.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/twhalley/Duressd/main/install.sh | sudo bash
 ```
 
 Or with `wget`:
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/twhalley/Duressd/main/get.sh | sudo bash
+wget -qO- https://raw.githubusercontent.com/twhalley/Duressd/main/install.sh | sudo bash
 ```
 
-`get.sh` downloads the latest source from the `main` branch, extracts it to a temporary directory, and runs `install.sh install` automatically. The temp directory is cleaned up on exit.
+When run this way `install.sh` detects that the `src/` tree is absent, downloads the full archive from GitHub automatically, and proceeds with the normal install. No separate bootstrap script needed.
 
 ### Manual install
 
@@ -564,7 +564,7 @@ Expected if `wipefs` already zeroed the LUKS magic. The data is already unrecove
 Send `SIGINT` to the `socat` process that holds the socket connection. Closing the socket is what triggers the abort on the daemon side.
 
 **One-liner installer fails with "extraction failed"**
-GitHub archive layout changed or download was interrupted. Try the manual install:
+The GitHub archive download was interrupted or the layout changed. Fall back to:
 ```bash
-git clone https://github.com/twhalley/Duressd.git && cd Duressd && sudo ./install.sh install
+git clone https://github.com/twhalley/Duressd.git && cd Duressd && sudo bash install.sh
 ```

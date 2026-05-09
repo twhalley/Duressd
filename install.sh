@@ -1,17 +1,38 @@
 #!/bin/bash
-# Install or uninstall the duressd wipe service.
-# Usage: ./install.sh [install|uninstall]   (default: install)
-# Must be run as root.
+# Install / uninstall / status the duressd wipe service.
+# Usage: sudo bash install.sh [install|uninstall|status]
+# One-liner: curl -sSL https://raw.githubusercontent.com/twhalley/Duressd/main/install.sh | sudo bash
 set -euo pipefail
+
+# ── bootstrap ─────────────────────────────────────────────────────────────────
+# When piped via curl/wget the src/ tree is absent. Download the full archive
+# from GitHub and re-exec from the extracted directory automatically.
+_self="${BASH_SOURCE[0]:-}"
+_dir="$(cd "$(dirname "${_self:-/}")" 2>/dev/null && pwd)" || _dir=""
+if [[ -z "$_dir" ]] || [[ ! -d "${_dir}/src" ]]; then
+    if [[ -t 1 ]]; then CYN=$'\033[1;36m' RED=$'\033[1;31m' RST=$'\033[0m'
+    else CYN='' RED='' RST=''; fi
+    [[ $EUID -eq 0 ]] || { printf '%s\n' "${RED}  ✘  Must be run as root — use: curl ... | sudo bash${RST}" >&2; exit 1; }
+    printf '%s\n' "${CYN}  →  Downloading duressd from GitHub${RST}"
+    _work=$(mktemp -d)
+    _url="https://github.com/twhalley/Duressd/archive/refs/heads/main.tar.gz"
+    if   command -v curl &>/dev/null; then curl -fsSL "$_url" -o "$_work/s.tar.gz"
+    elif command -v wget &>/dev/null; then wget  -q    "$_url" -O "$_work/s.tar.gz"
+    else printf '%s\n' "${RED}  ✘  curl or wget required${RST}" >&2; exit 1; fi
+    tar -xzf "$_work/s.tar.gz" -C "$_work"
+    _src=$(find "$_work" -maxdepth 1 -type d -name "Duressd-*" | head -1)
+    [[ -n "$_src" ]] || { printf '%s\n' "${RED}  ✘  Extraction failed${RST}" >&2; exit 1; }
+    exec bash "$_src/install.sh" "${1:-install}"
+fi
 
 LIBDIR=/usr/local/lib/duressd
 BINDIR=/usr/local/bin
 UNITDIR=/etc/systemd/system
 CFGDIR=/etc/duressd
-ALIASES=/etc/profile.d/duressd.sh        # bash / zsh / sh-compatible
+ALIASES=/etc/profile.d/duressd.sh
 FISH_ALIASES=/etc/fish/conf.d/duressd.fish
-SRC="$(cd "$(dirname "$0")/src" && pwd)"
-SYSTEMD_SRC="$(cd "$(dirname "$0")/systemd" && pwd)"
+SRC="${_dir}/src"
+SYSTEMD_SRC="${_dir}/systemd"
 
 # ── colours ───────────────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
