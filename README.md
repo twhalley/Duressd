@@ -86,10 +86,16 @@ sudo ./install.sh status      # check all components are present and running
 # 1. Configure
 sudo duressd configure
 
-# 2. Dry run — confirm everything works
+# 2. Verify the passphrase was stored correctly
+duressd verify
+
+# 3. Preflight check — confirm everything is ready
+duressd health
+
+# 4. Dry run — exercise the full wipe chain
 duressd test
 
-# 3. (Optional) Install shortcuts for your desktop
+# 5. (Optional) Install shortcuts for your desktop
 duressd install-shortcuts
 duressd install-keybindings
 ```
@@ -194,6 +200,77 @@ dwipe_real
 ### `duressd unconfigure`
 
 Erases the Argon2id keyslot container (`shred`), removes `/etc/duressd/config`. Requires the duress passphrase (or LUKS passphrase for `type=luks`).
+
+---
+
+### `duressd verify`
+
+**Non-destructive.** Tests that the stored passphrase is correct and that the authentication backend (`LUKS --test-passphrase` or the Argon2id container) can validate it — without touching any real device.
+
+Run this regularly after configure or after a `change-passphrase` to confirm the system will authenticate at the moment it needs to.
+
+```bash
+duressd verify
+```
+
+---
+
+### `duressd health`
+
+Single-command preflight check. Reports pass/warn/fail for each component:
+
+| Check | What is verified |
+|-------|-----------------|
+| `service_running` | `duressd.service` is active |
+| `config_file` | `/etc/duressd/config` exists |
+| `auth_backend` | LUKS device accessible (type=luks) or `passphrase.luks` present (type=custom) |
+| `required_tools` | All wipe-chain binaries are on PATH |
+| `luks_devices` | At least one LUKS container is discoverable |
+
+```bash
+duressd health
+```
+
+---
+
+### `duressd change-passphrase`
+
+Atomically replaces the duress passphrase for `type=custom` configurations. Verifies the old passphrase, destroys the old Argon2id keyslot, and creates a new one. Automatically verifies the new passphrase before reporting success.
+
+For `type=luks` configurations, the duress passphrase **is** your LUKS passphrase — use `cryptsetup luksChangeKey` directly.
+
+```bash
+duressd change-passphrase
+```
+
+---
+
+### `duressd passgen`
+
+Generates a strong random passphrase. Three modes:
+
+| Mode | Example | Source |
+|------|---------|--------|
+| Base64 | `Kj3mP+xQrL8fVwN2eZpA` | `openssl rand -base64 18` (24 chars) |
+| Hex | `a3f7c2d19b4e6082...` | `openssl rand -hex 16` (32 chars) |
+| Words | `river-table-cloud-fence` | 4 words from `/usr/share/dict/words` |
+
+```bash
+duressd passgen
+```
+
+The generated passphrase is printed once and not stored — copy it before continuing.
+
+---
+
+### `duressd logs [N]`
+
+Shows the last *N* lines (default 50) of the `duressd` service journal with colour-highlighted output — errors in red, warnings in yellow, start/stop events in green.
+
+```bash
+duressd logs
+duressd logs 100
+```
 
 ---
 
@@ -338,24 +415,6 @@ The double `--force` bypasses systemd's graceful shutdown sequence, which would 
 | Passphrase in memory | Passed as `--key-file=-` to cryptsetup stdin; never written to disk or the config file |
 | Config file | `/etc/duressd/config` — root `0600`. Contains only boolean flags and the verify-device path, never the passphrase |
 | SIGPIPE / client disconnect | `trap '' SIGPIPE` in handler ensures a client crash never leaves the daemon in an inconsistent state. During countdown, `printf || exit 0` aborts a wipe if the client disconnects |
-
----
-
-## Suggested improvements
-
-The following features are not yet implemented:
-
-| Feature | Description |
-|---------|-------------|
-| `duressd verify` | Test that the stored passphrase still works right now (`--test-passphrase`) without doing any wipe. Essential sanity check after configuring |
-| `duressd health` | Preflight: service running, config valid, verify_device accessible, all tools on PATH, `passphrase.luks` intact — single-command go/no-go |
-| `duressd change-passphrase` | Atomically update the duress passphrase (add new LUKS2 keyslot, remove old) without full reconfigure |
-| `duressd passgen` | Generate and print a strong random passphrase (`openssl rand -base64 18` or diceware) |
-| `duressd logs` | `journalctl -u duressd -n 100` with coloured output |
-| PAM module | Trigger wipe when a "decoy" username logs in via PAM `pam_exec` |
-| Network kill-switch | UDP/HTTP listener that triggers wipe on receipt of a signal from a remote server |
-| Auto-test on boot | Silent `TRIGGER_TEST` at startup; alert or log if it fails |
-| Encrypted config | Wrap `/etc/duressd/config` itself in a LUKS2 container |
 
 ---
 

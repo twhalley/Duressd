@@ -317,6 +317,172 @@ cmd_scan() {
     echo >&2
 }
 
+# ── verify passphrase ─────────────────────────────────────────────────────────
+cmd_verify() {
+    section "Verify Passphrase"
+    info "Tests that your duress passphrase authenticates correctly"
+    info "without triggering any wipe."
+    echo >&2
+    local pass
+    pass=$(read_pass "Duress passphrase: ")
+    echo >&2
+    local rc=0
+    send_cmd "$CYN" VERIFY "$(b64 "$pass")" || rc=$?
+    if [[ $rc -eq 0 ]]; then
+        good "Passphrase verified — authentication is working correctly"
+    else
+        bad "Passphrase verification failed"
+    fi
+    echo >&2
+    return $rc
+}
+
+# ── health check ──────────────────────────────────────────────────────────────
+cmd_health() {
+    section "System Health Check"
+    echo >&2
+
+    if [[ ! -S "$SOCKET" ]]; then
+        bad "daemon socket not found at $SOCKET"
+        info "  Is the service running?  systemctl status ${SERVICE}"
+        return 1
+    fi
+
+    local rc=0 overall=""
+    while IFS=$'\t' read -r type rest; do
+        case "$type" in
+            CHECK)
+                local level="${rest%%$'\t'*}"
+                local rest2="${rest#*$'\t'}"
+                local key="${rest2%%$'\t'*}"
+                local msg="${rest2#*$'\t'}"
+                case "$level" in
+                    ok)   printf '  %s✔  %-24s%s  %s\n' "${GRN}" "${key}" "${RST}" "${msg}" >&2 ;;
+                    warn) printf '  %s⚠  %-24s%s  %s\n' "${YLW}" "${key}" "${RST}" "${msg}" >&2 ;;
+                    fail) printf '  %s✘  %-24s%s  %s\n' "${RED}" "${key}" "${RST}" "${msg}" >&2; rc=1 ;;
+                esac
+                ;;
+            OK)
+                for pair in $rest; do
+                    [[ "${pair%%=*}" == "health" ]] && overall="${pair#*=}"
+                done
+                ;;
+            ERROR)
+                bad "Error: ${rest}"; rc=1
+                ;;
+            PROGRESS) ;;
+        esac
+    done < <(printf 'HEALTH\n' | socat - "UNIX-CONNECT:${SOCKET}" 2>/dev/null)
+
+    echo >&2
+    case "$overall" in
+        ok)   good "All checks passed — system ready" ;;
+        warn) warn "Health check complete — some warnings" ;;
+        fail) bad  "One or more checks failed — see above" ;;
+        *)    warn "No response from daemon" ;;
+    esac
+    echo >&2
+    return $rc
+}
+
+# ── change passphrase ─────────────────────────────────────────────────────────
+cmd_change_passphrase() {
+    section "Change Duress Passphrase"
+    info "Only available for password type 'custom' (Argon2id)."
+    info "For LUKS type, use: cryptsetup luksChangeKey <device>"
+    echo >&2
+    local old_pass new_pass confirm
+    old_pass=$(read_pass "Current duress passphrase: ")
+    echo >&2
+    new_pass=$(read_pass "New duress passphrase: ")
+    echo >&2
+    confirm=$(read_pass "Confirm new passphrase: ")
+    echo >&2
+    if [[ "$new_pass" != "$confirm" ]]; then
+        bad "New passphrases do not match."; return 1
+    fi
+    if [[ "$new_pass" == "$old_pass" ]]; then
+        bad "New passphrase is the same as the current one."; return 1
+    fi
+    info "Replacing Argon2id keyslot — this may take ~3 s…"
+    send_cmd "$CYN" CHANGE_PASSPHRASE "$(b64 "$old_pass")" "$(b64 "$new_pass")"
+}
+
+# ── passgen ───────────────────────────────────────────────────────────────────
+cmd_passgen() {
+    section "Generate Passphrase"
+    echo >&2
+    info "Select type:"
+    info "  1) Base64  — 24 chars  (letters, numbers, +, /)"
+    info "  2) Hex     — 32 chars  (0-9, a-f)"
+    info "  3) Words   — 4 random words from /usr/share/dict/words"
+    echo >&2
+    local choice
+    choice=$(ask "Choice [1/2/3, default 1]: ")
+    [[ "$choice" =~ ^[123]$ ]] || choice=1
+    echo >&2
+
+    local pass=""
+    case "$choice" in
+        1)
+            pass=$(openssl rand -base64 18)
+            info "Base64 passphrase (24 chars):"
+            ;;
+        2)
+            pass=$(openssl rand -hex 16)
+            info "Hex passphrase (32 chars):"
+            ;;
+        3)
+            local wordfile=/usr/share/dict/words
+            if [[ ! -f "$wordfile" ]]; then
+                bad "/usr/share/dict/words not found"
+                info "Install a word list:  apt install wamerican  /  pacman -S words"
+                return 1
+            fi
+            local word_count
+            word_count=$(wc -l < "$wordfile")
+            local -a words=()
+            for (( i=0; i<4; i++ )); do
+                local idx=$(( 0x$(openssl rand -hex 3) % word_count + 1 ))
+                local w
+                w=$(sed -n "${idx}p" "$wordfile" | tr -d "'" | tr '[:upper:]' '[:lower:]' | tr -d '\n')
+                [[ -n "$w" ]] && words+=("$w")
+            done
+            pass=$(IFS=-; echo "${words[*]}")
+            info "Diceware passphrase (4 words):"
+            ;;
+    esac
+
+    echo >&2
+    printf '  %s%s%s\n\n' "${GRN}${BLD}" "$pass" "${RST}" >&2
+    warn "This passphrase will not be shown again — save it securely."
+    echo >&2
+}
+
+# ── logs ──────────────────────────────────────────────────────────────────────
+cmd_logs() {
+    local n="${1:-50}"
+    section "duressd service logs (last ${n} lines)"
+    echo >&2
+    if ! command -v journalctl &>/dev/null; then
+        bad "journalctl not found — not a systemd system?"
+        return 1
+    fi
+    journalctl -u "$SERVICE" -n "$n" --no-pager 2>/dev/null \
+        | while IFS= read -r line; do
+            if   [[ "$line" =~ [Ee]rror|[Ff]ail|WIPE ]]; then
+                printf '%s%s%s\n' "$RED" "$line" "$RST" >&2
+            elif [[ "$line" =~ [Ww]arn ]]; then
+                printf '%s%s%s\n' "$YLW" "$line" "$RST" >&2
+            elif [[ "$line" =~ [Ss]tarted|[Ss]topped|[Aa]ctive ]]; then
+                printf '%s%s%s\n' "$GRN" "$line" "$RST" >&2
+            else
+                printf '%s%s%s\n' "$DIM" "$line" "$RST" >&2
+            fi
+          done
+    echo >&2
+}
+
 # ── desktop shortcuts ─────────────────────────────────────────────────────────
 cmd_install_shortcuts() {
     local desktop_dir="${HOME:-/root}/Desktop"
@@ -550,29 +716,45 @@ cmd_menu() {
         echo -e "${BLD}  duressd wipe service${RST}" >&2
         echo -e "  daemon: ${svc_color}${svc_state}${RST}" >&2
         echo >&2
+        echo -e "  ${DIM}── Diagnostics ─────────────────────────────${RST}" >&2
         echo -e "  ${CYN}1${RST}  Status" >&2
-        echo -e "  ${CYN}2${RST}  Configure" >&2
-        echo -e "  ${CYN}3${RST}  Unconfigure" >&2
-        echo -e "  ${GRN}4${RST}  ${GRN}${BLD}Test wipe${RST}  ${DIM}(dry run — safe)${RST}" >&2
-        echo -e "  ${CYN}5${RST}  Wipe unused space" >&2
-        echo -e "  ${CYN}6${RST}  Scan for LUKS containers" >&2
-        echo -e "  ${CYN}7${RST}  Install desktop shortcuts" >&2
-        echo -e "  ${CYN}8${RST}  Install keyboard shortcuts" >&2
-        echo -e "  ${RED}9${RST}  ${RED}${BLD}TRIGGER REAL WIPE${RST}  ${DIM}(destructive)${RST}" >&2
+        echo -e "  ${CYN}2${RST}  Health check" >&2
+        echo -e "  ${CYN}3${RST}  Scan LUKS containers" >&2
+        echo -e "  ${CYN}4${RST}  Logs" >&2
+        echo -e "  ${DIM}── Configuration ───────────────────────────${RST}" >&2
+        echo -e "  ${CYN}5${RST}  Configure" >&2
+        echo -e "  ${CYN}6${RST}  Change passphrase" >&2
+        echo -e "  ${CYN}7${RST}  Unconfigure" >&2
+        echo -e "  ${CYN}8${RST}  Generate passphrase" >&2
+        echo -e "  ${DIM}── Actions ──────────────────────────────────${RST}" >&2
+        echo -e "  ${CYN}9${RST}  Verify passphrase" >&2
+        echo -e "  ${CYN}0${RST}  Wipe unused space" >&2
+        echo -e "  ${DIM}── Shortcuts ────────────────────────────────${RST}" >&2
+        echo -e "  ${CYN}d${RST}  Install desktop shortcuts" >&2
+        echo -e "  ${CYN}k${RST}  Install keyboard shortcuts" >&2
+        echo -e "  ${DIM}── Wipe ─────────────────────────────────────${RST}" >&2
+        echo -e "  ${GRN}t${RST}  ${GRN}${BLD}Test wipe${RST}  ${DIM}(dry run — safe)${RST}" >&2
+        echo -e "  ${RED}W${RST}  ${RED}${BLD}TRIGGER REAL WIPE${RST}  ${DIM}(destructive)${RST}" >&2
+        echo -e "  ${DIM}────────────────────────────────────────────${RST}" >&2
         echo -e "  ${DIM}q  Quit${RST}" >&2
         echo >&2
         local choice
         choice=$(ask "Choice: ")
         case "$choice" in
             1) cmd_status ;;
-            2) cmd_configure ;;
-            3) cmd_unconfigure ;;
-            4) cmd_test ;;
-            5) cmd_wipe_unused ;;
-            6) cmd_scan ;;
-            7) cmd_install_shortcuts ;;
-            8) cmd_install_keybindings ;;
-            9) cmd_trigger ;;
+            2) cmd_health ;;
+            3) cmd_scan ;;
+            4) cmd_logs ;;
+            5) cmd_configure ;;
+            6) cmd_change_passphrase ;;
+            7) cmd_unconfigure ;;
+            8) cmd_passgen ;;
+            9) cmd_verify ;;
+            0) cmd_wipe_unused ;;
+            d|D) cmd_install_shortcuts ;;
+            k|K) cmd_install_keybindings ;;
+            t|T) cmd_test ;;
+            W) cmd_trigger ;;
             q|Q) echo >&2; exit 0 ;;
             *) bad "Invalid choice." ;;
         esac
@@ -585,13 +767,22 @@ usage() {
 
 ${BLD}Usage:${RST} duressd [COMMAND]
 
-${BLD}Commands:${RST}
+${BLD}Diagnostics:${RST}
   ${CYN}status${RST}                  Show daemon state and configuration
+  ${CYN}health${RST}                  Preflight check — service, config, tools, devices
+  ${CYN}scan${RST}                    List every LUKS container on this system
+  ${CYN}logs [N]${RST}                Show last N (default 50) journal lines for the service
+  ${CYN}verify${RST}                  Test passphrase works without wiping
+
+${BLD}Configuration:${RST}
   ${CYN}configure${RST}               Set up duress passphrase and wipe options
-  ${CYN}unconfigure${RST}             Remove configuration
+  ${CYN}change-passphrase${RST}       Atomically replace the duress passphrase (custom type only)
+  ${CYN}unconfigure${RST}             Erase passphrase hash and remove config
+  ${CYN}passgen${RST}                 Generate a strong random passphrase
+
+${BLD}Actions:${RST}
   ${GRN}test${RST}                    ${GRN}Non-destructive dry-run of the wipe chain${RST}
   ${CYN}wipe-unused${RST}             Zero unallocated sectors on all mounted LUKS volumes
-  ${CYN}scan${RST}                    List every LUKS container on this system
   ${CYN}install-shortcuts${RST}       Create desktop .desktop launchers
   ${CYN}install-keybindings${RST}     Register keyboard shortcuts in the current DE
   ${CYN}service <action>${RST}        Pass action to systemctl (start/stop/status/restart)
@@ -612,11 +803,16 @@ if [[ $# -eq 0 ]]; then
 else
     case "$1" in
         status)               cmd_status ;;
+        health)               cmd_health ;;
+        verify)               cmd_verify ;;
         configure)            cmd_configure ;;
+        change-passphrase)    cmd_change_passphrase ;;
         unconfigure)          cmd_unconfigure ;;
+        passgen)              cmd_passgen ;;
         test)                 cmd_test ;;
         wipe-unused)          cmd_wipe_unused ;;
         scan)                 cmd_scan ;;
+        logs)                 cmd_logs "${2:-50}" ;;
         install-shortcuts)    cmd_install_shortcuts ;;
         install-keybindings)  cmd_install_keybindings ;;
         service)              cmd_service "${2:-status}" ;;

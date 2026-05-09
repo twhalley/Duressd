@@ -425,6 +425,111 @@ cmd_wipe_unused() {
     ok "Wiped free space on $wiped mounted LUKS volume(s)"
 }
 
+# ── new suggested-improvement commands ───────────────────────────────────────
+
+cmd_health() {
+    local -a checks=()
+
+    # 1 — service running
+    if systemctl is-active duressd.service &>/dev/null; then
+        checks+=("ok:service_running:duressd.service is active")
+    else
+        checks+=("fail:service_running:duressd.service is not running")
+    fi
+
+    # 2 — config file present
+    if [[ -f "$CFGFILE" ]]; then
+        checks+=("ok:config_file:$CFGFILE is present")
+    else
+        checks+=("fail:config_file:$CFGFILE not found — run: duressd configure")
+    fi
+
+    # 3 — auth backend reachable (non-fatal load)
+    if load_config 2>/dev/null && [[ "${CONFIGURED:-false}" == true ]]; then
+        case "${PASSWORD_TYPE:-}" in
+            luks)
+                if [[ -n "${VERIFY_DEVICE:-}" ]] && [[ -b "${VERIFY_DEVICE}" ]]; then
+                    checks+=("ok:auth_backend:LUKS device ${VERIFY_DEVICE} accessible")
+                else
+                    checks+=("fail:auth_backend:verify device '${VERIFY_DEVICE:-<unset>}' not found — re-run configure")
+                fi
+                ;;
+            custom)
+                if [[ -f "$PASSPHRASE_LUKS" ]]; then
+                    checks+=("ok:auth_backend:Argon2id container $PASSPHRASE_LUKS present")
+                else
+                    checks+=("fail:auth_backend:$PASSPHRASE_LUKS missing — re-run configure")
+                fi
+                ;;
+            *)
+                checks+=("fail:auth_backend:PASSWORD_TYPE invalid or unset")
+                ;;
+        esac
+    else
+        checks+=("warn:auth_backend:not configured — auth backend unchecked")
+    fi
+
+    # 4 — required tools on PATH
+    local required=(cryptsetup wipefs dmsetup lsblk blkdiscard openssl dd findmnt shred)
+    local missing_tools=()
+    for t in "${required[@]}"; do command -v "$t" &>/dev/null || missing_tools+=("$t"); done
+    if [[ ${#missing_tools[@]} -eq 0 ]]; then
+        checks+=("ok:required_tools:all required tools on PATH")
+    else
+        checks+=("fail:required_tools:missing: ${missing_tools[*]}")
+    fi
+
+    # 5 — at least one LUKS container discoverable
+    local luks_count=0
+    while IFS= read -r _; do (( luks_count++ )); done < <(discover_luks_devices)
+    if (( luks_count > 0 )); then
+        checks+=("ok:luks_devices:${luks_count} LUKS container(s) found")
+    else
+        checks+=("warn:luks_devices:no LUKS containers discovered — nothing to wipe")
+    fi
+
+    local fail_count=0 warn_count=0 ok_count=0
+    for c in "${checks[@]}"; do
+        local level="${c%%:*}"
+        local rest="${c#*:}"
+        local key="${rest%%:*}"
+        local msg="${rest#*:}"
+        printf 'CHECK\t%s\t%s\t%s\n' "$level" "$key" "$msg"
+        case "$level" in
+            ok)   (( ok_count++   )) ;;
+            warn) (( warn_count++ )) ;;
+            fail) (( fail_count++ )) ;;
+        esac
+    done
+
+    local overall=ok
+    (( warn_count > 0 )) && overall=warn
+    (( fail_count > 0 )) && overall=fail
+    ok "health=${overall} ok=${ok_count} warn=${warn_count} fail=${fail_count}"
+}
+
+cmd_change_passphrase() {
+    load_config || die "Not configured"
+    [[ "${PASSWORD_TYPE:-}" == custom ]] || \
+        die "Password type is 'luks' — change that key with: cryptsetup luksChangeKey ${VERIFY_DEVICE:-<device>}"
+
+    local old_pass new_pass
+    old_pass=$(printf '%s' "${argv[0]}" | base64 -d)
+    new_pass=$(printf '%s' "${argv[1]}" | base64 -d)
+
+    prog 20 "Verifying current passphrase"
+    verify_passphrase "$old_pass" || die "Current passphrase incorrect"
+
+    prog 50 "Replacing Argon2id keyslot (~3 s)"
+    destroy_passphrase_luks
+    create_passphrase_luks "$new_pass"
+
+    prog 90 "Verifying new passphrase"
+    verify_passphrase "$new_pass" || die "New passphrase verification failed — please reconfigure"
+
+    ok "Passphrase changed successfully"
+}
+
 # ── lock acquisition ──────────────────────────────────────────────────────────
 acquire_lock() {
     exec 9>"$LOCKFILE"
@@ -498,6 +603,25 @@ case "$cmd" in
         [[ "${#argv[@]}" -ge 1 ]] || die "Missing passphrase"
         acquire_lock
         cmd_wipe_unused
+        ;;
+
+    VERIFY)
+        [[ "${#argv[@]}" -ge 1 ]] || die "Missing passphrase"
+        pass=$(printf '%s' "${argv[0]}" | base64 -d)
+        prog 0 "Verifying passphrase"
+        load_config || die "Not configured"
+        verify_passphrase "$pass" || die "Passphrase incorrect"
+        ok "Passphrase verified — authentication is working correctly"
+        ;;
+
+    HEALTH)
+        cmd_health
+        ;;
+
+    CHANGE_PASSPHRASE)
+        [[ "${#argv[@]}" -ge 2 ]] || die "Expected old and new passphrase"
+        acquire_lock
+        cmd_change_passphrase
         ;;
 
     *)
