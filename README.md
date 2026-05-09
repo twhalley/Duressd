@@ -440,19 +440,103 @@ The double `--force` bypasses systemd's graceful shutdown sequence, which would 
 
 ---
 
+## Triggering via LUKS passphrase at boot
+
+It is possible to fire a wipe when the duress passphrase is typed at the **full-disk-encryption boot prompt** — no terminal, no desktop, no login required — without patching or rebuilding cryptsetup.
+
+### How it works (initramfs hook)
+
+LUKS2 supports up to 32 keyslots. The trick is to:
+
+1. Add the duress passphrase as a real LUKS keyslot on your encrypted volume with `cryptsetup luksAddKey`.
+2. Install a custom **initramfs hook** that runs *before* the standard `cryptroot` script.
+3. The hook tests the typed passphrase against the duress keyslot using `cryptsetup open --test-passphrase`.
+4. If it matches → the hook destroys every LUKS header on the system, scrubs the passphrase from memory, and calls `echo o > /proc/sysrq-trigger` to halt — the filesystem is never mounted.
+5. If it doesn't match → the hook exits cleanly and `cryptroot` proceeds as normal.
+
+No cryptsetup source changes are needed. The hook uses cryptsetup as shipped.
+
+### Implementation sketch
+
+**Debian/Ubuntu** (initramfs-tools):
+
+```
+/etc/initramfs-tools/hooks/duressd          ← copies binaries into initrd
+/etc/initramfs-tools/scripts/local-top/duressd  ← runs at passphrase time
+```
+
+The `local-top` script runs before `cryptroot`, has access to block devices, and can call cryptsetup freely.
+
+**Arch / dracut**:
+
+```
+/etc/dracut.conf.d/duressd.conf    ← install_items += ...
+/usr/lib/dracut/modules.d/99duressd/  ← hook module
+```
+
+### Security note
+
+Because the duress passphrase is a real LUKS keyslot, someone who obtains the passphrase *and* physically blocks the hook from running (e.g. boots a live OS) could decrypt the volume. Mitigations:
+
+- Combine with a countdown so the wipe cannot be interrupted.
+- Use a passphrase that differs from your normal unlock key (`type=custom` is already recommended for this).
+- Phase 2 header overwrite makes forensic recovery significantly harder even if the raw sectors survive.
+
+### Status
+
+Not yet implemented — tracked as a roadmap item below.
+
+---
+
 ## Potential improvements
 
-| Feature | Description |
-|---------|-------------|
-| PAM module | Trigger wipe when a "honeypot" username is entered at a login prompt via `pam_exec` — no screen unlocking or terminal required |
-| Network kill-switch | UDP/HTTP listener that triggers wipe on receipt of a signed token from a remote server — useful if the machine goes missing |
-| Dead man's switch | Wipe if a heartbeat ping is not received within N minutes — useful if detained and unable to reach the machine |
-| Auto-test on boot | Silent `TRIGGER_TEST` at service startup; write result to state file so `duressd health` can report it |
-| Duress SSH key | An `authorized_keys` entry that runs `duressd trigger` instead of a shell — remote wipe over SSH |
-| `duressd export-key` | Print the Argon2id container as a base64 blob; `duressd import-key` restores it — backup auth without revealing the passphrase |
-| `duressd schedule` | Register a systemd timer that runs `duressd health` daily and alerts if a check fails |
-| Encrypted config | Wrap `/etc/duressd/config` itself in a LUKS2 container |
-| JSON/quiet output | `--json` flag on `status` and `health` for scripted use |
+### Trigger mechanisms
+
+| Feature | Difficulty | Description |
+|---------|-----------|-------------|
+| **initramfs hook** | Medium | Intercept the LUKS passphrase at the boot prompt — wipe before the OS ever mounts. No cryptsetup patch needed (see section above). Requires generating a custom initrd on install. |
+| **PAM module** | Medium | Trigger wipe when a "honeypot" username is entered at a login prompt via `pam_exec`. Works without unlocking a desktop session. |
+| **Duress SSH key** | Easy | Add an `authorized_keys` entry whose `command=` runs `duressd trigger`. Remote wipe over SSH — useful if you have remote access but can't run the CLI. |
+| **Network kill-switch** | Medium | A lightweight UDP/HTTP listener that triggers wipe on receipt of a cryptographically signed token from a remote server. Useful when the machine goes missing. |
+| **Dead man's switch** | Medium | Wipe if a heartbeat ping is not received within a configurable window. Pair with a mobile app or cron job on another machine — if you stop checking in, the machine wipes itself. |
+| **USB kill key** | Easy | Monitor `udev` events; wipe when a specific USB device (identified by vendor/product ID or a secret file on the device) is inserted or *removed*. |
+| **Bluetooth proximity** | Medium | Wipe when a paired Bluetooth device (phone) goes out of range for longer than N seconds. Acts as a passive dead man's switch. |
+| **Browser trigger** | Easy | Tiny `socat`/`nc` HTTP listener on localhost only — visit a specific URL path to trigger wipe. Useful for bookmarks or scripts that can open URLs. |
+| **TOTP / OTP code** | Medium | Support a time-based one-time password as the duress passphrase. Every 30 s the valid code changes — reduces replay risk if someone observes you typing it. |
+
+### Wipe depth & hardware
+
+| Feature | Difficulty | Description |
+|---------|-----------|-------------|
+| **SED / OPAL** | Hard | Issue a hardware `PSID revert` or `ATA Secure Erase` command to self-encrypting drives. Cryptographically instantaneous — the drive's internal key is gone in milliseconds. Falls back to software wipe if unsupported. |
+| **UEFI variable wipe** | Medium | Clear NVRAM variables (`efivar`) and optionally enrolled Secure Boot keys after Phase 1. Prevents booting a known-good OS image from another device that might read leaked memory. |
+| **TPM key eviction** | Medium | Flush TPM-sealed keys (`tpm2_evictcontrol`, `tpm2_flushcontext`) during Phase 1 so TPM-unsealed FDE keys are permanently gone. |
+| **RAM scrub** | Hard | Write random patterns to all accessible RAM before poweroff. Mitigates cold-boot attacks. Requires a custom kernel module or early-exit userspace loop before the MMU shuts down. |
+| **Multi-pass overwrite** | Easy | Option to run DoD 5220.22-M (3-pass) or Gutmann (35-pass) instead of single-pass random. Mainly useful for rotational HDDs. |
+| **NVMe Sanitize** | Easy | Issue `nvme sanitize` (crypto-erase or block-erase mode) to NVMe drives in addition to software wipe. Faster and more thorough than overwriting sectors. |
+
+### Operational
+
+| Feature | Difficulty | Description |
+|---------|-----------|-------------|
+| **Auto-test on boot** | Easy | Run a silent `TRIGGER_TEST` at service startup; write result and timestamp to the state file. `duressd health` reports whether the last boot-time test passed. |
+| **`duressd schedule`** | Easy | Register a systemd timer that runs `duressd health` daily and writes failures to the journal. Optionally sends a desktop notification or email alert. |
+| **`duressd export-key`** | Easy | Serialise the Argon2id container to a base64 blob (stdout or QR code). `duressd import-key` restores it. Lets you back up authentication without exposing the passphrase. |
+| **Audit log** | Easy | Append a tamper-evident log entry (timestamp, command, outcome) for every authentication attempt and wipe event. Stored in `/var/log/duressd.log` (root-only). |
+| **Encrypted config** | Medium | Wrap `/etc/duressd/config` in its own LUKS2 container so configuration (verify device path, wipe flags) is not readable without the duress passphrase. |
+| **Multi-machine wipe** | Medium | After wiping locally, SSH to a list of configured hosts and run `duressd trigger` there too. Useful for setups where sensitive data lives on multiple machines. |
+| **Config sync** | Medium | Encrypt and push the config to a remote endpoint (S3, SFTP, git) after each configure. Pull and restore on a fresh install without manual re-configuration. |
+
+### UX / output
+
+| Feature | Difficulty | Description |
+|---------|-----------|-------------|
+| **JSON output** | Easy | `--json` flag on `status`, `health`, and `scan` for scripting and monitoring integrations. |
+| **systemd-notify** | Easy | Call `systemd-notify READY=1` from the daemon so the service shows a proper `active (running)` status in `systemctl status` rather than just `active`. |
+| **`duressd lock`** | Easy | Require passphrase re-entry before any duressd command runs for N minutes — prevents an attacker with a logged-in terminal from running `duressd unconfigure`. |
+| **TUI menu** | Medium | Replace the plain-text interactive menu with a `dialog`/`whiptail` TUI for a more polished experience on headless servers. |
+| **Quiet / script mode** | Easy | `--quiet` flag that suppresses all output except the final OK/ERROR line. Makes duressd composable in larger scripts. |
+| **Notification hooks** | Easy | `POST_WIPE_HOOK` config key — a shell command run just before Phase 4 (e.g. send a push notification, POST to a webhook, or write to a remote log). |
 
 ---
 
