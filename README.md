@@ -64,13 +64,29 @@ duressd trigger          ← enter duress passphrase
 
 ## Installation
 
+### One-liner (recommended)
+
+```bash
+curl -sSL https://raw.githubusercontent.com/twhalley/Duressd/main/get.sh | sudo bash
+```
+
+Or with `wget`:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/twhalley/Duressd/main/get.sh | sudo bash
+```
+
+`get.sh` downloads the latest source from the `main` branch, extracts it to a temporary directory, and runs `install.sh install` automatically. The temp directory is cleaned up on exit.
+
+### Manual install
+
 ```bash
 git clone https://github.com/twhalley/Duressd.git
 cd Duressd
 sudo ./install.sh install
 ```
 
-`install.sh` copies binaries, installs the systemd unit, enables and starts the service, and drops shell aliases into `/etc/profile.d/duressd.sh`.
+`install.sh` copies binaries, installs the systemd unit, enables and starts the service, and installs shell aliases for bash, zsh, and fish.
 
 ```
 sudo ./install.sh install     # install everything
@@ -83,7 +99,7 @@ sudo ./install.sh status      # check all components are present and running
 ## Quick start
 
 ```bash
-# 1. Configure
+# 1. Configure your duress passphrase and wipe options
 sudo duressd configure
 
 # 2. Verify the passphrase was stored correctly
@@ -92,7 +108,7 @@ duressd verify
 # 3. Preflight check — confirm everything is ready
 duressd health
 
-# 4. Dry run — exercise the full wipe chain
+# 4. Dry run — exercise the full wipe chain on a throwaway container
 duressd test
 
 # 5. (Optional) Install shortcuts for your desktop
@@ -131,6 +147,8 @@ Set a countdown (e.g. `5` seconds) to allow aborting a real wipe by pressing `Ct
 
 Run `duressd` with no arguments to open the interactive menu.
 
+---
+
 ### `duressd status`
 
 Shows the daemon state and the active configuration.
@@ -149,6 +167,34 @@ State values: `IDLE` · `WIPING` · `TESTING` · `PREP_WIPING` · `DONE`
 
 ---
 
+### `duressd health`
+
+Single-command preflight check. Reports pass/warn/fail for each component:
+
+| Check | What is verified |
+|-------|-----------------|
+| `service_running` | `duressd.service` is active |
+| `config_file` | `/etc/duressd/config` exists |
+| `auth_backend` | LUKS device accessible (type=luks) or `passphrase.luks` present (type=custom) |
+| `required_tools` | All wipe-chain binaries are on PATH |
+| `luks_devices` | At least one LUKS container is discoverable |
+
+```bash
+duressd health
+```
+
+---
+
+### `duressd verify`
+
+**Non-destructive.** Tests that the stored passphrase is correct and that the authentication backend can validate it — without touching any real device. Run this after `configure` or `change-passphrase` to confirm authentication works.
+
+```bash
+duressd verify
+```
+
+---
+
 ### `duressd configure`
 
 Interactive wizard. Sets up the duress passphrase, wipe depth, and countdown. Safe to re-run — it overwrites the existing config.
@@ -164,6 +210,53 @@ Countdown before real wipe (0 = disabled): 5
 ```
 
 The daemon scans all block devices to find which one your LUKS passphrase unlocks. That device path is stored as `VERIFY_DEVICE` so future authentication is O(1).
+
+---
+
+### `duressd change-passphrase`
+
+Atomically replaces the duress passphrase for `type=custom` configurations. Verifies the old passphrase, destroys the old Argon2id keyslot, creates a new one, then verifies the new one before reporting success.
+
+For `type=luks` configurations use `cryptsetup luksChangeKey <device>` directly.
+
+```bash
+duressd change-passphrase
+```
+
+---
+
+### `duressd unconfigure`
+
+Erases the Argon2id keyslot container (`shred`), removes `/etc/duressd/config`. Requires the duress passphrase (or LUKS passphrase for `type=luks`).
+
+---
+
+### `duressd passgen`
+
+Generates a strong random passphrase. Three modes:
+
+| Mode | Example length | Source |
+|------|---------------|--------|
+| Base64 | 24 chars | `openssl rand -base64 18` |
+| Hex | 32 chars | `openssl rand -hex 16` |
+| Words | 4 words | `/usr/share/dict/words` via `openssl rand` indices |
+
+```bash
+duressd passgen
+```
+
+The passphrase is printed once and not stored — copy it before continuing.
+
+---
+
+### `duressd logs [N]`
+
+Shows the last *N* lines (default 50) of the `duressd` service journal with colour-highlighted output — errors in red, warnings in yellow, start/stop events in green.
+
+```bash
+duressd logs
+duressd logs 100
+```
 
 ---
 
@@ -193,83 +286,6 @@ Displayed in **red** throughout.
 duressd trigger
 # or
 dwipe_real
-```
-
----
-
-### `duressd unconfigure`
-
-Erases the Argon2id keyslot container (`shred`), removes `/etc/duressd/config`. Requires the duress passphrase (or LUKS passphrase for `type=luks`).
-
----
-
-### `duressd verify`
-
-**Non-destructive.** Tests that the stored passphrase is correct and that the authentication backend (`LUKS --test-passphrase` or the Argon2id container) can validate it — without touching any real device.
-
-Run this regularly after configure or after a `change-passphrase` to confirm the system will authenticate at the moment it needs to.
-
-```bash
-duressd verify
-```
-
----
-
-### `duressd health`
-
-Single-command preflight check. Reports pass/warn/fail for each component:
-
-| Check | What is verified |
-|-------|-----------------|
-| `service_running` | `duressd.service` is active |
-| `config_file` | `/etc/duressd/config` exists |
-| `auth_backend` | LUKS device accessible (type=luks) or `passphrase.luks` present (type=custom) |
-| `required_tools` | All wipe-chain binaries are on PATH |
-| `luks_devices` | At least one LUKS container is discoverable |
-
-```bash
-duressd health
-```
-
----
-
-### `duressd change-passphrase`
-
-Atomically replaces the duress passphrase for `type=custom` configurations. Verifies the old passphrase, destroys the old Argon2id keyslot, and creates a new one. Automatically verifies the new passphrase before reporting success.
-
-For `type=luks` configurations, the duress passphrase **is** your LUKS passphrase — use `cryptsetup luksChangeKey` directly.
-
-```bash
-duressd change-passphrase
-```
-
----
-
-### `duressd passgen`
-
-Generates a strong random passphrase. Three modes:
-
-| Mode | Example | Source |
-|------|---------|--------|
-| Base64 | `Kj3mP+xQrL8fVwN2eZpA` | `openssl rand -base64 18` (24 chars) |
-| Hex | `a3f7c2d19b4e6082...` | `openssl rand -hex 16` (32 chars) |
-| Words | `river-table-cloud-fence` | 4 words from `/usr/share/dict/words` |
-
-```bash
-duressd passgen
-```
-
-The generated passphrase is printed once and not stored — copy it before continuing.
-
----
-
-### `duressd logs [N]`
-
-Shows the last *N* lines (default 50) of the `duressd` service journal with colour-highlighted output — errors in red, warnings in yellow, start/stop events in green.
-
-```bash
-duressd logs
-duressd logs 100
 ```
 
 ---
@@ -344,11 +360,17 @@ duressd service stop
 
 ## Shell aliases
 
-Installed to `/etc/profile.d/duressd.sh` (active for all login shells after re-login):
+Installed automatically during `install.sh install`. Active for all login shells after re-login or shell restart.
+
+| Shell | Location | Notes |
+|-------|----------|-------|
+| bash | `/etc/profile.d/duressd.sh` | Sourced by all login shells |
+| zsh | `/etc/profile.d/duressd.sh` | Sourced when zsh reads `/etc/profile` (default on most distros) |
+| fish | `/etc/fish/conf.d/duressd.fish` | Installed automatically if `fish` is on PATH |
 
 ```bash
-alias dwipe_test='duressd test'
-alias dwipe_real='duressd trigger'
+alias dwipe_test='duressd test'    # non-destructive dry run
+alias dwipe_real='duressd trigger' # destructive real wipe
 ```
 
 ---
@@ -418,6 +440,22 @@ The double `--force` bypasses systemd's graceful shutdown sequence, which would 
 
 ---
 
+## Potential improvements
+
+| Feature | Description |
+|---------|-------------|
+| PAM module | Trigger wipe when a "honeypot" username is entered at a login prompt via `pam_exec` — no screen unlocking or terminal required |
+| Network kill-switch | UDP/HTTP listener that triggers wipe on receipt of a signed token from a remote server — useful if the machine goes missing |
+| Dead man's switch | Wipe if a heartbeat ping is not received within N minutes — useful if detained and unable to reach the machine |
+| Auto-test on boot | Silent `TRIGGER_TEST` at service startup; write result to state file so `duressd health` can report it |
+| Duress SSH key | An `authorized_keys` entry that runs `duressd trigger` instead of a shell — remote wipe over SSH |
+| `duressd export-key` | Print the Argon2id container as a base64 blob; `duressd import-key` restores it — backup auth without revealing the passphrase |
+| `duressd schedule` | Register a systemd timer that runs `duressd health` daily and alerts if a check fails |
+| Encrypted config | Wrap `/etc/duressd/config` itself in a LUKS2 container |
+| JSON/quiet output | `--json` flag on `status` and `health` for scripted use |
+
+---
+
 ## Troubleshooting
 
 **`daemon socket not found`**
@@ -440,3 +478,9 @@ Expected if `wipefs` already zeroed the LUKS magic. The data is already unrecove
 
 **Countdown does not abort when I press Ctrl-C in a script**
 Send `SIGINT` to the `socat` process that holds the socket connection. Closing the socket is what triggers the abort on the daemon side.
+
+**One-liner installer fails with "extraction failed"**
+GitHub archive layout changed or download was interrupted. Try the manual install:
+```bash
+git clone https://github.com/twhalley/Duressd.git && cd Duressd && sudo ./install.sh install
+```

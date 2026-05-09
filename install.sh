@@ -8,7 +8,8 @@ LIBDIR=/usr/local/lib/duressd
 BINDIR=/usr/local/bin
 UNITDIR=/etc/systemd/system
 CFGDIR=/etc/duressd
-ALIASES=/etc/profile.d/duressd.sh
+ALIASES=/etc/profile.d/duressd.sh        # bash / zsh / sh-compatible
+FISH_ALIASES=/etc/fish/conf.d/duressd.fish
 SRC="$(cd "$(dirname "$0")/src" && pwd)"
 SYSTEMD_SRC="$(cd "$(dirname "$0")/systemd" && pwd)"
 
@@ -206,6 +207,12 @@ cmd_install() {
     step "Installing shell aliases to $ALIASES"
     install -m 0644 "$SRC/aliases.sh" "$ALIASES"
 
+    if command -v fish &>/dev/null; then
+        step "Installing fish aliases to $FISH_ALIASES"
+        install -d -m 0755 /etc/fish/conf.d
+        install -m 0644 "$SRC/aliases.fish" "$FISH_ALIASES"
+    fi
+
     step "Installing systemd unit"
     install -m 0644 "$SYSTEMD_SRC/duressd.service" "$UNITDIR/duressd.service"
 
@@ -246,6 +253,7 @@ cmd_uninstall() {
 
     step "Removing shell aliases"
     rm -f "$ALIASES"
+    rm -f "$FISH_ALIASES"
 
     if [[ -d "$CFGDIR" ]]; then
         warn "Configuration directory $CFGDIR/ still exists."
@@ -293,6 +301,16 @@ cmd_status() {
     [[ -f "$CFGDIR/config" ]] && \
         echo -e "  ${GRN}✔${RST}  $CFGDIR/config  ${GRN}(configured)${RST}" || \
         echo -e "  ${YLW}⚠${RST}  $CFGDIR/config  ${YLW}(not configured — run: duressd configure)${RST}"
+
+    [[ -f "$ALIASES" ]] && \
+        echo -e "  ${GRN}✔${RST}  $ALIASES  ${GRN}(bash/zsh aliases)${RST}" || \
+        echo -e "  ${YLW}⚠${RST}  $ALIASES  ${YLW}(missing)${RST}"
+
+    if command -v fish &>/dev/null; then
+        [[ -f "$FISH_ALIASES" ]] && \
+            echo -e "  ${GRN}✔${RST}  $FISH_ALIASES  ${GRN}(fish aliases)${RST}" || \
+            echo -e "  ${YLW}⚠${RST}  $FISH_ALIASES  ${YLW}(missing)${RST}"
+    fi
 
     echo
     $all_ok && good "All components installed" || warn "Some components missing — run: ./install.sh install"
