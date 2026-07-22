@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Generic recording stub for duressd unit tests.
+#
+# The invoked command name ($0 basename) selects behaviour, so a single file
+# backs every mocked binary (symlinked in by tests/lib/common.bash). Every call
+# is appended to $DURESSD_STUB_LOG as "<name><TAB><args>". Canned output and
+# exit codes are driven by STUB_* environment variables set by each test.
+set -u
+
+name=$(basename "$0")
+args=("$@")
+[[ -n "${DURESSD_STUB_LOG:-}" ]] && printf '%s\t%s\n' "$name" "$*" >>"$DURESSD_STUB_LOG"
+
+_has()      { local a; for a in "${args[@]}"; do [[ "$a" == "$1" ]] && return 0; done; return 1; }
+_contains() { local a; for a in "${args[@]}"; do [[ "$a" == *"$1"* ]] && return 0; done; return 1; }
+_in_list()  { local x="$1" y; shift; for y in $1; do [[ "$y" == "$x" ]] && return 0; done; return 1; }
+_last()     { printf '%s' "${args[${#args[@]}-1]}"; }
+
+case "$name" in
+  cryptsetup)
+    # Drain the piped passphrase so `printf | cryptsetup` never takes SIGPIPE
+    # (which pipefail would turn into a spurious verification failure).
+    _has '--key-file=-' && cat >/dev/null 2>&1
+    sub="${args[0]:-}"
+    case "$sub" in
+      isLuks)
+        _in_list "$(_last)" "${STUB_LUKS_DEVICES:-}" && exit 0 || exit 1 ;;
+      open|luksOpen)
+        if [[ -n "${STUB_VERIFY_OK_DEVICES:-}" ]]; then
+          _in_list "$(_last)" "${STUB_VERIFY_OK_DEVICES:-}" && exit 0 || exit 1
+        fi
+        exit "${STUB_VERIFY_RC:-0}" ;;
+      status)
+        printf '%s\n' "${STUB_CRYPTSETUP_STATUS:-}"; exit 0 ;;
+      luksFormat|luksErase|luksAddKey|luksChangeKey)
+        exit "${STUB_CRYPTSETUP_RC:-0}" ;;
+      *) exit 0 ;;
+    esac ;;
+
+  lsblk)
+    # Dispatch on the exact -o column spec so different queries are separable.
+    if   _has NAME,PARTTYPE,FSTYPE,MOUNTPOINT; then printf '%s\n' "${STUB_LSBLK_BOOTSCAN:-}"
+    elif _has NAME,PARTTYPE;                   then printf '%s\n' "${STUB_LSBLK_PARTTYPE:-}"
+    elif _has NAME,TYPE;                       then printf '%s\n' "${STUB_LSBLK_NAMETYPE:-}"
+    elif _contains PKNAME;                     then printf '%s\n' "${STUB_PKNAME:-}"
+    elif _contains SIZE;                       then printf '%s\n' "${STUB_SIZE:-10485760}"
+    elif _contains FSTYPE; then
+      # Per-device fstype query — device is the last argument.
+      var="STUB_FSTYPE_$(printf '%s' "$(_last)" | tr -c 'A-Za-z0-9' '_')"
+      printf '%s\n' "${!var:-${STUB_FSTYPE:-}}"
+    else printf '%s\n' "${STUB_LSBLK_NAME:-}"
+    fi
+    exit 0 ;;
+
+  openssl)
+    if [[ "${args[0]:-}" == rand ]]; then
+      n="$(_last)"
+      if   _has -hex;    then head -c "$n" /dev/zero | od -An -tx1 | tr -d ' \n'; echo
+      elif _has -base64; then head -c "$n" /dev/zero | base64
+      else head -c "$n" /dev/zero
+      fi
+    fi
+    exit 0 ;;
+
+  dmsetup)
+    if _contains ls; then
+      [[ -n "${STUB_DMSETUP_CRYPT:-}" ]] && printf '%s\n' "${STUB_DMSETUP_CRYPT}"
+    fi
+    exit 0 ;;
+
+  findmnt)    printf '%s\n' "${STUB_FINDMNT:-}"; exit 0 ;;
+  efibootmgr) printf '%s\n' "${STUB_EFIBOOTMGR:-}"; exit 0 ;;
+
+  systemctl)
+    [[ "${args[0]:-}" == is-active ]] && exit "${STUB_SYSTEMCTL_ISACTIVE_RC:-0}"
+    exit 0 ;;
+
+  dd) cat >/dev/null 2>&1; exit 0 ;;
+
+  wipefs|blkdiscard|mdadm|shred|umount|sync|blockdev|partprobe|sfdisk)
+    exit 0 ;;
+
+  *) exit 0 ;;
+esac

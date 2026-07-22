@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# Build a bootable, LUKS-encrypted Arch disk image pre-provisioned with a
+# standard sudo user, sshd, and duressd (configured + SSH duress trigger) for
+# PHYSICAL wipe testing on a laptop.
+#
+#   sudo LUKS_PASS=... DURESS_PASS=... USER_PASS=... \
+#        bash tests/physical/build-laptop-image.sh
+#
+# Produces:
+#   <OUT>                the raw disk image  ->  dd it onto the laptop's disk
+#   <OUT>.duress-key     the private SSH key for the remote duress trigger
+#
+# Env (required): LUKS_PASS DURESS_PASS USER_PASS
+# Env (optional): USERNAME=tester HOSTNAME=duressd-test SIZE=12G
+#                 OUT=duressd-laptop.raw AUTO_UNLOCK=0 QCOW2=0
+#                 WIPE_HARDWARE_KEYS=true WIPE_COUNTDOWN=0
+#
+# Boot model: at power-on you type LUKS_PASS to unlock and boot normally; the
+# separate DURESS_PASS fires the wipe (locally `sudo duressd trigger`, or over
+# SSH). Set AUTO_UNLOCK=1 to embed a keyfile so the laptop boots headless.
+set -euo pipefail
+
+# `--clean` tears down any leftover build state from an interrupted run
+# (recursive unmount of the chroot binds, close the build LUKS mapping, detach
+# the loop). Safe: only touches /tmp/duressd-build.* and duressd_build_* names.
+if [[ "${1:-}" == --clean ]]; then
+    [[ $EUID -eq 0 ]] || { echo "run as root: sudo bash $0 --clean" >&2; exit 1; }
+    echo "  →  tearing down leftover duressd build state"
+    for m in /tmp/duressd-build.*; do
+        [[ -d "$m" ]] || continue
+        mountpoint -q "$m" && { echo "     umount -R $m"; umount -R "$m" 2>/dev/null || true; }
+        rmdir "$m" 2>/dev/null || true
+    done
+    for d in /dev/mapper/duressd_build_*; do
+        [[ -e "$d" ]] && { echo "     cryptsetup close $(basename "$d")"; cryptsetup close "$(basename "$d")" 2>/dev/null || true; }
+    done
+    for l in $(losetup -j "${OUT:-$PWD/duressd-laptop.raw}" 2>/dev/null | cut -d: -f1); do
+        echo "     losetup -d $l"; losetup -d "$l" 2>/dev/null || true
+    done
+    echo "  ✔  cleanup complete"
+    exit 0
+fi
+
+[[ $EUID -eq 0 ]] || { echo "must run as root" >&2; exit 1; }
+for v in LUKS_PASS DURESS_PASS USER_PASS; do
+    [[ -n "${!v:-}" ]] || { echo "set $v (e.g. LUKS_PASS=..., DURESS_PASS=..., USER_PASS=...)" >&2; exit 1; }
+done
+for t in pacstrap sfdisk losetup cryptsetup mkfs.vfat mkfs.ext4 ssh-keygen; do
+    command -v "$t" >/dev/null || { echo "missing tool: $t (need arch-install-scripts, dosfstools, openssh)" >&2; exit 1; }
+done
+
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+USERNAME="${USERNAME:-tester}"
+HOSTNAME="${HOSTNAME:-duressd-test}"
+SIZE="${SIZE:-12G}"
+OUT="${OUT:-$PWD/duressd-laptop.raw}"
+AUTO_UNLOCK="${AUTO_UNLOCK:-0}"
+WIPE_HW="${WIPE_HARDWARE_KEYS:-true}"
+COUNTDOWN="${WIPE_COUNTDOWN:-0}"
+KEYOUT="${OUT}.duress-key"
+
+# Unique dm-crypt mapping name for THIS build, so we never collide with — or
+# accidentally tear down — the host's own mappings (e.g. /dev/mapper/root).
+MAPNAME="duressd_build_$$"
+# Private throwaway mountpoint — never the conventional /mnt, so we can never
+# shadow or unmount whatever the host may have mounted there.
+MNT="$(mktemp -d /tmp/duressd-build.XXXXXX)"
+
+LOOP=""
+cleanup() {
+    set +e
+    # Recursive unmount handles the ESP, the root, AND any arch-chroot API binds
+    # (proc/sys/dev/efivars) that a killed run may have left mounted under $MNT.
+    mountpoint -q "$MNT" && umount -R "$MNT" 2>/dev/null
+    [[ -e "/dev/mapper/$MAPNAME" ]] && cryptsetup close "$MAPNAME"
+    [[ -n "$LOOP" ]] && losetup -d "$LOOP"
+    [[ -n "${MNT:-}" ]] && rmdir "$MNT" 2>/dev/null
+}
+trap cleanup EXIT INT TERM
+
+echo "  →  allocating $SIZE raw image at $OUT"
+# Detach any stale loop from a previous run and start from a clean file, so
+# leftover vfat/LUKS signatures can never trigger an interactive sfdisk prompt.
+for l in $(losetup -j "$OUT" 2>/dev/null | cut -d: -f1); do
+    losetup -d "$l" 2>/dev/null || true
+done
+rm -f "$OUT" "$KEYOUT" "$KEYOUT.pub"
+truncate -s "$SIZE" "$OUT"
+LOOP="$(losetup -P --find --show "$OUT")"
+echo "     loop device: $LOOP"
+
+echo "  →  partitioning (ESP + LUKS root)"
+# --wipe=always / --wipe-partitions=always: remove any existing signatures
+# without prompting (belt-and-suspenders with the fresh file above).
+sfdisk --wipe=always --wipe-partitions=always "$LOOP" <<'EOF'
+label: gpt
+,1G,U
+,,L
+EOF
+udevadm settle 2>/dev/null || sleep 1
+ESP="${LOOP}p1"; ROOTP="${LOOP}p2"
+echo "     partitions:"
+lsblk -o NAME,SIZE,TYPE,FSTYPE "$LOOP" 2>/dev/null || true
+
+echo "  →  filesystems + LUKS root"
+mkfs.vfat -F32 "$ESP" >/dev/null
+printf '%s' "$LUKS_PASS" | cryptsetup luksFormat --type luks2 --batch-mode --key-file=- "$ROOTP"
+printf '%s' "$LUKS_PASS" | cryptsetup open --key-file=- "$ROOTP" "$MAPNAME"
+mkfs.ext4 -q "/dev/mapper/$MAPNAME"
+
+mount "/dev/mapper/$MAPNAME" "$MNT"
+mkdir -p "$MNT"/boot
+mount "$ESP" "$MNT"/boot     # ESP mounted at /boot: systemd-boot reads kernels here
+
+echo "  →  pacstrap base system + duressd deps"
+pacstrap -K "$MNT" base linux linux-firmware mkinitcpio systemd sudo openssh \
+    networkmanager cryptsetup socat util-linux openssl coreutils efibootmgr \
+    tpm2-tools vim
+
+ROOT_UUID="$(blkid -s UUID -o value "$ROOTP")"
+genfstab -U "$MNT" >> "$MNT"/etc/fstab
+
+# Optional headless auto-unlock: keyfile embedded in the initramfs.
+CRYPTKEY=""
+if [[ "$AUTO_UNLOCK" == 1 ]]; then
+    echo "  →  embedding LUKS keyfile for headless auto-unlock"
+    dd if=/dev/urandom of="$MNT"/crypto_keyfile.bin bs=512 count=8 status=none
+    chmod 000 "$MNT"/crypto_keyfile.bin
+    printf '%s' "$LUKS_PASS" | cryptsetup luksAddKey --key-file=- "$ROOTP" "$MNT"/crypto_keyfile.bin
+    CRYPTKEY="cryptkey=rootfs:/crypto_keyfile.bin"
+    sed -i 's|^FILES=.*|FILES=(/crypto_keyfile.bin)|' "$MNT"/etc/mkinitcpio.conf
+fi
+
+echo "  →  installing duressd into the image"
+install -Dm755 "$REPO_ROOT/src/handler" "$MNT"/usr/local/lib/duressd/handler
+install -Dm755 "$REPO_ROOT/src/daemon"  "$MNT"/usr/local/lib/duressd/daemon
+install -Dm755 "$REPO_ROOT/src/cli"     "$MNT"/usr/local/bin/duressd
+install -Dm644 "$REPO_ROOT/systemd/duressd.service" "$MNT"/etc/systemd/system/duressd.service
+install -Dm644 "$REPO_ROOT/src/aliases.sh"   "$MNT"/etc/profile.d/duressd.sh
+
+# Generate the duress SSH keypair on the host so we can hand you the private key.
+echo "  →  generating duress SSH key → $KEYOUT"
+rm -f "$KEYOUT" "$KEYOUT.pub"
+ssh-keygen -t ed25519 -N '' -C duressd-duress -f "$KEYOUT" >/dev/null
+install -d -m0700 "$MNT"/root/.ssh
+printf 'command="duressd trigger-remote",restrict %s\n' "$(cat "$KEYOUT.pub")" \
+    >> "$MNT"/root/.ssh/authorized_keys
+chmod 0600 "$MNT"/root/.ssh/authorized_keys
+
+echo "  →  chroot: system config, users, bootloader, duressd config"
+# Quoted heredoc: nothing is expanded by THIS shell — every value below comes
+# from the environment inside the chroot (arch-chroot inherits exported vars),
+# so passwords containing $, backticks, etc. can neither break the script nor
+# be injected into it.
+export USERNAME HOSTNAME USER_PASS DURESS_PASS ROOT_UUID CRYPTKEY WIPE_HW COUNTDOWN
+arch-chroot "$MNT" /bin/bash -euo pipefail <<'CHROOT'
+ln -sf /usr/share/zoneinfo/UTC /etc/localtime; hwclock --systohc 2>/dev/null || true
+echo 'en_US.UTF-8 UTF-8' > /etc/locale.gen; locale-gen
+echo 'LANG=en_US.UTF-8' > /etc/locale.conf
+echo "$HOSTNAME" > /etc/hostname
+
+# initramfs with the encrypt hook (+ keyboard/keymap so you can type the passphrase)
+sed -i 's/^HOOKS=.*/HOOKS=(base udev autodetect modconf kms keyboard keymap consolefont block encrypt filesystems fsck)/' /etc/mkinitcpio.conf
+mkinitcpio -P
+
+# standard sudo user + root password; enable wheel sudo
+useradd -m -G wheel -s /bin/bash "$USERNAME"
+printf '%s:%s\n' "$USERNAME" "$USER_PASS" | chpasswd
+printf 'root:%s\n' "$USER_PASS" | chpasswd
+sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
+
+# services: network, ssh, duressd
+systemctl enable NetworkManager sshd duressd.service
+# sshd: allow the user's password login; root only for the forced-command duress key
+sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin forced-commands-only/' /etc/ssh/sshd_config
+
+# systemd-boot
+bootctl --esp-path=/boot install --no-variables
+cat > /boot/loader/loader.conf <<LOADER
+default arch.conf
+timeout 3
+LOADER
+cat > /boot/loader/entries/arch.conf <<ENTRY
+title Arch (duressd test)
+linux /vmlinuz-linux
+initrd /initramfs-linux.img
+options cryptdevice=UUID=${ROOT_UUID}:root root=/dev/mapper/root rw $CRYPTKEY
+ENTRY
+
+# pre-configure duressd (custom passphrase, boot-artifact wipe on)
+install -d -m0700 /etc/duressd
+dd if=/dev/zero of=/etc/duressd/passphrase.luks bs=1M count=8 status=none
+chmod 0600 /etc/duressd/passphrase.luks
+printf '%s' "$DURESS_PASS" | cryptsetup luksFormat --type luks2 --batch-mode \
+    --pbkdf argon2id --key-file=- /etc/duressd/passphrase.luks
+cat > /etc/duressd/config <<CFG
+CONFIGURED=true
+PASSWORD_TYPE=custom
+VERIFY_DEVICE=
+OVERWRITE_LUKS_HEADER=false
+WIPE_FULL_DEVICE=false
+WIPE_BOOT_ARTIFACTS=true
+WIPE_HARDWARE_KEYS=$WIPE_HW
+WIPE_COUNTDOWN=$COUNTDOWN
+CFG
+chmod 0600 /etc/duressd/config
+CHROOT
+
+umount "$MNT"/boot "$MNT"
+cryptsetup close "$MAPNAME"
+losetup -d "$LOOP"; LOOP=""
+
+if [[ "${QCOW2:-0}" == 1 ]] && command -v qemu-img >/dev/null; then
+    echo "  →  converting to qcow2"
+    qemu-img convert -f raw -O qcow2 "$OUT" "${OUT%.raw}.qcow2"
+    echo "  ✔  ${OUT%.raw}.qcow2"
+fi
+
+cat <<DONE
+
+  ✔  built $OUT
+  ✔  duress SSH private key: $KEYOUT
+
+  Provision the laptop (DESTROYS its current disk):
+    sudo dd if=$OUT of=/dev/<laptop-disk> bs=64M conv=fsync status=progress
+    # confirm the target with: lsblk -o NAME,SIZE,MODEL,SERIAL
+
+  Log in:
+    console/ssh user: $USERNAME   (password you set in USER_PASS)
+    at boot, unlock LUKS with the LUKS_PASS you set${CRYPTKEY:+ (or it auto-unlocks)}
+
+  Trigger the duress wipe:
+    local:   sudo duressd trigger        # or:  sudo duressd status / health
+    remote:  printf '%s' '<DURESS_PASS>' | ssh -i $KEYOUT -T root@<laptop-ip>
+
+  Then verify with tests/physical/verify-wipe.sh from a live USB.
+DONE

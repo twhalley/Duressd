@@ -1,0 +1,37 @@
+name: e2e
+
+# KVM end-to-end is heavy (builds encrypted OS images, boots real bootloaders).
+# It is opt-in: run it manually, or on a self-hosted/KVM-capable runner.
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  kvm-e2e:
+    name: KVM end-to-end
+    # GitHub's standard runners expose /dev/kvm on the newer larger images;
+    # override with a self-hosted label if yours does not.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check KVM availability
+        run: |
+          if [[ ! -e /dev/kvm ]]; then
+            echo "::warning::/dev/kvm not available on this runner — e2e will run un-accelerated or should move to a self-hosted runner"
+          fi
+
+      - name: Install QEMU + tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils ovmf cryptsetup-bin dosfstools
+
+      # NOTE: build-golden.sh currently targets an Arch host (pacstrap). On a
+      # Debian/Ubuntu runner, provide pre-built golden images as an artifact or
+      # port the builder to debootstrap. See docs/TESTING.md.
+      - name: Run e2e (expects pre-built golden images)
+        run: sudo E2E_OVMF=/usr/share/OVMF/OVMF_CODE.fd bash tests/e2e/run.sh

@@ -3,11 +3,13 @@
 # subprocess per client connection via socat.
 set -euo pipefail
 
-RUNDIR=/run/duressd
-SOCKET=$RUNDIR/control.sock
-LIBDIR=/usr/local/lib/duressd
+# Paths are overridable via env for testing; systemd leaves them unset.
+RUNDIR=${DURESSD_RUNDIR:-/run/duressd}
+SOCKET=${DURESSD_SOCKET:-$RUNDIR/control.sock}
+LIBDIR=${DURESSD_LIBDIR:-/usr/local/lib/duressd}
 
-install -d -m 0700 -o root -g root "$RUNDIR"
+# Running as root under systemd, so root ownership is implicit.
+install -d -m 0700 "$RUNDIR"
 rm -f "$SOCKET"
 echo IDLE > "$RUNDIR/state"
 

@@ -1,1 +1,4 @@
 .claude/
+
+# E2E golden disk images (built locally, never committed)
+tests/e2e/images/

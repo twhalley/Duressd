@@ -119,15 +119,20 @@ _pkg_for() {
 check_deps() {
     # Required: wipe chain cannot run without these.
     local required=(socat cryptsetup wipefs dmsetup lsblk blkdiscard openssl dd findmnt shred)
-    # Optional: only needed when WIPE_ALL_LUKS=true targets RAID arrays.
-    local optional=(mdadm)
+    # Optional: enable extra wipe depth —
+    #   mdadm       RAID teardown (Phase 3)
+    #   efibootmgr  UEFI NVRAM entry removal (Phase 1.5 boot-artifact wipe)
+    #   tpm2_clear  TPM-sealed key eviction (Phase 1.6 hardware-key wipe)
+    local optional=(mdadm efibootmgr tpm2_clear)
 
     local missing=() missing_opt=()
     for cmd in "${required[@]}";  do command -v "$cmd" &>/dev/null || missing+=("$cmd");     done
     for cmd in "${optional[@]}";  do command -v "$cmd" &>/dev/null || missing_opt+=("$cmd"); done
 
-    [[ ${#missing_opt[@]} -gt 0 ]] && \
-        warn "Optional (RAID wipe) tools not found: ${missing_opt[*]}"
+    if [[ ${#missing_opt[@]} -gt 0 ]]; then
+        warn "Optional wipe-depth tools not found: ${missing_opt[*]}"
+        warn "  Packages: mdadm (RAID) · efibootmgr (UEFI) · tpm2-tools (TPM)"
+    fi
 
     if [[ ${#missing[@]} -eq 0 ]]; then
         good "All required tools present"

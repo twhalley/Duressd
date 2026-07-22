@@ -4,16 +4,16 @@
 # Interactive: duressd  (no args → menu)
 set -euo pipefail
 
-SOCKET=/run/duressd/control.sock
+SOCKET=${DURESSD_SOCKET:-/run/duressd/control.sock}
 SERVICE=duressd
 
 # ── colours ───────────────────────────────────────────────────────────────────
 if [[ -t 2 ]]; then
     RED=$'\033[1;31m'   YLW=$'\033[1;33m'   GRN=$'\033[1;32m'
-    CYN=$'\033[1;36m'   BLU=$'\033[1;34m'   MAG=$'\033[1;35m'
+    CYN=$'\033[1;36m'   BLU=$'\033[1;34m'
     DIM=$'\033[2m'      BLD=$'\033[1m'       RST=$'\033[0m'
 else
-    RED='' YLW='' GRN='' CYN='' BLU='' MAG='' DIM='' BLD='' RST=''
+    RED='' YLW='' GRN='' CYN='' BLU='' DIM='' BLD='' RST=''
 fi
 
 # ── banners ───────────────────────────────────────────────────────────────────
@@ -132,7 +132,7 @@ cmd_status() {
     local result
     result=$(send_cmd "$CYN" STATUS) || return 1
 
-    local state="" cfgd="" pt="" vdev="" olh="" wfd="" wcd=""
+    local state="" cfgd="" pt="" vdev="" olh="" wfd="" wba="" whk="" wcd=""
     for pair in $result; do
         case "${pair%%=*}" in
             state)                 state="${pair#*=}" ;;
@@ -141,6 +141,8 @@ cmd_status() {
             verify_device)         vdev="${pair#*=}" ;;
             overwrite_luks_header) olh="${pair#*=}" ;;
             wipe_full_device)      wfd="${pair#*=}" ;;
+            wipe_boot_artifacts)   wba="${pair#*=}" ;;
+            wipe_hardware_keys)    whk="${pair#*=}" ;;
             wipe_countdown)        wcd="${pair#*=}" ;;
         esac
     done
@@ -156,6 +158,8 @@ cmd_status() {
     printf '  %-30s %s\n' "Password type:"         "${pt:-none}" >&2
     printf '  %-30s %s\n' "Verify device:"         "${vdev:-none}" >&2
     printf '  %-30s %s\n' "Overwrite LUKS header:" "${olh:-false}" >&2
+    printf '  %-30s %s\n' "Wipe boot artifacts:"   "${wba:-false}" >&2
+    printf '  %-30s %s\n' "Wipe hardware keys:"    "${whk:-false}" >&2
     printf '  %-30s %s\n' "Wipe full device(s):"   "${wfd:-false}" >&2
     printf '  %-30s %s\n' "Countdown (s):"         "${wcd:-0}" >&2
     echo >&2
@@ -211,6 +215,19 @@ cmd_configure() {
     info "  Slower but overwrites raw header bytes for forensic plausible deniability."
     echo >&2
 
+    local wipe_boot_artifacts
+    wipe_boot_artifacts=$(yn_bool "$(ask \
+        "Phase 1.5 — wipe boot artifacts (ESP, /boot, MBR, UEFI entries)?     [y/N]: ")")
+    info "  Removes the bootloader and unencrypted /boot so no OS remains."
+    info "  Recommended for GRUB, systemd-boot, and especially Qubes OS."
+    echo >&2
+
+    local wipe_hardware_keys
+    wipe_hardware_keys=$(yn_bool "$(ask \
+        "Phase 1.6 — clear hardware keys (TPM-sealed FDE keys)?               [y/N]: ")")
+    info "  Clears the TPM so a TPM-sealed unlock key can never be reused."
+    echo >&2
+
     local wipe_full_device
     wipe_full_device=$(yn_bool "$(ask \
         "Phase 3 — overwrite entire parent block device(s) + RAID teardown?   [y/N]: ")")
@@ -233,7 +250,9 @@ cmd_configure() {
         "$(b64 "$duress_pass")" \
         "$overwrite_luks_header" \
         "$wipe_full_device" \
-        "$wipe_countdown"
+        "$wipe_countdown" \
+        "$wipe_boot_artifacts" \
+        "$wipe_hardware_keys"
 }
 
 # ── unconfigure ───────────────────────────────────────────────────────────────
@@ -283,6 +302,110 @@ cmd_trigger() {
     info "If a countdown is configured, press Ctrl-C now to abort."
     echo >&2
     send_cmd "$RED" TRIGGER "$(b64 "$pass")"
+}
+
+# ── remote / non-interactive trigger ──────────────────────────────────────────
+# For SSH forced-commands and automation. NO prompts and NO "WIPE" confirmation —
+# the ability to invoke it (e.g. a dedicated SSH key) is the authorization.
+# The duress passphrase is taken from, in order:
+#   1. --passphrase-file FILE   (first line)
+#   2. $DURESSD_PASS            (environment)
+#   3. stdin                    (first line)
+# Requires root: the control socket is root-only.
+cmd_trigger_remote() {
+    local passfile="" pass=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --passphrase-file) passfile="$2"; shift 2 ;;
+            -h|--help)
+                echo "usage: duressd trigger-remote [--passphrase-file FILE]" >&2
+                echo "  passphrase from --passphrase-file, \$DURESSD_PASS, or stdin" >&2
+                return 0 ;;
+            *) shift ;;
+        esac
+    done
+
+    if   [[ -n "$passfile" ]];          then IFS= read -r pass < "$passfile" || true
+    elif [[ -n "${DURESSD_PASS:-}" ]];  then pass="$DURESSD_PASS"
+    else IFS= read -r pass || true
+    fi
+    [[ -n "$pass" ]] || { echo "ERROR: no passphrase (use --passphrase-file, \$DURESSD_PASS, or stdin)" >&2; return 1; }
+
+    send_cmd "$RED" TRIGGER "$(b64 "$pass")"
+}
+
+# ── install an SSH duress trigger key ─────────────────────────────────────────
+# Installs a forced-command entry in root's authorized_keys so that connecting
+# with a dedicated key fires the wipe — a remote kill switch. Two modes:
+#   default            operator supplies the passphrase over SSH stdin
+#                        printf '%s' "$PASS" | ssh -i key -T root@host
+#   --embed-passphrase key alone triggers (passphrase stored root-only on disk)
+#                        ssh -i key root@host
+cmd_install_ssh_trigger() {
+    local pubkey="" keydir="${HOME:-/root}/.ssh" embed=false
+    local authkeys="${DURESSD_SSH_AUTHKEYS:-/root/.ssh/authorized_keys}"
+    local passfile="${DURESSD_CFGDIR:-/etc/duressd}/ssh-trigger.pass"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pubkey)            pubkey="$2"; shift 2 ;;
+            --authorized-keys)   authkeys="$2"; shift 2 ;;
+            --embed-passphrase)  embed=true; shift ;;
+            -h|--help)
+                echo "usage: duressd install-ssh-trigger [--pubkey FILE] [--embed-passphrase]" >&2
+                return 0 ;;
+            *) shift ;;
+        esac
+    done
+
+    section "Install SSH duress trigger"
+
+    # Obtain a public key — reuse a supplied one, or generate a fresh keypair.
+    local generated=""
+    if [[ -z "$pubkey" ]]; then
+        command -v ssh-keygen &>/dev/null || { bad "ssh-keygen not found"; return 1; }
+        install -d -m 0700 "$keydir"
+        generated="$keydir/duressd_duress"
+        [[ -f "$generated" ]] && { bad "$generated already exists — remove it or pass --pubkey"; return 1; }
+        ssh-keygen -t ed25519 -N '' -C duressd-duress -f "$generated" >/dev/null
+        pubkey="${generated}.pub"
+        good "Generated keypair: $generated"
+    fi
+    [[ -f "$pubkey" ]] || { bad "public key not found: $pubkey"; return 1; }
+
+    # Build the forced command.
+    local forced="duressd trigger-remote"
+    if [[ "$embed" == true ]]; then
+        local p1 p2
+        p1=$(read_pass "Duress passphrase to embed: "); echo >&2
+        p2=$(read_pass "Confirm: ");                    echo >&2
+        [[ "$p1" == "$p2" ]] || { bad "passphrases do not match"; return 1; }
+        install -d -m 0700 "$(dirname "$passfile")"
+        printf '%s' "$p1" > "$passfile"; chmod 0600 "$passfile"
+        forced="duressd trigger-remote --passphrase-file $passfile"
+        warn "Passphrase stored at $passfile (root 0600) — key alone now triggers a wipe."
+    fi
+
+    # restrict = no pty/agent/port/x11/user-rc (OpenSSH 7.2+).
+    local keymaterial line
+    keymaterial="$(cat "$pubkey")"
+    line="command=\"$forced\",restrict $keymaterial"
+    install -d -m 0700 "$(dirname "$authkeys")"
+    printf '%s\n' "$line" >> "$authkeys"
+    chmod 0600 "$authkeys"
+    good "Forced-command entry added to $authkeys"
+
+    echo >&2
+    info "Trigger the wipe remotely with:"
+    if [[ "$embed" == true ]]; then
+        info "  ssh -i <private-key> root@<host>"
+    else
+        info "  printf '%s' \"\$DURESS_PASS\" | ssh -i <private-key> -T root@<host>"
+    fi
+    if [[ -n "$generated" ]]; then
+        echo >&2
+        warn "Move the PRIVATE key ($generated) off this machine and delete it here:"
+        warn "  shred -u $generated"
+    fi
 }
 
 # ── wipe unused ───────────────────────────────────────────────────────────────
@@ -788,6 +911,10 @@ ${BLD}Actions:${RST}
   ${CYN}service <action>${RST}        Pass action to systemctl (start/stop/status/restart)
   ${RED}trigger${RST}                 ${RED}DESTRUCTIVE: wipe all LUKS volumes and power off${RST}
 
+${BLD}Remote (SSH / automation):${RST}
+  ${RED}trigger-remote${RST}          ${RED}Non-interactive wipe${RST} — passphrase from stdin/\$DURESSD_PASS/--passphrase-file
+  ${CYN}install-ssh-trigger${RST}     Install an SSH forced-command duress key (remote kill switch)
+
 ${BLD}Aliases:${RST}
   dwipe_test   →  duressd test
   dwipe_real   →  duressd trigger
@@ -798,6 +925,12 @@ EOF
 }
 
 # ── main ──────────────────────────────────────────────────────────────────────
+# Source guard: tests set DURESSD_LIB_ONLY=1 to load the helper functions
+# without launching the interactive menu or dispatching a command.
+if [[ "${DURESSD_LIB_ONLY:-}" == 1 ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 if [[ $# -eq 0 ]]; then
     cmd_menu
 else
@@ -817,6 +950,8 @@ else
         install-keybindings)  cmd_install_keybindings ;;
         service)              cmd_service "${2:-status}" ;;
         trigger)              cmd_trigger ;;
+        trigger-remote)       shift; cmd_trigger_remote "$@" ;;
+        install-ssh-trigger)  shift; cmd_install_ssh_trigger "$@" ;;
         -h|--help|help)       usage ;;
         *)                    bad "Unknown command: $1"; usage ;;
     esac
