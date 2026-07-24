@@ -20,9 +20,12 @@ ISO="${ISO:-}"
 
 # Warn if a duressd-built ISO predates the current sources (this only boots it).
 if [[ "$ISO" == *duressd-test* ]] \
-   && [[ -n "$(find "$REPO/src" "$REPO/tests/iso" "$REPO/tests/vm" -newer "$ISO" -print -quit 2>/dev/null)" ]]; then
-    echo "⚠  $ISO is OLDER than the current sources — rebuild it first:  sudo make iso" >&2
-    sleep 2
+   && [[ -n "$(find "$REPO/src" "$REPO/tests/iso" "$REPO/tests/vm" -newer "$ISO" -print -quit 2>/dev/null)" ]] \
+   && [[ "${ALLOW_STALE_ISO:-}" != 1 ]]; then
+    echo "✘  STOP: $ISO is OLDER than the current sources. Rebuild it first:" >&2
+    echo "       sudo make iso    (wait for '✔  ISO built', then re-run)" >&2
+    echo "   (To boot the stale ISO anyway: ALLOW_STALE_ISO=1 make vm-shell ISO=…)" >&2
+    exit 1
 fi
 
 WORK="$(mktemp -d)"
