@@ -39,7 +39,15 @@ new_loop() {
     printf '%s' "$loop"
 }
 
-_loop_base() { local d="${1#/dev/}"; d="${d%%p[0-9]*}"; printf '/dev/%s' "$d"; }
+# Base loop device for a partition path: /dev/loop1p3 → /dev/loop1, /dev/loop1 →
+# /dev/loop1. NB: a naive %%p[0-9]* is wrong — "loop1" itself contains "p1".
+_loop_base() {
+    if [[ "$1" =~ ^(/dev/loop[0-9]+)p[0-9]+$ ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    else
+        printf '%s' "$1"
+    fi
+}
 
 # SAFETY RAIL — abort unless every target is a loop device whose backing file
 # lives under this run's workdir. Called before any destructive helper runs.
