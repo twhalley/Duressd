@@ -40,6 +40,7 @@ WORK="$(mktemp -d)"
 # written regardless (ISO + repo are read-only, the VM disk is RAM); this only
 # removes the extracted kernel/initramfs temp dir and the QEMU child.
 cleanup() {
+    set +e   # never let a failing kill (e.g. swtpm already gone) flip the exit code
     rm -rf "$WORK"
     [[ -n "${QPID:-}" ]]      && kill "$QPID"      2>/dev/null
     [[ -n "${SWTPM_PID:-}" ]] && kill "$SWTPM_PID" 2>/dev/null
