@@ -51,7 +51,9 @@ assert_safe_targets() {
             *) echo "REFUSING destructive op: '$dev' is not a loop device" >&2; return 1 ;;
         esac
         base="$(_loop_base "$dev")"
-        back="$(losetup -nO BACK-FILE "$base" 2>/dev/null || true)"
+        # Prefer sysfs (reliable everywhere); fall back to losetup --list.
+        back="$(cat "/sys/block/${base#/dev/}/loop/backing_file" 2>/dev/null \
+                || losetup -ln -O BACK-FILE "$base" 2>/dev/null || true)"
         if [[ -z "$back" || "$back" != "$INT_WORKDIR"/* ]]; then
             echo "REFUSING destructive op: '$dev' backing '$back' is not under $INT_WORKDIR" >&2
             return 1

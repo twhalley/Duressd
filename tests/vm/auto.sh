@@ -55,7 +55,7 @@ kvm=(); [[ -e /dev/kvm ]] && kvm=(-enable-kvm -cpu host)
 
 # `duressd.poweroff`: the ISO's self-test service shuts the VM down when the
 # suite finishes, so this script needs to drive nothing.
-APPEND="archisobasedir=arch archisosearchuuid=${UUID} console=ttyS0,115200 systemd.show_status=false rd.systemd.show_status=false modprobe.blacklist=floppy duressd.poweroff"
+APPEND="archisobasedir=arch archisosearchuuid=${UUID} console=ttyS0,115200 systemd.show_status=false rd.systemd.show_status=false modprobe.blacklist=floppy loglevel=3 duressd.poweroff"
 
 echo "Booting headless (serial). Live transcript → $LOG" >&2
 # The guest's serial line is this coprocess's stdout: ${VM[0]}.

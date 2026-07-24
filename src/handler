@@ -148,12 +148,17 @@ discover_luks_devices() {
 close_all_crypt_mappings() {
     while IFS=$'\t' read -r name _; do
         [[ -z "$name" ]] && continue
+        # `dmsetup ls` prints this literal line when there are no mappings — it
+        # is not a device name.
+        [[ "$name" == "No devices found" ]] && continue
         # When scoped, only close mappings backed by an in-scope device so an
         # integration run never tears down the host's own encrypted volumes.
         if [[ -n "${DURESSD_TARGET_DEVICES:-}" ]]; then
             local backing
+            # Tolerate a failing `cryptsetup status` (|| true) so set -e can't
+            # abort the whole wipe over one unreadable mapping.
             backing=$(cryptsetup status "$name" 2>/dev/null \
-                | awk '/^[[:space:]]*device:/ {print $2}')
+                | awk '/^[[:space:]]*device:/ {print $2}') || true
             _in_scope "$backing" || continue
         fi
         local mp
@@ -655,10 +660,11 @@ cmd_wipe_unused() {
     # Fill free space on every currently-mounted LUKS volume.
     while IFS=$'\t' read -r name _; do
         [[ -z "$name" ]] && continue
+        [[ "$name" == "No devices found" ]] && continue
         if [[ -n "${DURESSD_TARGET_DEVICES:-}" ]]; then
             local backing
             backing=$(cryptsetup status "$name" 2>/dev/null \
-                | awk '/^[[:space:]]*device:/ {print $2}')
+                | awk '/^[[:space:]]*device:/ {print $2}') || true
             _in_scope "$backing" || continue
         fi
         local mp

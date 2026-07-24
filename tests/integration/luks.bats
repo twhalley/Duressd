@@ -9,7 +9,7 @@ teardown() { int_teardown; }
 luks_format() { printf '%s' "$2" | cryptsetup luksFormat "${LUKS_FAST[@]}" --key-file=- "$1"; }
 
 @test "phase1 destroys a real LUKS2 header (data cryptographically gone)" {
-    loop="$(new_loop 24)"
+    loop="$(new_loop 48)"
     luks_format "$loop" "unlock-me"
     assert_is_luks "$loop"
 
@@ -21,7 +21,7 @@ luks_format() { printf '%s' "$2" | cryptsetup luksFormat "${LUKS_FAST[@]}" --key
 }
 
 @test "phase2 header overwrite leaves no LUKS signature" {
-    loop="$(new_loop 24)"
+    loop="$(new_loop 48)"
     luks_format "$loop" "unlock-me"
 
     export DURESSD_TARGET_DEVICES="$loop"
@@ -35,7 +35,7 @@ luks_format() { printf '%s' "$2" | cryptsetup luksFormat "${LUKS_FAST[@]}" --key
 }
 
 @test "phase3 overwrites the whole parent device" {
-    loop="$(new_loop 16)"
+    loop="$(new_loop 48)"
     luks_format "$loop" "unlock-me"
     # Record a recognizable marker mid-device, then confirm it's gone after wipe.
     printf 'DURESSDMARKER' | dd of="$loop" bs=1 seek=1048576 conv=notrunc status=none
