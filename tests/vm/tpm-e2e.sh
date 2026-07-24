@@ -22,16 +22,18 @@ command -v tpm2_nvdefine >/dev/null \
 export TPM2TOOLS_TCTI="device:/dev/tpmrm0"
 NV=0x1500016
 SECRET="TPM-SEALED-$(openssl rand -hex 8)"
+LEN=${#SECRET}
 
 hr "provisioning a secret into the emulated TPM (owner NV index $NV)"
 # Start from a clean, known state (empty auth on a fresh swtpm).
 tpm2_clear -c platform >/dev/null 2>&1 || tpm2_clear >/dev/null 2>&1 || true
-tpm2_nvdefine "$NV" -C o -s 64 -a "ownerread|ownerwrite" >/dev/null 2>&1 \
+# Size the index to the secret so a full read returns exactly it (no padding).
+tpm2_nvdefine "$NV" -C o -s "$LEN" -a "ownerread|ownerwrite" >/dev/null 2>&1 \
     || skip "could not define an NV index — TPM not usable in this VM"
 printf '%s' "$SECRET" | tpm2_nvwrite "$NV" -C o -i- >/dev/null 2>&1 \
     || fail "could not write the secret to the TPM"
-[[ "$(tpm2_nvread "$NV" -C o 2>/dev/null)" == "$SECRET" ]] \
-    || fail "secret not readable back before wipe"
+got="$(tpm2_nvread "$NV" -C o -s "$LEN" 2>/dev/null)"
+[[ "$got" == "$SECRET" ]] || fail "secret not readable back before wipe (got: '$got')"
 pass "secret sealed into the TPM and read back OK"
 
 hr "running duressd's hardware-key wipe (real tpm2_clear via the engine)"

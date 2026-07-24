@@ -119,11 +119,12 @@ _pkg_for() {
 check_deps() {
     # Required: wipe chain cannot run without these.
     local required=(socat cryptsetup wipefs dmsetup lsblk blkdiscard openssl dd findmnt shred)
-    # Optional: enable extra wipe depth —
+    # Optional: enable extra wipe depth / remote reach —
     #   mdadm       RAID teardown (Phase 3)
     #   efibootmgr  UEFI NVRAM entry removal (Phase 1.5 boot-artifact wipe)
     #   tpm2_clear  TPM-sealed key eviction (Phase 1.6 hardware-key wipe)
-    local optional=(mdadm efibootmgr tpm2_clear)
+    #   tor         SSH-over-Tor onion kill switch (install-ssh-trigger --tor)
+    local optional=(mdadm efibootmgr tpm2_clear tor)
 
     local missing=() missing_opt=()
     for cmd in "${required[@]}";  do command -v "$cmd" &>/dev/null || missing+=("$cmd");     done
@@ -131,7 +132,7 @@ check_deps() {
 
     if [[ ${#missing_opt[@]} -gt 0 ]]; then
         warn "Optional wipe-depth tools not found: ${missing_opt[*]}"
-        warn "  Packages: mdadm (RAID) · efibootmgr (UEFI) · tpm2-tools (TPM)"
+        warn "  Packages: mdadm (RAID) · efibootmgr (UEFI) · tpm2-tools (TPM) · tor (onion trigger)"
     fi
 
     if [[ ${#missing[@]} -eq 0 ]]; then

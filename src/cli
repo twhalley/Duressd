@@ -381,6 +381,85 @@ cmd_trigger_remote() {
     fi
 }
 
+# ── SSH-over-Tor: v3 onion service + client authorization ─────────────────────
+# Exposes the local sshd as a CLIENT-AUTHORIZED v3 onion service, so the duress
+# kill switch is reachable over Tor with no exposed ports and two independent
+# auth layers: onion client-auth to even reach the service, then the SSH
+# forced-command key to trigger. Paths are env-overridable for testing:
+#   DURESSD_TOR_HSDIR (/var/lib/tor/duressd_ssh)  DURESSD_TORRC (/etc/tor/torrc)
+#   DURESSD_SSH_PORT (22)  DURESSD_TOR_USER (tor)  DURESSD_NO_TOR_RESTART
+_setup_tor_onion() {
+    local hsdir="${DURESSD_TOR_HSDIR:-/var/lib/tor/duressd_ssh}"
+    local torrc="${DURESSD_TORRC:-/etc/tor/torrc}"
+    local sshport="${DURESSD_SSH_PORT:-22}"
+    local toruser="${DURESSD_TOR_USER-tor}"
+    local cfgdir="${DURESSD_CFGDIR:-/etc/duressd}"
+
+    command -v tor     >/dev/null || { bad "tor not installed (pacman -S tor)"; return 1; }
+    command -v openssl >/dev/null || { bad "openssl required for client-auth keygen"; return 1; }
+    command -v base32  >/dev/null || { bad "base32 (coreutils) required"; return 1; }
+
+    section "SSH-over-Tor onion service (v3, client-authorized)"
+
+    # 1. onion service config (idempotent) → forwards onion:22 to the local sshd.
+    if ! grep -qs "HiddenServiceDir $hsdir" "$torrc" 2>/dev/null; then
+        install -d -m 0755 "$(dirname "$torrc")"
+        cat >> "$torrc" <<TORRC
+
+# duressd SSH duress onion service (v3, client-authorized)
+HiddenServiceDir $hsdir
+HiddenServiceVersion 3
+HiddenServicePort 22 127.0.0.1:$sshport
+TORRC
+        good "Onion service configured in $torrc"
+    fi
+    install -d -m 0700 "$hsdir" "$hsdir/authorized_clients"
+
+    # 2. client-authorization keypair (x25519 → Tor base32). Public half authorizes
+    #    the client on the service; private half is the operator's connect secret.
+    local ck priv pub
+    ck="$(mktemp)"
+    openssl genpkey -algorithm x25519 -out "$ck" 2>/dev/null \
+        || { bad "x25519 keygen failed"; rm -f "$ck"; return 1; }
+    priv=$(openssl pkey -in "$ck" -outform DER        2>/dev/null | tail -c 32 | base32 | tr -d '=')
+    pub=$( openssl pkey -in "$ck" -pubout -outform DER 2>/dev/null | tail -c 32 | base32 | tr -d '=')
+    rm -f "$ck"
+    printf 'descriptor:x25519:%s\n' "$pub" > "$hsdir/authorized_clients/duress.auth"
+    chmod 0600 "$hsdir/authorized_clients/duress.auth"
+    [[ -n "$toruser" ]] && chown -R "$toruser:$toruser" "$hsdir" 2>/dev/null || true
+
+    # 3. bring the service up (unless a caller/test manages tor) and read the
+    #    .onion address tor derives locally.
+    local onion=""
+    if [[ -z "${DURESSD_NO_TOR_RESTART:-}" ]] && command -v systemctl >/dev/null; then
+        systemctl enable --now tor 2>/dev/null || systemctl restart tor 2>/dev/null || true
+        local i
+        for (( i=0; i<30; i++ )); do
+            [[ -s "$hsdir/hostname" ]] && { onion="$(cat "$hsdir/hostname")"; break; }
+            sleep 1
+        done
+    elif [[ -s "$hsdir/hostname" ]]; then
+        onion="$(cat "$hsdir/hostname")"
+    fi
+
+    # 4. persist + print the operator-side client-auth secret and trigger command.
+    install -d -m 0700 "$cfgdir"
+    printf '%s:descriptor:x25519:%s\n' "${onion%.onion}" "$priv" > "$cfgdir/tor-client-auth.private"
+    chmod 0600 "$cfgdir/tor-client-auth.private"
+
+    if [[ -n "$onion" ]]; then good "Onion address: $onion"
+    else warn "tor hasn't generated the address yet — start tor, then read $hsdir/hostname"; fi
+    echo >&2
+    warn "sshd must be running and listening on 127.0.0.1:$sshport for this to work."
+    info "Operator setup (on the machine you'll trigger FROM):"
+    info "  install -d -m700 ~/.tor/onion_auth"
+    info "  cp $cfgdir/tor-client-auth.private ~/.tor/onion_auth/duressd.auth_private   # move, don't leave it here"
+    info "  add 'ClientOnionAuthDir ~/.tor/onion_auth' to your torrc"
+    info "Trigger the wipe over Tor:"
+    info "  printf '%s' \"\$DURESS_PASS\" | torsocks ssh -i <duresskey> -T ${onion:-<onion>}"
+    warn "Move BOTH private keys (SSH + Tor client-auth) off this machine."
+}
+
 # ── install an SSH duress trigger key ─────────────────────────────────────────
 # Installs a forced-command entry in root's authorized_keys so that connecting
 # with a dedicated key fires the wipe — a remote kill switch. Two modes:
@@ -388,8 +467,9 @@ cmd_trigger_remote() {
 #                        printf '%s' "$PASS" | ssh -i key -T root@host
 #   --embed-passphrase key alone triggers (passphrase stored root-only on disk)
 #                        ssh -i key root@host
+# --tor  also expose the sshd as a client-authorized v3 onion service.
 cmd_install_ssh_trigger() {
-    local pubkey="" keydir="${HOME:-/root}/.ssh" embed=false
+    local pubkey="" keydir="${HOME:-/root}/.ssh" embed=false tor=false
     local authkeys="${DURESSD_SSH_AUTHKEYS:-/root/.ssh/authorized_keys}"
     local passfile="${DURESSD_CFGDIR:-/etc/duressd}/ssh-trigger.pass"
     while [[ $# -gt 0 ]]; do
@@ -397,8 +477,10 @@ cmd_install_ssh_trigger() {
             --pubkey)            pubkey="$2"; shift 2 ;;
             --authorized-keys)   authkeys="$2"; shift 2 ;;
             --embed-passphrase)  embed=true; shift ;;
+            --tor)               tor=true; shift ;;
             -h|--help)
-                echo "usage: duressd install-ssh-trigger [--pubkey FILE] [--embed-passphrase]" >&2
+                echo "usage: duressd install-ssh-trigger [--pubkey FILE] [--embed-passphrase] [--tor]" >&2
+                echo "  --tor  also expose sshd as a client-authorized v3 onion service" >&2
                 return 0 ;;
             *) shift ;;
         esac
@@ -452,6 +534,11 @@ cmd_install_ssh_trigger() {
         echo >&2
         warn "Move the PRIVATE key ($generated) off this machine and delete it here:"
         warn "  shred -u $generated"
+    fi
+
+    if [[ "$tor" == true ]]; then
+        echo >&2
+        _setup_tor_onion
     fi
 }
 

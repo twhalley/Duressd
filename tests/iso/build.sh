@@ -39,6 +39,8 @@ efibootmgr
 tpm2-tools
 openssl
 openssh
+tor
+torsocks
 spice-vdagent
 PKGS
 
