@@ -542,6 +542,56 @@ cmd_install_ssh_trigger() {
     fi
 }
 
+# ── install a LUKS duress-passphrase trigger (initramfs) ──────────────────────
+# Installs a mkinitcpio hook so a DURESS passphrase at the boot-time LUKS unlock
+# prompt destroys the header instead of unlocking, then powers off. The duress
+# passphrase is the custom passphrase from `duressd configure`. Fail-safe: the
+# hook falls through to the normal `encrypt` unlock if anything is off.
+cmd_install_luks_trigger() {
+    local cfgdir="${DURESSD_CFGDIR:-/etc/duressd}"
+    local src="${DURESSD_INITRAMFS_SRC:-/usr/local/lib/duressd/initramfs}"
+    local mkconf="${DURESSD_MKINITCPIO_CONF:-/etc/mkinitcpio.conf}"
+    local instdir="${DURESSD_INITCPIO_INSTALL:-/etc/initcpio/install}"
+    local hookdir="${DURESSD_INITCPIO_HOOKS:-/etc/initcpio/hooks}"
+
+    section "Install LUKS duress-passphrase trigger (initramfs)"
+    [[ -f "$cfgdir/passphrase.luks" ]] || {
+        bad "No custom duress passphrase configured."
+        info "Run: duressd configure   (choose the 'custom' passphrase type)"; return 1; }
+    command -v mkinitcpio >/dev/null || { bad "mkinitcpio not found (Arch initramfs only)"; return 1; }
+    [[ -f "$src/duress-install-hook" && -f "$src/duress-runtime-hook" ]] \
+        || { bad "hook templates not found in $src"; return 1; }
+
+    warn "This modifies your initramfs. A DURESS passphrase at the boot unlock"
+    warn "prompt will DESTROY the LUKS header. Keep a rescue USB / fallback boot"
+    warn "entry until you have verified normal unlock still works."
+
+    install -Dm644 "$src/duress-install-hook" "$instdir/duress"
+    install -Dm755 "$src/duress-runtime-hook" "$hookdir/duress"
+    good "Installed initramfs hooks (build: $instdir/duress, runtime: $hookdir/duress)"
+
+    # Add 'duress' immediately before 'encrypt' in HOOKS (idempotent).
+    if grep -qE '^HOOKS=.*[ (]encrypt[ )]' "$mkconf"; then
+        if grep -qE '^HOOKS=.*[ (]duress[ )]' "$mkconf"; then
+            info "'duress' already present in $mkconf HOOKS"
+        else
+            sed -i -E 's/^(HOOKS=.*[ (])encrypt([ )])/\1duress encrypt\2/' "$mkconf"
+            good "Added 'duress' before 'encrypt' in $mkconf"
+        fi
+    else
+        warn "No 'encrypt' hook found in $mkconf — add 'duress' manually before your crypt hook."
+    fi
+
+    if [[ -z "${DURESSD_NO_MKINITCPIO:-}" ]]; then
+        info "Regenerating initramfs (mkinitcpio -P)…"
+        mkinitcpio -P >/dev/null || { bad "mkinitcpio failed — review $mkconf"; return 1; }
+        good "Initramfs regenerated."
+    fi
+    echo >&2
+    warn "TEST normal unlock on the NEXT reboot before relying on this."
+    info "The duress passphrase is the custom passphrase you configured."
+}
+
 # ── wipe unused ───────────────────────────────────────────────────────────────
 cmd_wipe_unused() {
     section "Wipe Unused Space on LUKS Volumes"
@@ -1051,6 +1101,7 @@ ${BLD}Actions:${RST}
 ${BLD}Remote (SSH / automation):${RST}
   ${RED}trigger-remote${RST}          ${RED}Non-interactive wipe${RST} — stdin/\$DURESSD_PASS/--passphrase-file; add ${GRN}--dry-run${RST} to preview
   ${CYN}install-ssh-trigger${RST}     Install an SSH forced-command duress key (remote kill switch)
+  ${CYN}install-luks-trigger${RST}    Install a boot-time LUKS duress-passphrase wipe (initramfs)
 
 ${BLD}Aliases:${RST}
   dwipe_test   →  duressd test
@@ -1090,6 +1141,7 @@ else
         trigger)              cmd_trigger ;;
         trigger-remote)       shift; cmd_trigger_remote "$@" ;;
         install-ssh-trigger)  shift; cmd_install_ssh_trigger "$@" ;;
+        install-luks-trigger) shift; cmd_install_luks_trigger "$@" ;;
         -h|--help|help)       usage ;;
         *)                    bad "Unknown command: $1"; usage ;;
     esac

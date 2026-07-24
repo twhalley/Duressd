@@ -231,6 +231,12 @@ cmd_install() {
     step "Installing CLI to $BINDIR/duressd"
     install -m 0755 "$SRC/cli" "$BINDIR/duressd"
 
+    if [[ -d "${_dir}/initramfs" ]]; then
+        step "Installing initramfs hook templates to $LIBDIR/initramfs/"
+        install -Dm644 "${_dir}/initramfs/duress-install-hook" "$LIBDIR/initramfs/duress-install-hook"
+        install -Dm755 "${_dir}/initramfs/duress-runtime-hook" "$LIBDIR/initramfs/duress-runtime-hook"
+    fi
+
     step "Installing shell aliases to $ALIASES"
     install -m 0644 "$SRC/aliases.sh" "$ALIASES"
 

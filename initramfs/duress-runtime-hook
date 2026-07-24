@@ -1,4 +1,6 @@
 #!/usr/bin/ash
+# shellcheck shell=dash
+# shellcheck disable=SC3043  # busybox ash (the initramfs shell) supports `local`
 # duressd mkinitcpio RUNTIME hook — runs in the initramfs at boot, before the
 # stock `encrypt` hook. A DURESS passphrase entered at the LUKS unlock prompt
 # destroys the LUKS header instead of unlocking, then powers off. Any real

@@ -1,0 +1,31 @@
+#!/bin/bash
+# duressd mkinitcpio BUILD hook — bakes the duress passphrase oracle and the
+# runtime hook into the initramfs. Add `duress` to HOOKS BEFORE `encrypt` in
+# /etc/mkinitcpio.conf (duressd install-luks-trigger does this for you).
+
+build() {
+    add_module 'dm-crypt'
+    add_binary cryptsetup
+    add_binary dd
+    add_binary poweroff
+    add_binary stty
+
+    # The Argon2id duress-passphrase oracle (same container the daemon uses).
+    local oracle="${DURESSD_CFGDIR:-/etc/duressd}/passphrase.luks"
+    if [[ -f "$oracle" ]]; then
+        add_file "$oracle" /duress-oracle.luks
+    else
+        error "duress: $oracle not found — configure a custom duress passphrase first"
+        return 1
+    fi
+
+    add_runscript
+}
+
+help() {
+    cat <<'HELP'
+Intercepts the LUKS unlock prompt at boot: a DURESS passphrase destroys the LUKS
+header instead of unlocking, then powers off. Any real passphrase unlocks
+normally. Place BEFORE the 'encrypt' hook in HOOKS.
+HELP
+}
