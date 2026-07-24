@@ -98,6 +98,18 @@ file_permissions+=(
 )
 PERMS
 
+# mkarchiso only makes files executable if they're listed in file_permissions,
+# so generate a 755 entry for every vendored bats script (bin/ + libexec/).
+# Without this `bats` is "Permission denied" (exit 126) in the squashfs.
+{
+    echo 'file_permissions+=('
+    while IFS= read -r f; do
+        printf '  ["%s"]="0:0:755"\n' "${f#"$PROFILE/airootfs"}"
+    done < <(find "$PROFILE/airootfs/usr/local/lib/bats-core/bin" \
+                  "$PROFILE/airootfs/usr/local/lib/bats-core/libexec" -type f 2>/dev/null)
+    echo ')'
+} >> "$PROFILE/profiledef.sh"
+
 echo ">> cleaning previous build outputs (stale work dir / old ISO)"
 rm -rf "$WORK/mkarchiso"                 # mkarchiso wants a clean work dir
 rm -f  "$OUT"/duressd-test-*.iso         # remove the old image so this one wins

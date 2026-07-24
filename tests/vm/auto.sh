@@ -39,7 +39,7 @@ WORK="$(mktemp -d)"
 # Clean up on any exit path — normal, Ctrl-C, or kill. Nothing on the host is
 # written regardless (ISO + repo are read-only, the VM disk is RAM); this only
 # removes the extracted kernel/initramfs temp dir and the QEMU child.
-trap 'rm -rf "$WORK"; [[ -n "${VM_PID:-}" ]] && kill "$VM_PID" 2>/dev/null || true' EXIT INT TERM
+trap 'rm -rf "$WORK"; [[ -n "${QPID:-}" ]] && kill "$QPID" 2>/dev/null || true' EXIT INT TERM
 
 # Boot the ISO without its menu: pull the kernel/initramfs out and point the
 # archiso initramfs at the CD by its filesystem UUID (stable, no label guess).
@@ -65,28 +65,38 @@ coproc VM { exec qemu-system-x86_64 "${kvm[@]}" \
     -drive file="$ISO",media=cdrom,if=virtio,readonly=on \
     -virtfs "local,path=$REPO,mount_tag=duressd,security_model=none,readonly=on" \
     -nic user -display none -serial stdio -monitor none 2>>"$LOG"; }
-VM_PID=$!
+QPID=$!            # our own name — bash unsets the coproc-managed VM_PID on exit
 OUT=${VM[0]}
 
-# Passive capture: read the serial byte-stream one char at a time, append it to
-# the log, mirror whole lines to the terminal, and record the self-test result.
-# The VM powers itself off afterwards (duressd.poweroff).
-buf=""; line=""; rc=""
-while IFS= read -r -t "${TIMEOUT:-900}" -N 1 ch <&"$OUT"; do
-    printf '%s' "$ch" >>"$LOG"
-    if [[ "$ch" == $'\n' ]]; then printf '%s\n' "$line" >&2; line=""; else line+="$ch"; fi
-    buf+="$ch"
-    if [[ "$buf" == *"SELF-TEST PASSED"* ]]; then rc=0; break; fi
-    if [[ "$buf" == *"SELF-TEST FAILED"* ]]; then rc=1; break; fi
-    (( ${#buf} > 4096 )) && buf="${buf: -512}"   # bound memory, keep the tail
+# Strip terminal query/report noise (cursor-position "…R", window-size "…t",
+# etc.) while KEEPING colour (SGR "…m"), so the mirrored console stays readable.
+ESC=$'\033'; BEL=$'\007'
+strip_noise() {
+    local s="$1" re="${ESC}\[[0-9;?]*[A-Za-ln-z]" osc="${ESC}\][^${BEL}]*${BEL}"
+    while [[ "$s" =~ $re  ]]; do s="${s//"${BASH_REMATCH[0]}"/}"; done
+    while [[ "$s" =~ $osc ]]; do s="${s//"${BASH_REMATCH[0]}"/}"; done
+    printf '%s\n' "$s"
+}
+
+# Passive capture: read the serial console line by line, log it verbatim, mirror
+# a cleaned copy, and record the self-test result. The VM powers itself off
+# afterwards (duressd.poweroff).
+rc=""
+while IFS= read -r -t "${TIMEOUT:-900}" line <&"$OUT"; do
+    printf '%s\n' "$line" >>"$LOG"
+    strip_noise "$line" >&2
+    case "$line" in
+        *"SELF-TEST PASSED"*) rc=0; break ;;
+        *"SELF-TEST FAILED"*) rc=1; break ;;
+    esac
 done
 
 # Give the VM a moment to power itself off, then make sure it's gone.
 printf '\nResult captured; waiting for the VM to power off…\n' >&2
-for _ in $(seq 1 15); do kill -0 "$VM_PID" 2>/dev/null || break; sleep 1; done
-kill "$VM_PID" 2>/dev/null || true
-wait "$VM_PID" 2>/dev/null || true
-VM_PID=""
+for _ in $(seq 1 15); do kill -0 "$QPID" 2>/dev/null || break; sleep 1; done
+kill "$QPID" 2>/dev/null || true
+wait "$QPID" 2>/dev/null || true
+QPID=""
 
 echo "Transcript saved to $LOG" >&2
 if [[ "$rc" == 0 ]]; then
