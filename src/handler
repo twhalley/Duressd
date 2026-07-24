@@ -171,11 +171,17 @@ close_all_crypt_mappings() {
 }
 
 # ── fast random write (AES-NI via openssl, 5-10× faster than /dev/urandom) ───
+# iflag=fullblock is load-bearing: reading bs=4M from a PIPE returns short reads
+# (~64 KiB), which dd would otherwise count as whole blocks — stopping early,
+# closing the pipe (openssl gets EPIPE → non-zero under pipefail) and leaving the
+# device only partially overwritten. fullblock makes dd assemble full 4 MiB
+# blocks, so it consumes exactly what openssl produces.
 rand_write() {
     local dest="$1" seek="$2" count="$3"
     local bytes=$(( count * 4 * 1024 * 1024 ))
     openssl rand "$bytes" 2>/dev/null \
-        | dd of="$dest" bs=4M seek="$seek" count="$count" conv=fdatasync 2>/dev/null
+        | dd of="$dest" bs=4M seek="$seek" count="$count" \
+             iflag=fullblock conv=fdatasync 2>/dev/null
 }
 
 # ── wipe phases ───────────────────────────────────────────────────────────────
