@@ -2,3 +2,9 @@
 
 # E2E golden disk images (built locally, never committed)
 tests/e2e/images/
+
+# Custom ISO build outputs + scratch (make iso)
+/out/
+/.iso-work/
+*.iso
+vm-autorun.log
