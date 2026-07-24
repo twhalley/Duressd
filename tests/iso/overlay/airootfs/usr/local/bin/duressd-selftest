@@ -21,9 +21,16 @@ else
 fi
 cat <<'TIP'
 
-Interactive root shell — duressd is installed and running as a service. Try:
+duressd is installed and running as a service. From the shell, try:
   duressd status        duressd health       duressd dry-run
   duressd test          duressd configure    systemctl status duressd
 Repo/source: /root/duressd     Re-run the suite: duressd-selftest --force
 
 TIP
+
+# Headless runs pass `duressd.poweroff` on the kernel cmdline so the VM shuts
+# itself down when the suite finishes (make vm-auto watches for that).
+if grep -qw duressd.poweroff /proc/cmdline 2>/dev/null; then
+    printf 'Powering off (duressd.poweroff on cmdline)…\n'
+    systemctl poweroff
+fi

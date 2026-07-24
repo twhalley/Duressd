@@ -72,10 +72,12 @@ install -Dm755 "$REPO/src/cli"     "$PROFILE/airootfs/usr/local/bin/duressd"
 install -Dm644 "$REPO/systemd/duressd.service" \
     "$PROFILE/airootfs/etc/systemd/system/duressd.service"
 
-echo ">> enabling services (duressd, spice-vdagentd)"
+echo ">> enabling services (duressd, duressd-selftest, spice-vdagentd)"
 install -d "$PROFILE/airootfs/etc/systemd/system/multi-user.target.wants"
 ln -sf /etc/systemd/system/duressd.service \
     "$PROFILE/airootfs/etc/systemd/system/multi-user.target.wants/duressd.service"
+ln -sf /etc/systemd/system/duressd-selftest.service \
+    "$PROFILE/airootfs/etc/systemd/system/multi-user.target.wants/duressd-selftest.service"
 ln -sf /usr/lib/systemd/system/spice-vdagentd.service \
     "$PROFILE/airootfs/etc/systemd/system/multi-user.target.wants/spice-vdagentd.service"
 
