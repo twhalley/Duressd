@@ -58,9 +58,19 @@ cryptsetup isLuks "$LOOP" || fail "a wrong password wiped the disk — it must n
 pass "non-duress password left the disk intact"
 
 hr "PAM hook: the DURESS password fires the wipe"
+export DURESSD_DEBUG_LOG="$WORK/trig.log"; : > "$WORK/trig.log"
 printf '%s' "$DPASS" | DURESSD_BIN="$REPO/src/cli" bash pam/pam-duress
-sleep 3   # pam-duress backgrounds the trigger so login is never delayed
-cryptsetup isLuks "$LOOP" 2>/dev/null && fail "duress password did not wipe the disk"
+# pam-duress detaches the trigger (login is never delayed); poll for the wipe.
+for _ in 1 2 3 4 5 6 7 8; do cryptsetup isLuks "$LOOP" 2>/dev/null || break; sleep 1; done
+if cryptsetup isLuks "$LOOP" 2>/dev/null; then
+    echo "  --- DEBUG pam-duress trigger output ---"
+    tr -cd '[:print:]\n\t' < "$WORK/trig.log" | tail -20 | sed 's/^/    | /'
+    echo "  --- DEBUG daemon alive=$(kill -0 "$DPID" 2>/dev/null && echo yes || echo no) socket=$([[ -S "$SOCK" ]] && echo yes || echo no) setsid=$(command -v setsid || echo MISSING) ---"
+    echo "  --- DEBUG direct foreground trigger: ---"
+    DURESSD_PASS="$DPASS" bash src/cli trigger-remote </dev/null 2>&1 | tr -cd '[:print:]\n' | tail -8 | sed 's/^/    | /'
+    echo "  --- after direct: $(cryptsetup isLuks "$LOOP" 2>/dev/null && echo STILL-LUKS || echo WIPED) ---"
+    fail "duress password did not wipe the disk"
+fi
 pass "duress password fired the wipe (scratch disk destroyed)"
 
 hr "install-login-trigger wires the pam_exec hook into the auth stack"

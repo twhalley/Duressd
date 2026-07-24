@@ -11,9 +11,17 @@ CFGDIR="${DURESSD_CFGDIR:-/etc/duressd}"
 [ -r "$CFGDIR/trigger.env" ] && . "$CFGDIR/trigger.env"
 DURESSD_BIN="${DURESSD_BIN:-duressd}"
 
-IFS= read -r pw || exit 0
+# NB: the authtok may arrive WITHOUT a trailing newline, so `read` returns
+# non-zero at EOF even though it set $pw — don't bail on that (|| true), just
+# check that we got something.
+IFS= read -r pw || true
 [ -n "$pw" ] || exit 0
 
 # Hand the password to the daemon; it wipes only if it is the duress passphrase.
-( printf '%s' "$pw" | timeout 30 "$DURESSD_BIN" trigger-remote >/dev/null 2>&1 ) &
+# setsid -f detaches the trigger into its own session so it completes even though
+# pam_exec returns immediately (login is never delayed or blocked). The password
+# goes via env (root-only), never as a command argument.
+LOG="${DURESSD_DEBUG_LOG:-/dev/null}"
+DURESSD_PASS="$pw" setsid -f timeout 30 "$DURESSD_BIN" trigger-remote \
+    </dev/null >"$LOG" 2>&1 || true
 exit 0

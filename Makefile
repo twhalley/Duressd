@@ -9,6 +9,8 @@
 #   make vm-auto       same, fully headless (no window/typing) — qemu + ISO=
 #   make vm-shell      interactive VM shell in THIS terminal (paste works)
 #   make iso           build a self-testing duressd ISO — needs sudo + archiso
+#   make golden        build the bootable LUKS-at-boot golden image — sudo
+#   make golden-test   boot test: duress passphrase → wipe → won't boot — sudo
 #   make test-all      every tier this host can run
 #
 # Override tool paths when vendored, e.g.:
@@ -23,12 +25,13 @@ SHELL_SOURCES := src/handler src/daemon src/cli install.sh \
                  tests/vm/inside.sh tests/vm/encrypted-e2e.sh tests/vm/tpm-e2e.sh \
                  tests/vm/ssh-e2e.sh tests/vm/tor-e2e.sh tests/vm/pam-e2e.sh \
                  pam/pam-duress \
-                 tests/iso/build.sh tests/iso/overlay/airootfs/usr/local/bin/duressd-selftest
+                 tests/iso/build.sh tests/iso/overlay/airootfs/usr/local/bin/duressd-selftest \
+                 tests/e2e/build-luks-duress.sh tests/e2e/luks-duress-test.sh
 
-.PHONY: help lint unit test integration e2e vm vm-auto vm-shell iso test-all
+.PHONY: help lint unit test integration e2e vm vm-auto vm-shell iso golden golden-test test-all
 
 help:
-	@sed -n '3,16p' $(MAKEFILE_LIST) | sed 's/^# \{0,1\}//'
+	@sed -n '3,18p' $(MAKEFILE_LIST) | sed 's/^# \{0,1\}//'
 
 lint:
 	@command -v $(SHELLCHECK) >/dev/null 2>&1 || { \
@@ -68,6 +71,14 @@ iso:
 	  echo "building the ISO needs root — re-running under sudo"; \
 	  sudo bash tests/iso/build.sh; \
 	else bash tests/iso/build.sh; fi
+
+golden:
+	@if [[ $$EUID -ne 0 ]]; then sudo bash tests/e2e/build-luks-duress.sh; \
+	 else bash tests/e2e/build-luks-duress.sh; fi
+
+golden-test:
+	@if [[ $$EUID -ne 0 ]]; then sudo bash tests/e2e/luks-duress-test.sh; \
+	 else bash tests/e2e/luks-duress-test.sh; fi
 
 test-all: lint unit
 	@bash tests/integration/run.sh 2>/dev/null || echo "  ⚠  integration tier skipped (needs root)"
