@@ -98,12 +98,17 @@ file_permissions+=(
 )
 PERMS
 
+echo ">> cleaning previous build outputs (stale work dir / old ISO)"
+rm -rf "$WORK/mkarchiso"                 # mkarchiso wants a clean work dir
+rm -f  "$OUT"/duressd-test-*.iso         # remove the old image so this one wins
+
 echo ">> building ISO (downloads packages; takes a few minutes)…"
 mkarchiso -v -w "$WORK/mkarchiso" -o "$OUT" "$PROFILE"
 
 ISO_PATH="$(ls -1t "$OUT"/*.iso 2>/dev/null | head -1)"
+[[ -n "$ISO_PATH" && -f "$ISO_PATH" ]] || { echo "✘  build produced no ISO in $OUT" >&2; exit 1; }
 echo
-echo "✔  ISO built: ${ISO_PATH:-$OUT/}"
+echo "✔  ISO built: $ISO_PATH  ($(date -r "$ISO_PATH" '+%H:%M:%S'))"
 if [[ -n "$ISO_PATH" ]]; then
     echo
     echo "Boot it to auto-run the suite (copy-paste):"
