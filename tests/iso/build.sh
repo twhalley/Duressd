@@ -33,6 +33,7 @@ socat
 cryptsetup
 util-linux
 dosfstools
+e2fsprogs
 mdadm
 efibootmgr
 tpm2-tools
@@ -40,7 +41,7 @@ openssl
 spice-vdagent
 PKGS
 
-echo ">> applying overlay (self-test entrypoint + autologin hooks)"
+echo ">> applying overlay (self-test entrypoint + tty1/serial autologin hooks)"
 cp -a "$REPO/tests/iso/overlay/." "$PROFILE/"
 
 echo ">> baking the repo into /root/duressd"

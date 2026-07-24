@@ -21,7 +21,7 @@ if [[ "${DURESSD_SKIP_PACMAN:-}" == 1 ]]; then
     echo "  ↷  skipping — dependencies are baked into this image"
 else
     pacman -Sy --needed --noconfirm \
-        bats shellcheck cryptsetup util-linux socat openssl coreutils dosfstools >/dev/null
+        bats shellcheck cryptsetup util-linux socat openssl coreutils dosfstools e2fsprogs >/dev/null
     echo "  ✔  deps ready"
 fi
 
@@ -96,5 +96,11 @@ if cryptsetup isLuks "$LOOP" 2>/dev/null; then
     exit 1
 fi
 echo -e "  \033[1;32m✔  PASS: duressd destroyed the scratch disk's LUKS header\033[0m"
+
+# Kill the scratch-test daemon before the richer end-to-end run below.
+[[ -n "$DPID" ]] && kill "$DPID" 2>/dev/null; DPID=""
+
+hr "full-stack ENCRYPTED-DISK wipe — GPT + ESP + /boot + LUKS, all phases"
+bash tests/vm/encrypted-e2e.sh
 
 hr "all tiers passed — inside a disposable VM, host untouched"

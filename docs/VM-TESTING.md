@@ -61,9 +61,18 @@ All inside the VM, in order:
    SSH trigger would; then asserts the scratch disk's LUKS header is gone. The
    wipe is scoped to the scratch loop (`DURESSD_TARGET_DEVICES`) and poweroff is
    suppressed so the VM survives for the assertion.
+5. **encrypted-disk end-to-end** (`tests/vm/encrypted-e2e.sh`) — builds a
+   realistic disk (GPT: **ESP + ext4 `/boot` + LUKS2 root** with a filesystem and
+   secrets), writes a plaintext sentinel to the unencrypted ESP and a secret
+   inside the encrypted root, then fires a **real trigger with every phase**
+   (crypto + boot-artifacts + full-device). It proves the LUKS header is gone
+   and **can no longer be opened with the passphrase**, the ESP/`/boot`
+   filesystems and GPT table are destroyed, and the plaintext boot data is
+   unrecoverable from the raw device — all scoped to the loopback disk.
 
 A green run proves lint + unit + integration + the real daemon/CLI/trigger path
-all pass, against real encrypted disks, with zero host exposure.
++ a full encrypted-disk wipe all pass, against real encrypted disks, with zero
+host exposure.
 
 ## Cleanup
 

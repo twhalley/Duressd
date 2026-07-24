@@ -19,7 +19,7 @@ ISO="${ISO:-}"
 [[ -n "$ISO" && -f "$ISO" ]] || { echo "set ISO=/path/to/archlinux-x86_64.iso" >&2; exit 1; }
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf "$WORK"' EXIT INT TERM
 
 UUID="$(blkid -o value -s UUID "$ISO" 2>/dev/null || true)"
 [[ -n "$UUID" ]] || { echo "could not read ISO filesystem UUID" >&2; exit 1; }
@@ -41,10 +41,11 @@ Your terminal's normal paste (Ctrl-Shift-V) works here.  Quit the VM: Ctrl-A the
 
 EOF
 
-exec qemu-system-x86_64 "${kvm[@]}" \
+# NOT exec: keep bash alive so the EXIT/INT/TERM trap removes $WORK afterward.
+qemu-system-x86_64 "${kvm[@]}" \
     -m "${MEM:-4096}" -smp "${SMP:-2}" \
     -kernel "$KERNEL" -initrd "$INITRD" \
-    -append "archisobasedir=arch archisosearchuuid=${UUID} console=ttyS0,115200" \
+    -append "archisobasedir=arch archisosearchuuid=${UUID} console=ttyS0,115200 modprobe.blacklist=floppy" \
     -drive file="$ISO",media=cdrom,if=virtio,readonly=on \
     -virtfs "local,path=$REPO,mount_tag=duressd,security_model=none,readonly=on" \
     -nic user -display none -serial mon:stdio

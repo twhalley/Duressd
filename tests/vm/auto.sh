@@ -22,7 +22,10 @@ ISO="${ISO:-}"
 [[ -n "$ISO" && -f "$ISO" ]] || { echo "set ISO=/path/to/archlinux-x86_64.iso" >&2; exit 1; }
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"; [[ -n "${VM_PID:-}" ]] && kill "$VM_PID" 2>/dev/null || true' EXIT
+# Clean up on any exit path — normal, Ctrl-C, or kill. Nothing on the host is
+# written regardless (ISO + repo are read-only, the VM disk is RAM); this only
+# removes the extracted kernel/initramfs temp dir and the QEMU child.
+trap 'rm -rf "$WORK"; [[ -n "${VM_PID:-}" ]] && kill "$VM_PID" 2>/dev/null || true' EXIT INT TERM
 
 # Boot the ISO without its menu: pull the kernel/initramfs out and point the
 # archiso initramfs at the CD by its filesystem UUID (stable, no label guess).
@@ -36,7 +39,7 @@ INITRD="$WORK/arch/boot/x86_64/initramfs-linux.img"
 LOG="${LOG:-$REPO/vm-autorun.log}"; : > "$LOG"
 kvm=(); [[ -e /dev/kvm ]] && kvm=(-enable-kvm -cpu host)
 
-APPEND="archisobasedir=arch archisosearchuuid=${UUID} console=ttyS0,115200 systemd.show_status=false rd.systemd.show_status=false"
+APPEND="archisobasedir=arch archisosearchuuid=${UUID} console=ttyS0,115200 systemd.show_status=false rd.systemd.show_status=false modprobe.blacklist=floppy"
 
 echo "Booting headless (serial). Live transcript → $LOG" >&2
 # The guest's serial line is this coprocess's stdio: ${VM[0]} read, ${VM[1]} write.
