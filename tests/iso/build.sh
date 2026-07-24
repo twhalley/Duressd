@@ -84,7 +84,12 @@ PERMS
 echo ">> building ISO (downloads packages; takes a few minutes)…"
 mkarchiso -v -w "$WORK/mkarchiso" -o "$OUT" "$PROFILE"
 
+ISO_PATH="$(ls -1t "$OUT"/*.iso 2>/dev/null | head -1)"
 echo
-echo "✔  ISO built in: $OUT/"
-ls -1 "$OUT"/*.iso 2>/dev/null || true
-echo "Boot it to auto-run the suite:  make vm ISO=$OUT/<name>.iso"
+echo "✔  ISO built: ${ISO_PATH:-$OUT/}"
+if [[ -n "$ISO_PATH" ]]; then
+    echo
+    echo "Boot it to auto-run the suite (copy-paste):"
+    echo "  make vm ISO=$ISO_PATH"
+    echo "  make vm-auto ISO=$ISO_PATH   # headless, transcript to vm-autorun.log"
+fi
