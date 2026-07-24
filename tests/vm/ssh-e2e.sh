@@ -35,20 +35,22 @@ trap cleanup EXIT
 
 DPASS="wipe-now"; PORT="${SSH_E2E_PORT:-2022}"
 
-hr "scratch encrypted disk + a SCOPED daemon on the default socket"
-# Free the default control socket, then run a daemon SCOPED to the scratch loop
-# there — so the forced command's `duressd trigger-remote` (default socket) can
-# only ever wipe the throwaway disk, never the VM.
-systemctl stop duressd 2>/dev/null || true
+hr "scratch encrypted disk + a SCOPED daemon on a private socket"
+# Run a daemon SCOPED to the scratch loop on a PRIVATE socket (not the systemd-
+# managed /run/duressd, whose RuntimeDirectory systemd removes out from under us
+# on stop). The forced command is patched to target this socket, so it can only
+# ever wipe the throwaway disk, never the VM.
 truncate -s 48M "$WORK/scratch.img"
 LOOP="$(losetup -Pf --show "$WORK/scratch.img")"
 printf '%s' diskpass | cryptsetup luksFormat --type luks2 --batch-mode \
     --pbkdf pbkdf2 --pbkdf-force-iterations 1000 --key-file=- "$LOOP"
 cryptsetup isLuks "$LOOP" || fail "scratch disk has no LUKS header"
 
+SOCK="$WORK/run/control.sock"
 export DURESSD_CFGDIR="$WORK/cfg" DURESSD_LIBDIR="$REPO/src" \
+       DURESSD_RUNDIR="$WORK/run" DURESSD_SOCKET="$SOCK" \
        DURESSD_TARGET_DEVICES="$LOOP" DURESSD_NO_POWEROFF=1
-mkdir -p "$DURESSD_CFGDIR"
+mkdir -p "$DURESSD_CFGDIR" "$WORK/run"
 dd if=/dev/zero of="$DURESSD_CFGDIR/passphrase.luks" bs=1M count=24 status=none
 printf '%s' "$DPASS" | cryptsetup luksFormat --type luks2 --batch-mode \
     --pbkdf pbkdf2 --pbkdf-force-iterations 1000 --key-file=- "$DURESSD_CFGDIR/passphrase.luks"
@@ -63,8 +65,8 @@ WIPE_HARDWARE_KEYS=false
 WIPE_COUNTDOWN=0
 CFG
 bash src/daemon & DPID=$!
-sleep 1
-[[ -S /run/duressd/control.sock ]] || fail "scoped daemon socket did not come up"
+for _ in 1 2 3 4 5 6 7 8 9 10; do [[ -S "$SOCK" ]] && break; sleep 0.5; done
+[[ -S "$SOCK" ]] || fail "scoped daemon socket did not come up"
 pass "scratch LUKS disk + scoped daemon ready (target: $LOOP, poweroff suppressed)"
 
 hr "installing the duressd SSH forced-command key (real install-ssh-trigger)"
@@ -74,6 +76,9 @@ bash src/cli install-ssh-trigger --pubkey "$WORK/duresskey.pub" \
     || fail "install-ssh-trigger failed"
 grep -q 'command="duressd trigger-remote",restrict' "$WORK/authorized_keys" \
     || fail "forced-command entry was not installed"
+# Point the forced command at our private scoped socket (test accommodation).
+sed -i "s#command=\"duressd trigger-remote\"#command=\"env DURESSD_SOCKET=$SOCK duressd trigger-remote\"#" \
+    "$WORK/authorized_keys"
 pass "forced-command duress key installed in authorized_keys"
 
 hr "starting sshd and firing the remote trigger over ssh"

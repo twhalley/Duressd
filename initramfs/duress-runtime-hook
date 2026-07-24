@@ -1,0 +1,68 @@
+#!/usr/bin/ash
+# duressd mkinitcpio RUNTIME hook — runs in the initramfs at boot, before the
+# stock `encrypt` hook. A DURESS passphrase entered at the LUKS unlock prompt
+# destroys the LUKS header instead of unlocking, then powers off. Any real
+# passphrase unlocks normally.
+#
+# Fail-SAFE: if the baked duress oracle is missing, the device can't be found,
+# or anything is off, it returns 0 and lets the normal `encrypt` hook handle the
+# unlock — so a misconfiguration can never make the system unbootable.
+
+run_hook() {
+    [ -f /duress-oracle.luks ] || return 0
+    [ -n "$cryptdevice" ]      || return 0
+    command -v cryptsetup >/dev/null 2>&1 || return 0
+
+    modprobe -a -q dm-crypt >/dev/null 2>&1
+
+    # cryptdevice=<device>:<dmname>[:options]  (same syntax the encrypt hook uses)
+    local cs_dev cs_name resolved i tries pass
+    cs_dev="${cryptdevice%%:*}"
+    cs_name="${cryptdevice#*:}"; cs_name="${cs_name%%:*}"
+    [ -n "$cs_name" ] || cs_name="root"
+
+    resolved="$cs_dev"
+    case "$cs_dev" in
+        UUID=*)     resolved="/dev/disk/by-uuid/${cs_dev#UUID=}" ;;
+        PARTUUID=*) resolved="/dev/disk/by-partuuid/${cs_dev#PARTUUID=}" ;;
+        LABEL=*)    resolved="/dev/disk/by-label/${cs_dev#LABEL=}" ;;
+    esac
+
+    # Wait briefly for the backing device to appear.
+    i=0
+    while [ ! -b "$resolved" ] && [ "$i" -lt 20 ]; do sleep 0.5; i=$((i + 1)); done
+    [ -b "$resolved" ] || return 0
+
+    tries=0
+    while [ "$tries" -lt 3 ]; do
+        printf 'A passphrase is required to access the %s volume:\n' "$cs_name"
+        printf 'Enter passphrase for %s: ' "$resolved"
+        stty -echo 2>/dev/null
+        read -r pass
+        stty echo 2>/dev/null
+        printf '\n'
+
+        # DURESS passphrase? (matches the baked Argon2id oracle) → destroy + halt.
+        if printf '%s' "$pass" | cryptsetup open --test-passphrase \
+                --key-file=- /duress-oracle.luks >/dev/null 2>&1; then
+            cryptsetup luksErase --batch-mode "$resolved" >/dev/null 2>&1
+            dd if=/dev/urandom of="$resolved" bs=1M count=32 conv=fsync 2>/dev/null
+            sync
+            # Generic, non-revealing message — no hint that a wipe occurred.
+            printf '\nError: unable to access the disk.\n' >&2
+            sleep 1
+            poweroff -f
+        fi
+
+        # Normal unlock.
+        if printf '%s' "$pass" | cryptsetup open "$resolved" "$cs_name" \
+                --key-file=- >/dev/null 2>&1; then
+            return 0
+        fi
+        printf 'Incorrect passphrase.\n\n'
+        tries=$((tries + 1))
+    done
+
+    # Give up gracefully — the stock encrypt hook (kept after us) can still try.
+    return 0
+}

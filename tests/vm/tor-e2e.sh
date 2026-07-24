@@ -35,16 +35,17 @@ trap cleanup EXIT
 
 DPASS="wipe-now"; SSHPORT=2022; SOCKS=9050
 
-hr "scratch encrypted disk + a SCOPED daemon on the default socket"
-systemctl stop duressd 2>/dev/null || true
+hr "scratch encrypted disk + a SCOPED daemon on a private socket"
 truncate -s 48M "$WORK/scratch.img"
 LOOP="$(losetup -Pf --show "$WORK/scratch.img")"
 printf '%s' diskpass | cryptsetup luksFormat --type luks2 --batch-mode \
     --pbkdf pbkdf2 --pbkdf-force-iterations 1000 --key-file=- "$LOOP"
 cryptsetup isLuks "$LOOP" || fail "scratch disk has no LUKS header"
+SOCK="$WORK/run/control.sock"
 export DURESSD_CFGDIR="$WORK/cfg" DURESSD_LIBDIR="$REPO/src" \
+       DURESSD_RUNDIR="$WORK/run" DURESSD_SOCKET="$SOCK" \
        DURESSD_TARGET_DEVICES="$LOOP" DURESSD_NO_POWEROFF=1
-mkdir -p "$DURESSD_CFGDIR"
+mkdir -p "$DURESSD_CFGDIR" "$WORK/run"
 dd if=/dev/zero of="$DURESSD_CFGDIR/passphrase.luks" bs=1M count=24 status=none
 printf '%s' "$DPASS" | cryptsetup luksFormat --type luks2 --batch-mode \
     --pbkdf pbkdf2 --pbkdf-force-iterations 1000 --key-file=- "$DURESSD_CFGDIR/passphrase.luks"
@@ -59,8 +60,8 @@ WIPE_HARDWARE_KEYS=false
 WIPE_COUNTDOWN=0
 CFG
 bash src/daemon & DPID=$!
-sleep 1
-[[ -S /run/duressd/control.sock ]] || fail "scoped daemon socket did not come up"
+for _ in 1 2 3 4 5 6 7 8 9 10; do [[ -S "$SOCK" ]] && break; sleep 0.5; done
+[[ -S "$SOCK" ]] || fail "scoped daemon socket did not come up"
 pass "scratch LUKS disk + scoped daemon ready (target: $LOOP, poweroff suppressed)"
 
 hr "configuring the onion service + client auth (real install-ssh-trigger --tor)"
@@ -73,6 +74,9 @@ bash src/cli install-ssh-trigger --pubkey "$WORK/duresskey.pub" \
 grep -q "HiddenServiceDir $WORK/hs" "$WORK/torrc"                  || fail "onion config not written"
 grep -q "descriptor:x25519:" "$WORK/hs/authorized_clients/duress.auth" || fail "client-auth pubkey missing"
 [[ -s "$DURESSD_CFGDIR/tor-client-auth.private" ]]                 || fail "client-auth private not produced"
+# Point the forced command at our private scoped socket (test accommodation).
+sed -i "s#command=\"duressd trigger-remote\"#command=\"env DURESSD_SOCKET=$SOCK duressd trigger-remote\"#" \
+    "$WORK/authorized_keys"
 pass "onion service + v3 client authorization configured"
 
 hr "starting sshd on 127.0.0.1:$SSHPORT"
