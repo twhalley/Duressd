@@ -45,8 +45,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Loop devices need the module; on a fresh host it may not be loaded yet.
+# Loop is built into this kernel (loop-control exists) but the /dev/loopN nodes
+# may be absent on a host that has never used a loop device, so `losetup --find`
+# allocates a number but can't open the missing node. Ensure some nodes exist.
 modprobe loop 2>/dev/null || true
+for _n in 0 1 2 3 4 5 6 7; do
+    [[ -e "/dev/loop$_n" ]] || mknod -m 0660 "/dev/loop$_n" b 7 "$_n" 2>/dev/null || true
+done
 
 echo "  →  allocating 4 GiB raw image (loopback file — no real disk touched)"
 truncate -s 4G "$RAW"
