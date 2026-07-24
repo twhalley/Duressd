@@ -31,6 +31,13 @@ expect_b64() { printf '%s' "$1" | base64 -w0; }
     rm -f "$pf"
 }
 
+@test "trigger-remote --dry-run sends the non-destructive TRIGGER_DRYRUN" {
+    printf '%s\n' "s3cret" | cmd_trigger_remote --dry-run
+    grep -q "TRIGGER_DRYRUN $(expect_b64 s3cret)" "$SENT"
+    # and never the destructive TRIGGER on its own
+    ! grep -qE "[[:space:]]TRIGGER $(expect_b64 s3cret)" "$SENT"
+}
+
 @test "trigger-remote fails with no passphrase source" {
     run cmd_trigger_remote </dev/null
     assert_fail

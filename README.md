@@ -274,6 +274,36 @@ duressd logs 100
 
 ---
 
+### `duressd dry-run`
+
+**Non-destructive preview of a *real* trigger.** Runs the exact same discovery,
+device scoping and phase-selection that a real wipe would — against your actual
+configured targets — then lists precisely what each phase *would* destroy
+(LUKS containers, ESP/`/boot`, MBR, BIOS-boot, UEFI NVRAM entries, TPM clear,
+poweroff) **without touching anything**. Every line is shown in **green** and
+the machine is never modified, discovered mappings are never closed, and the
+state file is left untouched.
+
+Because it reuses the real engine (only the destructive primitives are
+neutered), the preview can never drift from what a real trigger does — it is the
+best way to confirm a machine is configured to wipe what you expect.
+
+```bash
+duressd dry-run
+```
+
+It also works over SSH, so you can rehearse the remote kill switch harmlessly:
+
+```bash
+printf '%s' "$DURESS_PASS" | ssh -i duressd_duress -T root@host duressd trigger-remote --dry-run
+```
+
+> **`dry-run` vs `test`:** `dry-run` previews your *real* targets and changes
+> nothing; `test` (below) actually wipes a *throwaway scratch container* to prove
+> the wipe chain executes end-to-end. Both are safe and shown in green.
+
+---
+
 ### `duressd test`  ·  alias: `dwipe_test`
 
 **Non-destructive.** Allocates a 10 MiB throwaway LUKS2 file, runs `luksErase → wipefs` on it, and reports pass/fail. Your real data is never touched.
@@ -335,6 +365,10 @@ obtains that private key can wipe the machine.
 
 > If a countdown is configured, keep the SSH session open during it — closing
 > the connection aborts the wipe (the same abort that `Ctrl-C` gives locally).
+
+Add **`--dry-run`** to `trigger-remote` to rehearse the remote path without
+touching anything — the daemon streams a green preview of exactly what a real
+remote trigger would destroy (see `duressd dry-run` above).
 
 ---
 

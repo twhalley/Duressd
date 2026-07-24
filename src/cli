@@ -26,6 +26,15 @@ banner_test() {
     echo >&2
 }
 
+banner_dryrun() {
+    echo >&2
+    echo -e "${GRN}╔══════════════════════════════════════════╗${RST}" >&2
+    echo -e "${GRN}║       DRY RUN  —  PREVIEW ONLY (SAFE)    ║${RST}" >&2
+    echo -e "${GRN}║  Real targets shown. Nothing is touched. ║${RST}" >&2
+    echo -e "${GRN}╚══════════════════════════════════════════╝${RST}" >&2
+    echo >&2
+}
+
 banner_real() {
     echo >&2
     echo -e "${RED}╔══════════════════════════════════════════╗${RST}" >&2
@@ -59,6 +68,17 @@ render_progress() {
         "$color" "$bar" "$RST" "$pct" "$DIM" "$msg" "$RST" >&2
 }
 
+# ── dry-run plan rendering (all green — this is a safe, non-destructive run) ───
+render_plan() {
+    local kind="$1" text="$2"
+    case "$kind" in
+        head) printf '\n  %s%s▶  %s%s\n'    "$GRN" "$BLD" "$text" "$RST" >&2 ;;
+        item) printf '  %s✔  would %s%s\n'  "$GRN"        "$text" "$RST" >&2 ;;
+        skip) printf '  %s○  %s%s\n'        "$DIM"        "$text" "$RST" >&2 ;;
+        note) printf '  %s%s%s\n'           "$GRN"        "$text" "$RST" >&2 ;;
+    esac
+}
+
 # ── low-level transport ───────────────────────────────────────────────────────
 # send_cmd <color> <CMD> [args…]
 # Streams PROGRESS in-place; returns 0 on OK, 1 on ERROR.
@@ -81,6 +101,11 @@ send_cmd() {
                 local pct="${rest%%$'\t'*}"
                 local msg="${rest#*$'\t'}"
                 render_progress "$color" "$pct" "$msg"
+                ;;
+            PLAN)
+                local kind="${rest%%$'\t'*}"
+                local text="${rest#*$'\t'}"
+                render_plan "$kind" "$text"
                 ;;
             OK)
                 render_progress "$color" 100 "Done"
@@ -279,6 +304,22 @@ cmd_test() {
     send_cmd "$GRN" TRIGGER_TEST "$(b64 "$pass")"
 }
 
+# ── dry run — preview every REAL target, touch nothing ────────────────────────
+# Runs the real discovery + phase-selection against the configured targets and
+# lists exactly what a real trigger would destroy, without touching anything.
+cmd_dryrun() {
+    banner_dryrun
+    section "Dry Run — preview the real wipe, change NOTHING"
+    info "Runs the real discovery, device scoping and phase-selection against your"
+    info "configured targets, then lists exactly what a real trigger would destroy."
+    good "Non-destructive: no device, header, boot partition, TPM or power state is changed."
+    echo >&2
+    local pass
+    pass=$(read_pass "Duress passphrase: ")
+    echo >&2
+    send_cmd "$GRN" TRIGGER_DRYRUN "$(b64 "$pass")"
+}
+
 # ── real wipe — red ───────────────────────────────────────────────────────────
 # Alias: dwipe_real
 cmd_trigger() {
@@ -313,13 +354,15 @@ cmd_trigger() {
 #   3. stdin                    (first line)
 # Requires root: the control socket is root-only.
 cmd_trigger_remote() {
-    local passfile="" pass=""
+    local passfile="" pass="" dry=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --passphrase-file) passfile="$2"; shift 2 ;;
+            --dry-run)         dry=true; shift ;;
             -h|--help)
-                echo "usage: duressd trigger-remote [--passphrase-file FILE]" >&2
+                echo "usage: duressd trigger-remote [--passphrase-file FILE] [--dry-run]" >&2
                 echo "  passphrase from --passphrase-file, \$DURESSD_PASS, or stdin" >&2
+                echo "  --dry-run  preview the wipe over SSH without touching anything" >&2
                 return 0 ;;
             *) shift ;;
         esac
@@ -331,7 +374,11 @@ cmd_trigger_remote() {
     fi
     [[ -n "$pass" ]] || { echo "ERROR: no passphrase (use --passphrase-file, \$DURESSD_PASS, or stdin)" >&2; return 1; }
 
-    send_cmd "$RED" TRIGGER "$(b64 "$pass")"
+    if [[ "$dry" == true ]]; then
+        send_cmd "$GRN" TRIGGER_DRYRUN "$(b64 "$pass")"
+    else
+        send_cmd "$RED" TRIGGER "$(b64 "$pass")"
+    fi
 }
 
 # ── install an SSH duress trigger key ─────────────────────────────────────────
@@ -856,7 +903,8 @@ cmd_menu() {
         echo -e "  ${CYN}d${RST}  Install desktop shortcuts" >&2
         echo -e "  ${CYN}k${RST}  Install keyboard shortcuts" >&2
         echo -e "  ${DIM}── Wipe ─────────────────────────────────────${RST}" >&2
-        echo -e "  ${GRN}t${RST}  ${GRN}${BLD}Test wipe${RST}  ${DIM}(dry run — safe)${RST}" >&2
+        echo -e "  ${GRN}p${RST}  ${GRN}${BLD}Preview real wipe${RST}  ${DIM}(dry run — nothing touched)${RST}" >&2
+        echo -e "  ${GRN}t${RST}  ${GRN}${BLD}Test wipe${RST}  ${DIM}(scratch container — safe)${RST}" >&2
         echo -e "  ${RED}W${RST}  ${RED}${BLD}TRIGGER REAL WIPE${RST}  ${DIM}(destructive)${RST}" >&2
         echo -e "  ${DIM}────────────────────────────────────────────${RST}" >&2
         echo -e "  ${DIM}q  Quit${RST}" >&2
@@ -876,6 +924,7 @@ cmd_menu() {
             0) cmd_wipe_unused ;;
             d|D) cmd_install_shortcuts ;;
             k|K) cmd_install_keybindings ;;
+            p|P) cmd_dryrun ;;
             t|T) cmd_test ;;
             W) cmd_trigger ;;
             q|Q) echo >&2; exit 0 ;;
@@ -904,7 +953,8 @@ ${BLD}Configuration:${RST}
   ${CYN}passgen${RST}                 Generate a strong random passphrase
 
 ${BLD}Actions:${RST}
-  ${GRN}test${RST}                    ${GRN}Non-destructive dry-run of the wipe chain${RST}
+  ${GRN}dry-run${RST}                 ${GRN}Preview the REAL wipe — lists every target, touches nothing${RST}
+  ${GRN}test${RST}                    ${GRN}Non-destructive wipe of a throwaway scratch container${RST}
   ${CYN}wipe-unused${RST}             Zero unallocated sectors on all mounted LUKS volumes
   ${CYN}install-shortcuts${RST}       Create desktop .desktop launchers
   ${CYN}install-keybindings${RST}     Register keyboard shortcuts in the current DE
@@ -912,7 +962,7 @@ ${BLD}Actions:${RST}
   ${RED}trigger${RST}                 ${RED}DESTRUCTIVE: wipe all LUKS volumes and power off${RST}
 
 ${BLD}Remote (SSH / automation):${RST}
-  ${RED}trigger-remote${RST}          ${RED}Non-interactive wipe${RST} — passphrase from stdin/\$DURESSD_PASS/--passphrase-file
+  ${RED}trigger-remote${RST}          ${RED}Non-interactive wipe${RST} — stdin/\$DURESSD_PASS/--passphrase-file; add ${GRN}--dry-run${RST} to preview
   ${CYN}install-ssh-trigger${RST}     Install an SSH forced-command duress key (remote kill switch)
 
 ${BLD}Aliases:${RST}
@@ -942,6 +992,7 @@ else
         change-passphrase)    cmd_change_passphrase ;;
         unconfigure)          cmd_unconfigure ;;
         passgen)              cmd_passgen ;;
+        dry-run|dryrun)       cmd_dryrun ;;
         test)                 cmd_test ;;
         wipe-unused)          cmd_wipe_unused ;;
         scan)                 cmd_scan ;;

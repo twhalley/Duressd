@@ -73,7 +73,18 @@ CFG
 # start the real daemon and fire the wipe over the socket, exactly like SSH would
 bash src/daemon & DPID=$!
 sleep 1
-echo "  triggering wipe via the real daemon (scoped to $LOOP)…"
+
+# First a DRY RUN over the exact same remote path — it must preview the wipe and
+# leave the scratch disk's LUKS header fully intact.
+echo "  dry-run preview via the real daemon (scoped to $LOOP)…"
+DURESSD_PASS=wipe-now bash src/cli trigger-remote --dry-run </dev/null || true
+if ! cryptsetup isLuks "$LOOP" 2>/dev/null; then
+    echo -e "  \033[1;31m✘  FAIL: dry run destroyed the LUKS header — it must touch nothing\033[0m"
+    exit 1
+fi
+echo -e "  \033[1;32m✔  PASS: dry run previewed the wipe and left the disk intact\033[0m"
+
+echo "  triggering REAL wipe via the real daemon (scoped to $LOOP)…"
 DURESSD_PASS=wipe-now bash src/cli trigger-remote </dev/null || true
 
 if cryptsetup isLuks "$LOOP" 2>/dev/null; then
