@@ -17,6 +17,7 @@ teardown() { teardown_stubs; }
 @test "wipe_hardware_keys is a no-op when no TPM is present" {
     unset DURESSD_TARGET_DEVICES
     _tpm_device() { return 1; }
+    _tpm_ppi()    { return 1; }   # and no firmware PPI clear interface either
     run wipe_hardware_keys
     assert_ok
     assert_output_contains "no TPM found"

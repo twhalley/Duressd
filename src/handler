@@ -56,6 +56,11 @@ _tpm_device() {
     return 1
 }
 
+# True if the firmware Physical Presence Interface can request a TPM clear.
+# Wrapped so unit tests can simulate its absence (it is writable as root whenever
+# a TPM — including an emulated one — is present).
+_tpm_ppi() { [[ -w /sys/class/tpm/tpm0/ppi/request ]]; }
+
 get_state() { cat "$STATEFILE" 2>/dev/null || echo IDLE; }
 set_state() { (( DRYRUN )) && return 0; echo "$1" > "$STATEFILE"; }
 
@@ -390,7 +395,7 @@ wipe_hardware_keys() {
         mutate tpm2_clear -c platform &>/dev/null \
             || mutate tpm2_clear &>/dev/null \
             || true
-    elif [[ -w /sys/class/tpm/tpm0/ppi/request ]]; then
+    elif _tpm_ppi; then
         # Firmware Physical Presence Interface fallback: request a clear on the
         # next boot (op 5 = Clear). Best-effort — some firmware needs confirmation.
         drun "request a TPM clear on next boot via the firmware PPI (op 5)"
