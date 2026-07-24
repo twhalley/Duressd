@@ -110,6 +110,17 @@ PERMS
     echo ')'
 } >> "$PROFILE/profiledef.sh"
 
+# Preserve the exec bits on every baked-in repo file that carries one (the
+# PATH-stub harness execs tests/stubs/generic-stub; without its exec bit the
+# shell falls through to the REAL system binaries and the unit tests fail).
+{
+    echo 'file_permissions+=('
+    while IFS= read -r f; do
+        printf '  ["%s"]="0:0:755"\n' "${f#"$PROFILE/airootfs"}"
+    done < <(find "$PROFILE/airootfs/root/duressd" -type f -perm -u+x 2>/dev/null)
+    echo ')'
+} >> "$PROFILE/profiledef.sh"
+
 echo ">> cleaning previous build outputs (stale work dir / old ISO)"
 rm -rf "$WORK/mkarchiso"                 # mkarchiso wants a clean work dir
 rm -f  "$OUT"/duressd-test-*.iso         # remove the old image so this one wins
