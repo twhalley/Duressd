@@ -25,7 +25,7 @@ ISO="${ISO:-}"
 # Warn if a duressd-built ISO predates the current sources — a rebuild is needed
 # to pick up recent changes (this script only BOOTS the ISO, it never rebuilds).
 if [[ "$ISO" == *duressd-test* ]] \
-   && [[ -n "$(find "$REPO/src" "$REPO/tests/iso" "$REPO/tests/vm" -newer "$ISO" -print -quit 2>/dev/null)" ]] \
+   && [[ -n "$(find "$REPO/src" "$REPO/systemd" "$REPO/tests/iso" "$REPO/tests/unit" "$REPO/tests/integration" "$REPO/tests/vm/inside.sh" "$REPO/tests/vm/encrypted-e2e.sh" -newer "$ISO" -print -quit 2>/dev/null)" ]] \
    && [[ "${ALLOW_STALE_ISO:-}" != 1 ]]; then
     echo "✘  STOP: $ISO is OLDER than the current sources." >&2
     echo "   Rebuild it first (needs your sudo password, ~a few minutes):" >&2
