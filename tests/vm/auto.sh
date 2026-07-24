@@ -39,7 +39,13 @@ WORK="$(mktemp -d)"
 # Clean up on any exit path — normal, Ctrl-C, or kill. Nothing on the host is
 # written regardless (ISO + repo are read-only, the VM disk is RAM); this only
 # removes the extracted kernel/initramfs temp dir and the QEMU child.
-trap 'rm -rf "$WORK"; [[ -n "${QPID:-}" ]] && kill "$QPID" 2>/dev/null || true' EXIT INT TERM
+cleanup() {
+    rm -rf "$WORK"
+    [[ -n "${QPID:-}" ]]      && kill "$QPID"      2>/dev/null
+    [[ -n "${SWTPM_PID:-}" ]] && kill "$SWTPM_PID" 2>/dev/null
+    return 0
+}
+trap cleanup EXIT INT TERM
 
 # Boot the ISO without its menu: pull the kernel/initramfs out and point the
 # archiso initramfs at the CD by its filesystem UUID (stable, no label guess).
@@ -53,6 +59,23 @@ INITRD="$WORK/arch/boot/x86_64/initramfs-linux.img"
 LOG="${LOG:-$REPO/vm-autorun.log}"; : > "$LOG"
 kvm=(); [[ -e /dev/kvm ]] && kvm=(-enable-kvm -cpu host)
 
+# Attach an emulated TPM (swtpm) so the in-VM TPM wipe test can actually run
+# tpm2_clear against a throwaway software TPM. Skips gracefully if swtpm is
+# absent (the guest test then skips too).
+tpm=(); SWTPM_PID=""
+if command -v swtpm >/dev/null; then
+    TPMDIR="$WORK/tpm"; mkdir -p "$TPMDIR"
+    swtpm socket --tpm2 --tpmstate "dir=$TPMDIR" \
+        --ctrl "type=unixio,path=$TPMDIR/sock" >/dev/null 2>&1 &
+    SWTPM_PID=$!
+    for _ in $(seq 1 30); do [[ -S "$TPMDIR/sock" ]] && break; sleep 0.1; done
+    tpm=(-chardev "socket,id=chrtpm,path=$TPMDIR/sock"
+         -tpmdev "emulator,id=tpm0,chardev=chrtpm"
+         -device "tpm-tis,tpmdev=tpm0")
+else
+    echo "note: swtpm not installed — the VM's TPM wipe test will skip (install: sudo pacman -S swtpm)" >&2
+fi
+
 # `duressd.poweroff`: the ISO's self-test service shuts the VM down when the
 # suite finishes, so this script needs to drive nothing.
 APPEND="archisobasedir=arch archisosearchuuid=${UUID} console=ttyS0,115200 systemd.show_status=false rd.systemd.show_status=false modprobe.blacklist=floppy loglevel=3 duressd.poweroff"
@@ -64,6 +87,7 @@ coproc VM { exec qemu-system-x86_64 "${kvm[@]}" \
     -kernel "$KERNEL" -initrd "$INITRD" -append "$APPEND" \
     -drive file="$ISO",media=cdrom,if=virtio,readonly=on \
     -virtfs "local,path=$REPO,mount_tag=duressd,security_model=none,readonly=on" \
+    "${tpm[@]}" \
     -nic user -display none -serial stdio -monitor none 2>>"$LOG"; }
 QPID=$!            # our own name — bash unsets the coproc-managed VM_PID on exit
 OUT=${VM[0]}

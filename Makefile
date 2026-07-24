@@ -20,7 +20,8 @@ BATS       ?= bats
 
 SHELL_SOURCES := src/handler src/daemon src/cli install.sh \
                  tests/stubs/generic-stub tests/vm/auto.sh tests/vm/shell.sh \
-                 tests/vm/inside.sh tests/vm/encrypted-e2e.sh \
+                 tests/vm/inside.sh tests/vm/encrypted-e2e.sh tests/vm/tpm-e2e.sh \
+                 tests/vm/ssh-e2e.sh \
                  tests/iso/build.sh tests/iso/overlay/airootfs/usr/local/bin/duressd-selftest
 
 .PHONY: help lint unit test integration e2e vm vm-auto vm-shell iso test-all

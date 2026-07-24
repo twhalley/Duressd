@@ -103,4 +103,10 @@ echo -e "  \033[1;32m✔  PASS: duressd destroyed the scratch disk's LUKS header
 hr "full-stack ENCRYPTED-DISK wipe — GPT + ESP + /boot + LUKS, all phases"
 bash tests/vm/encrypted-e2e.sh
 
+hr "TPM wipe — real tpm2_clear against the VM's emulated TPM (skips if none)"
+bash tests/vm/tpm-e2e.sh
+
+hr "SSH duress trigger — real sshd + forced-command key fires a scoped wipe"
+bash tests/vm/ssh-e2e.sh
+
 hr "all tiers passed — inside a disposable VM, host untouched"

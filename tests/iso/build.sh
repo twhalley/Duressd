@@ -38,6 +38,7 @@ mdadm
 efibootmgr
 tpm2-tools
 openssl
+openssh
 spice-vdagent
 PKGS
 

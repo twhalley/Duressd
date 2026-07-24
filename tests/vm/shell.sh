@@ -29,7 +29,7 @@ if [[ "$ISO" == *duressd-test* ]] \
 fi
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT INT TERM
+trap 'rm -rf "$WORK"; [[ -n "${SWTPM_PID:-}" ]] && kill "$SWTPM_PID" 2>/dev/null; true' EXIT INT TERM
 
 UUID="$(blkid -o value -s UUID "$ISO" 2>/dev/null || true)"
 [[ -n "$UUID" ]] || { echo "could not read ISO filesystem UUID" >&2; exit 1; }
@@ -39,6 +39,19 @@ KERNEL="$WORK/arch/boot/x86_64/vmlinuz-linux"
 INITRD="$WORK/arch/boot/x86_64/initramfs-linux.img"
 
 kvm=(); [[ -e /dev/kvm ]] && kvm=(-enable-kvm -cpu host)
+
+# Emulated TPM (swtpm) so `duressd` and the TPM test have a /dev/tpmrm0 to use.
+tpm=(); SWTPM_PID=""
+if command -v swtpm >/dev/null; then
+    TPMDIR="$WORK/tpm"; mkdir -p "$TPMDIR"
+    swtpm socket --tpm2 --tpmstate "dir=$TPMDIR" \
+        --ctrl "type=unixio,path=$TPMDIR/sock" >/dev/null 2>&1 &
+    SWTPM_PID=$!
+    for _ in $(seq 1 30); do [[ -S "$TPMDIR/sock" ]] && break; sleep 0.1; done
+    tpm=(-chardev "socket,id=chrtpm,path=$TPMDIR/sock"
+         -tpmdev "emulator,id=tpm0,chardev=chrtpm"
+         -device "tpm-tis,tpmdev=tpm0")
+fi
 
 cat >&2 <<'EOF'
 
@@ -58,4 +71,5 @@ qemu-system-x86_64 "${kvm[@]}" \
     -append "archisobasedir=arch archisosearchuuid=${UUID} console=ttyS0,115200 modprobe.blacklist=floppy" \
     -drive file="$ISO",media=cdrom,if=virtio,readonly=on \
     -virtfs "local,path=$REPO,mount_tag=duressd,security_model=none,readonly=on" \
+    "${tpm[@]}" \
     -nic user -display none -serial mon:stdio
