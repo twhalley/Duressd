@@ -28,13 +28,25 @@ make vm ISO=$PWD/archlinux-x86_64.iso
 
 `launch.sh` boots the Arch live ISO with this repo shared in **read-only** (9p),
 KVM-accelerated if `/dev/kvm` is present. A QEMU window opens to the live root
-shell. Inside it:
+shell. Inside it, one line runs everything:
 
 ```bash
-mkdir -p /mnt/repo && mount -t 9p -o trans=virtio,ro duressd /mnt/repo
-cp -a /mnt/repo /root/duressd && cd /root/duressd
-bash tests/vm/inside.sh
+mkdir -p /mnt/repo && mount -t 9p -o trans=virtio,ro duressd /mnt/repo && cp -a /mnt/repo /root/duressd && cd /root/duressd && bash tests/vm/inside.sh
 ```
+
+## Fully headless (no window, no typing)
+
+```bash
+make vm-auto ISO=$PWD/archlinux-x86_64.iso
+# equivalent to: ISO=… bash tests/vm/auto.sh
+```
+
+`auto.sh` extracts the ISO's own kernel/initramfs, boots it with a **serial
+console** (no graphical window), logs in and runs `tests/vm/inside.sh` over that
+serial line, streams a live transcript to `vm-autorun.log`, powers the VM off,
+and exits non-zero if the suite failed. Use this for CI or an unattended run;
+use `make vm` when you want to watch/interact. Both confine every wipe to a
+loopback file inside the VM.
 
 ## What `inside.sh` does
 

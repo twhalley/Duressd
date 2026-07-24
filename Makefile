@@ -6,6 +6,7 @@
 #   make integration   loop-device integration tests        — needs root/sudo
 #   make e2e           full KVM end-to-end tests             — needs KVM
 #   make vm            run the whole suite in a throwaway VM — needs qemu + ISO=
+#   make vm-auto       same, fully headless (no window/typing) — qemu + ISO=
 #   make test-all      every tier this host can run
 #
 # Override tool paths when vendored, e.g.:
@@ -16,12 +17,12 @@ SHELLCHECK ?= shellcheck
 BATS       ?= bats
 
 SHELL_SOURCES := src/handler src/daemon src/cli install.sh \
-                 tests/stubs/generic-stub
+                 tests/stubs/generic-stub tests/vm/auto.sh
 
-.PHONY: help lint unit test integration e2e vm test-all
+.PHONY: help lint unit test integration e2e vm vm-auto test-all
 
 help:
-	@sed -n '3,13p' $(MAKEFILE_LIST) | sed 's/^# \{0,1\}//'
+	@sed -n '3,14p' $(MAKEFILE_LIST) | sed 's/^# \{0,1\}//'
 
 lint:
 	@command -v $(SHELLCHECK) >/dev/null 2>&1 || { \
@@ -49,6 +50,9 @@ e2e:
 
 vm:
 	@ISO="$(ISO)" bash tests/vm/launch.sh
+
+vm-auto:
+	@ISO="$(ISO)" bash tests/vm/auto.sh
 
 test-all: lint unit
 	@bash tests/integration/run.sh 2>/dev/null || echo "  ⚠  integration tier skipped (needs root)"
