@@ -66,33 +66,45 @@ probe() {
 }
 probe & PROBE=$!
 
+# Plain-ISO path: once the shell is live, mount the repo share and run the suite
+# ourselves. The end marker is assembled at runtime ("DZR"+"C=…") so it never
+# matches the echoed command text, only the real output line. Single-quoted so
+# nothing expands host-side.
 send_payload() {
     {
-        printf 'mkdir -p /mnt/repo && mount -t 9p -o trans=virtio,ro duressd /mnt/repo\n'
-        printf 'cp -a /mnt/repo /root/duressd && cd /root/duressd\n'
-        printf 'bash tests/vm/inside.sh; echo "DZRC=$?=ZD"\n'
-        printf 'systemctl poweroff\n'
+        printf '%s\n' 'rm -rf /root/drun; mkdir -p /mnt/repo'
+        printf '%s\n' 'mount -t 9p -o trans=virtio,ro duressd /mnt/repo && cp -a /mnt/repo /root/drun && cd /root/drun'
+        printf '%s\n' 'bash tests/vm/inside.sh; rc=$?; printf "DZR""C=%s=ZD\n" "$rc"'
+        printf '%s\n' 'systemctl poweroff'
     } >&"$IN"
 }
 
-# Read the serial byte-stream (char at a time so partial prompts are seen),
-# tee to the log, and react to the two markers.
-buf=""; ready=0; rc=""
+# Read the serial byte-stream one char at a time (so partial prompts are seen),
+# append to the log, mirror whole lines to the terminal, and react to markers:
+#   * the custom self-testing ISO prints its own PASS/FAIL banner — honour it
+#     and do NOT drive a second run;
+#   * a plain ISO needs driving, so on the readiness marker we send the suite.
+buf=""; line=""; ready=0; rc=""; autorun=0
 while IFS= read -r -t "${TIMEOUT:-900}" -N 1 ch <&"$OUT"; do
-    printf '%s' "$ch" | tee -a "$LOG" >/dev/null
+    printf '%s' "$ch" >>"$LOG"
+    if [[ "$ch" == $'\n' ]]; then printf '%s\n' "$line" >&2; line=""; else line+="$ch"; fi
     buf+="$ch"
-    [[ "$ch" == $'\n' ]] && { printf '%s' "$buf" >&2; }   # mirror full lines to stderr
-    if (( ! ready )) && [[ "$buf" == *"D42Z"* ]]; then
+
+    # The self-testing ISO runs the suite on its own — take its result and stop.
+    [[ "$buf" == *"self-test"* || "$buf" == *"SELF-TEST"* ]] && autorun=1
+    if [[ "$buf" == *"SELF-TEST PASSED"* ]]; then rc=0; break; fi
+    if [[ "$buf" == *"SELF-TEST FAILED"* ]]; then rc=1; break; fi
+
+    # Plain ISO: drive the suite once the shell echoes our readiness marker.
+    if (( ! ready && ! autorun )) && [[ "$buf" == *"D42Z"* ]]; then
         ready=1; touch "$WORK/ready"; kill "$PROBE" 2>/dev/null || true
-        send_payload
-        buf=""
-        continue
+        send_payload; buf=""; continue
     fi
-    if [[ "$buf" == *"DZRC="*"=ZD"* ]]; then
-        rc="${buf##*DZRC=}"; rc="${rc%%=ZD*}"
-        break
+    if (( ready )) && [[ "$buf" == *"DZRC="*"=ZD"* ]]; then
+        rc="${buf##*DZRC=}"; rc="${rc%%=ZD*}"; break
     fi
-    (( ${#buf} > 8192 )) && buf="${buf: -256}"   # keep the tail, bound memory
+
+    (( ${#buf} > 4096 )) && buf="${buf: -512}"   # bound memory, keep marker tail
 done
 
 kill "$PROBE" 2>/dev/null || true

@@ -62,8 +62,19 @@ fi
 install -d "$PROFILE/airootfs/usr/local/bin"
 ln -sf /usr/local/lib/bats-core/bin/bats "$PROFILE/airootfs/usr/local/bin/bats"
 
-echo ">> enabling spice-vdagentd"
+echo ">> installing duressd (so \`duressd\` works live on the ISO)"
+# Mirror install.sh's layout exactly, so the ISO behaves like a real install:
+# CLI on PATH, daemon+handler in LIBDIR, and the daemon running as a service.
+install -Dm755 "$REPO/src/daemon"  "$PROFILE/airootfs/usr/local/lib/duressd/daemon"
+install -Dm755 "$REPO/src/handler" "$PROFILE/airootfs/usr/local/lib/duressd/handler"
+install -Dm755 "$REPO/src/cli"     "$PROFILE/airootfs/usr/local/bin/duressd"
+install -Dm644 "$REPO/systemd/duressd.service" \
+    "$PROFILE/airootfs/etc/systemd/system/duressd.service"
+
+echo ">> enabling services (duressd, spice-vdagentd)"
 install -d "$PROFILE/airootfs/etc/systemd/system/multi-user.target.wants"
+ln -sf /etc/systemd/system/duressd.service \
+    "$PROFILE/airootfs/etc/systemd/system/multi-user.target.wants/duressd.service"
 ln -sf /usr/lib/systemd/system/spice-vdagentd.service \
     "$PROFILE/airootfs/etc/systemd/system/multi-user.target.wants/spice-vdagentd.service"
 
@@ -78,6 +89,9 @@ iso_publisher="duressd <https://github.com/>"
 iso_application="duressd self-testing ISO"
 file_permissions+=(
   ["/usr/local/bin/duressd-selftest"]="0:0:755"
+  ["/usr/local/bin/duressd"]="0:0:755"
+  ["/usr/local/lib/duressd/daemon"]="0:0:755"
+  ["/usr/local/lib/duressd/handler"]="0:0:755"
 )
 PERMS
 

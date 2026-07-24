@@ -23,16 +23,32 @@ resulting ISO runs fully offline.
 
 ## Run
 
+The ISO **self-tests on its own** at boot, so pick the launcher by what you want:
+
 ```bash
-make vm ISO=out/duressd-test-*.iso        # graphical window; watch it self-test
-# or fully headless with a captured transcript:
+# Interactive — a native terminal you can debug in (recommended):
+make vm ISO=out/duressd-test-*.iso          # graphical QEMU window
+make vm-shell ISO=out/duressd-test-*.iso    # serial shell in THIS terminal (paste works)
+
+# Unattended — runs, captures a transcript, powers off, exits non-zero on failure:
 make vm-auto ISO=out/duressd-test-*.iso
 ```
 
 On boot it autologins root, runs `tests/vm/inside.sh` with `DURESSD_SKIP_PACMAN=1`
-(lint → unit → loop-device integration → dry-run-then-real scoped wipe), and
-shows a green **✔ PASSED** or red **✘ FAILED** banner. Re-run any time from the
-shell with `duressd-selftest --force`.
+(lint → unit → loop-device integration → dry-run-then-real scoped wipe), shows a
+green **✔ PASSED** / red **✘ FAILED** banner, then drops you at an interactive
+root shell. Re-run the suite any time with `duressd-selftest --force`.
+
+**`duressd` is installed and running as a service** in the image, so the shell is
+a real playground:
+
+```bash
+duressd status      duressd health      duressd dry-run
+duressd test        duressd configure   systemctl status duressd
+```
+
+> Use `make vm` or `make vm-shell` for hands-on debugging — `make vm-auto` powers
+> the VM off when the suite finishes, so it's for CI/capture, not interactive use.
 
 ## What's inside
 
