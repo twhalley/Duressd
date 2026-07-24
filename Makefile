@@ -8,6 +8,7 @@
 #   make vm            run the whole suite in a throwaway VM — needs qemu + ISO=
 #   make vm-auto       same, fully headless (no window/typing) — qemu + ISO=
 #   make vm-shell      interactive VM shell in THIS terminal (paste works)
+#   make iso           build a self-testing duressd ISO — needs sudo + archiso
 #   make test-all      every tier this host can run
 #
 # Override tool paths when vendored, e.g.:
@@ -18,12 +19,13 @@ SHELLCHECK ?= shellcheck
 BATS       ?= bats
 
 SHELL_SOURCES := src/handler src/daemon src/cli install.sh \
-                 tests/stubs/generic-stub tests/vm/auto.sh tests/vm/shell.sh
+                 tests/stubs/generic-stub tests/vm/auto.sh tests/vm/shell.sh \
+                 tests/iso/build.sh tests/iso/overlay/airootfs/usr/local/bin/duressd-selftest
 
-.PHONY: help lint unit test integration e2e vm vm-auto vm-shell test-all
+.PHONY: help lint unit test integration e2e vm vm-auto vm-shell iso test-all
 
 help:
-	@sed -n '3,15p' $(MAKEFILE_LIST) | sed 's/^# \{0,1\}//'
+	@sed -n '3,16p' $(MAKEFILE_LIST) | sed 's/^# \{0,1\}//'
 
 lint:
 	@command -v $(SHELLCHECK) >/dev/null 2>&1 || { \
@@ -57,6 +59,12 @@ vm-auto:
 
 vm-shell:
 	@ISO="$(ISO)" bash tests/vm/shell.sh
+
+iso:
+	@if [[ $$EUID -ne 0 ]]; then \
+	  echo "building the ISO needs root — re-running under sudo"; \
+	  sudo bash tests/iso/build.sh; \
+	else bash tests/iso/build.sh; fi
 
 test-all: lint unit
 	@bash tests/integration/run.sh 2>/dev/null || echo "  ⚠  integration tier skipped (needs root)"

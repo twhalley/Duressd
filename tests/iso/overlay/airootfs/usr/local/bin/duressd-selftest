@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Runs on first autologin in the duressd test ISO: executes the full OFFLINE
+# suite (lint -> unit -> loop integration -> real scoped wipe) and prints a
+# clear PASS/FAIL, then returns so you land at an interactive root shell.
+# Re-run any time with:  duressd-selftest --force
+set -uo pipefail
+
+FLAG=/run/duressd-selftest.done
+[[ "${1:-}" == --force ]] && rm -f "$FLAG"
+[[ -e "$FLAG" ]] && exit 0
+: > "$FLAG"
+
+cd /root/duressd 2>/dev/null || { echo "duressd repo not found at /root/duressd" >&2; exit 0; }
+export DURESSD_SKIP_PACMAN=1   # deps are baked into the image
+
+printf '\n\033[1;36m════════ duressd self-test (offline) ════════\033[0m\n'
+if bash tests/vm/inside.sh; then
+    printf '\n\033[1;42m  ✔  DURESSD SELF-TEST PASSED  \033[0m\n'
+else
+    printf '\n\033[1;41m  ✘  DURESSD SELF-TEST FAILED — see output above  \033[0m\n'
+fi
+printf '\nInteractive root shell. Re-run the suite with: \033[1mduressd-selftest --force\033[0m\n\n'

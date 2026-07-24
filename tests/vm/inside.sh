@@ -17,9 +17,13 @@ cd "$REPO"
 hr() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 
 hr "installing test dependencies (pacman)"
-pacman -Sy --needed --noconfirm \
-    bats shellcheck cryptsetup util-linux socat openssl coreutils dosfstools >/dev/null
-echo "  ✔  deps ready"
+if [[ "${DURESSD_SKIP_PACMAN:-}" == 1 ]]; then
+    echo "  ↷  skipping — dependencies are baked into this image"
+else
+    pacman -Sy --needed --noconfirm \
+        bats shellcheck cryptsetup util-linux socat openssl coreutils dosfstools >/dev/null
+    echo "  ✔  deps ready"
+fi
 
 hr "tier 0 — lint"
 make lint
