@@ -237,6 +237,11 @@ cmd_install() {
         install -Dm755 "${_dir}/initramfs/duress-runtime-hook" "$LIBDIR/initramfs/duress-runtime-hook"
     fi
 
+    if [[ -f "${_dir}/pam/pam-duress" ]]; then
+        step "Installing PAM duress hook to $LIBDIR/pam-duress"
+        install -Dm755 "${_dir}/pam/pam-duress" "$LIBDIR/pam-duress"
+    fi
+
     step "Installing shell aliases to $ALIASES"
     install -m 0644 "$SRC/aliases.sh" "$ALIASES"
 

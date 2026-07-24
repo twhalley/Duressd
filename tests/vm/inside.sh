@@ -112,4 +112,7 @@ bash tests/vm/ssh-e2e.sh
 hr "SSH-over-Tor — client-authorized v3 onion service fires a scoped wipe (needs net)"
 bash tests/vm/tor-e2e.sh
 
+hr "PAM login duress — duress passphrase at login fires a scoped wipe"
+bash tests/vm/pam-e2e.sh
+
 hr "all tiers passed — inside a disposable VM, host untouched"

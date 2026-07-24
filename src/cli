@@ -592,6 +592,44 @@ cmd_install_luks_trigger() {
     info "The duress passphrase is the custom passphrase you configured."
 }
 
+# ── install a PAM login duress trigger ────────────────────────────────────────
+# Adds a pam_exec hook to the auth stack so that entering the duress passphrase
+# at ANY login (console, ssh, su, display manager) fires the wipe. `optional`, so
+# it never blocks or changes normal login; the daemon verifies the passphrase, so
+# only the configured duress passphrase triggers.
+cmd_install_login_trigger() {
+    local cfgdir="${DURESSD_CFGDIR:-/etc/duressd}"
+    local libdir="${DURESSD_LIBDIR:-/usr/local/lib/duressd}"
+    local pamfile="${DURESSD_PAM_FILE:-/etc/pam.d/system-auth}"
+    local src="${DURESSD_PAM_SRC:-/usr/local/lib/duressd}"
+    local script="$libdir/pam-duress"
+
+    section "Install PAM login duress trigger"
+    [[ -f "$cfgdir/passphrase.luks" ]] || {
+        bad "No custom duress passphrase configured."
+        info "Run: duressd configure   (choose the 'custom' passphrase type)"; return 1; }
+    [[ -f "$src/pam-duress" ]] || { bad "pam-duress hook not found in $src"; return 1; }
+
+    install -Dm755 "$src/pam-duress" "$script"
+    good "Installed PAM hook: $script"
+
+    local line="auth optional pam_exec.so expose_authtok quiet $script"
+    if grep -qF "$script" "$pamfile" 2>/dev/null; then
+        info "PAM hook already present in $pamfile"
+    else
+        [[ -f "$pamfile" ]] && cp -a "$pamfile" "$pamfile.duressd.bak"
+        # Prepend so the hook captures the authtok before other auth modules.
+        { printf '%s\n' "$line"; [[ -f "$pamfile" ]] && cat "$pamfile"; } > "$pamfile.tmp"
+        mv "$pamfile.tmp" "$pamfile"
+        good "Added duress hook to $pamfile${pamfile:+ (backup: $pamfile.duressd.bak)}"
+    fi
+
+    echo >&2
+    warn "Entering your configured duress passphrase at ANY login now fires the wipe."
+    warn "It is 'optional' — it never blocks or changes normal login."
+    warn "Verify normal login still works before relying on this."
+}
+
 # ── wipe unused ───────────────────────────────────────────────────────────────
 cmd_wipe_unused() {
     section "Wipe Unused Space on LUKS Volumes"
@@ -1102,6 +1140,7 @@ ${BLD}Remote (SSH / automation):${RST}
   ${RED}trigger-remote${RST}          ${RED}Non-interactive wipe${RST} — stdin/\$DURESSD_PASS/--passphrase-file; add ${GRN}--dry-run${RST} to preview
   ${CYN}install-ssh-trigger${RST}     Install an SSH forced-command duress key (remote kill switch)
   ${CYN}install-luks-trigger${RST}    Install a boot-time LUKS duress-passphrase wipe (initramfs)
+  ${CYN}install-login-trigger${RST}   Install a PAM login duress-passphrase wipe (any login)
 
 ${BLD}Aliases:${RST}
   dwipe_test   →  duressd test
@@ -1142,6 +1181,7 @@ else
         trigger-remote)       shift; cmd_trigger_remote "$@" ;;
         install-ssh-trigger)  shift; cmd_install_ssh_trigger "$@" ;;
         install-luks-trigger) shift; cmd_install_luks_trigger "$@" ;;
+        install-login-trigger) shift; cmd_install_login_trigger "$@" ;;
         -h|--help|help)       usage ;;
         *)                    bad "Unknown command: $1"; usage ;;
     esac

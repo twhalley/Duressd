@@ -1,0 +1,19 @@
+#!/bin/bash
+# duressd PAM auth hook — invoked by pam_exec.so with `expose_authtok`, which
+# feeds the entered password on stdin. If that password is the duress passphrase
+# it fires the wipe (the daemon verifies against the shared Argon2id oracle, so
+# only the duress passphrase ever triggers). The check runs in the BACKGROUND
+# and we always exit 0, so login is never delayed, blocked, or altered.
+set -u
+
+CFGDIR="${DURESSD_CFGDIR:-/etc/duressd}"
+# Optional socket/override env (used by tests; absent in production → defaults).
+[ -r "$CFGDIR/trigger.env" ] && . "$CFGDIR/trigger.env"
+DURESSD_BIN="${DURESSD_BIN:-duressd}"
+
+IFS= read -r pw || exit 0
+[ -n "$pw" ] || exit 0
+
+# Hand the password to the daemon; it wipes only if it is the duress passphrase.
+( printf '%s' "$pw" | timeout 30 "$DURESSD_BIN" trigger-remote >/dev/null 2>&1 ) &
+exit 0
