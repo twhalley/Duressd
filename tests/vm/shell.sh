@@ -18,6 +18,13 @@ REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 ISO="${ISO:-}"
 [[ -n "$ISO" && -f "$ISO" ]] || { echo "set ISO=/path/to/archlinux-x86_64.iso" >&2; exit 1; }
 
+# Warn if a duressd-built ISO predates the current sources (this only boots it).
+if [[ "$ISO" == *duressd-test* ]] \
+   && [[ -n "$(find "$REPO/src" "$REPO/tests/iso" "$REPO/tests/vm" -newer "$ISO" -print -quit 2>/dev/null)" ]]; then
+    echo "⚠  $ISO is OLDER than the current sources — rebuild it first:  sudo make iso" >&2
+    sleep 2
+fi
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM
 

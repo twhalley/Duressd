@@ -20,6 +20,13 @@ if [[ -z "$ISO" || ! -f "$ISO" ]]; then
     exit 1
 fi
 
+# Warn if a duressd-built ISO predates the current sources (this only boots it).
+if [[ "$ISO" == *duressd-test* ]] \
+   && [[ -n "$(find "$REPO/src" "$REPO/tests/iso" "$REPO/tests/vm" -newer "$ISO" -print -quit 2>/dev/null)" ]]; then
+    echo "⚠  $ISO is OLDER than the current sources — rebuild it first:  sudo make iso" >&2
+    sleep 2
+fi
+
 kvm=()
 [[ "${QEMU_KVM:-1}" == 1 && -e /dev/kvm ]] && kvm=(-enable-kvm -cpu host)
 

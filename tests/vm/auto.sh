@@ -22,6 +22,14 @@ REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 ISO="${ISO:-}"
 [[ -n "$ISO" && -f "$ISO" ]] || { echo "set ISO=/path/to/archlinux-x86_64.iso" >&2; exit 1; }
 
+# Warn if a duressd-built ISO predates the current sources — a rebuild is needed
+# to pick up recent changes (this script only BOOTS the ISO, it never rebuilds).
+if [[ "$ISO" == *duressd-test* ]] \
+   && [[ -n "$(find "$REPO/src" "$REPO/tests/iso" "$REPO/tests/vm" -newer "$ISO" -print -quit 2>/dev/null)" ]]; then
+    echo "⚠  $ISO is OLDER than the current sources — rebuild it first:  sudo make iso" >&2
+    sleep 2
+fi
+
 WORK="$(mktemp -d)"
 # Clean up on any exit path — normal, Ctrl-C, or kill. Nothing on the host is
 # written regardless (ISO + repo are read-only, the VM disk is RAM); this only
