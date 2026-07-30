@@ -48,6 +48,37 @@ and exits non-zero if the suite failed. Use this for CI or an unattended run;
 use `make vm` when you want to watch/interact. Both confine every wipe to a
 loopback file inside the VM.
 
+## Golden LUKS-at-boot boot test — fully in-VM (`make vm-golden`)
+
+The one path that needs a *real bootable OS* — proving the duress passphrase
+entered at the **boot-time LUKS prompt** wipes the disk and stops it booting —
+now runs entirely inside the disposable VM, so the host is never involved:
+
+```bash
+make vm-golden ISO=$PWD/out/duressd-test-*.iso
+# equivalent to: ISO=… bash tests/vm/golden-vm.sh
+```
+
+Requires the **duressd test ISO** (`sudo make iso`), which bakes in
+`qemu-base`, `edk2-ovmf`, and `arch-install-scripts`. `golden-vm.sh` boots that
+ISO headless with a throwaway scratch disk attached (addressed by a stable
+serial → `/dev/disk/by-id/virtio-duressdgolden`) and `duressd.golden=1`. Inside,
+the self-test service:
+
+1. builds a real bootable, LUKS-encrypted Arch image **on the scratch disk**
+   (`tests/e2e/build-luks-duress.sh`), with the duressd LUKS-at-boot hook and a
+   distinct duress passphrase baked in;
+2. runs the boot test in a **nested QEMU** (KVM speed when the host enables
+   nested virt, else TCG): **CONTROL** — the real passphrase boots normally
+   (`GOLDEN-BOOT-OK`, so the hook doesn't break boot); **DURESS** — the duress
+   passphrase wipes the LUKS header at the prompt and powers off; then it
+   verifies the header is gone and the disk **no longer boots**.
+
+A live transcript streams to `vm-golden.log`; the VM powers itself off and the
+command exits non-zero on any failure. Every byte — image, package cache, nested
+overlays — lands on the throwaway scratch disk, so `/var/cache/pacman`, host loop
+devices, and real disks are all untouched.
+
 ## What `inside.sh` does
 
 All inside the VM, in order:
@@ -83,10 +114,11 @@ VM's disk was RAM/ephemeral. Delete the ISO if you don't want to keep it.
 
 - The repo share is **read-only**, so the VM copies it to `/root/duressd` before
   running (tests write only inside the VM).
-- To also test a full *bootable-OS* self-wipe (bootloader + `/boot` + LUKS root)
-  rather than a scratch disk, use the host-side KVM e2e flow in
-  [TESTING.md](TESTING.md) (`tests/e2e/`), which builds a golden encrypted image
-  and boots it — that path runs QEMU on the host but still confines the wipe to
-  the VM's virtual disk.
+- To test a full *bootable-OS* self-wipe (bootloader + `/boot` + LUKS root)
+  rather than a scratch disk, prefer **`make vm-golden`** above — it runs the
+  whole build+boot inside the disposable VM. The host-side equivalents
+  (`make golden` + `make golden-test`, documented in [TESTING.md](TESTING.md))
+  build and boot the same golden image but run QEMU **on the host** (they still
+  confine the wipe to a loopback file, but they use host loop devices).
 - For real-hardware-only paths (TPM clear, NVMe Sanitize), see
   [PHYSICAL-TESTING.md](PHYSICAL-TESTING.md).
