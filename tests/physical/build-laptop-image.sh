@@ -113,9 +113,11 @@ mkdir -p "$MNT"/boot
 mount "$ESP" "$MNT"/boot     # ESP mounted at /boot: systemd-boot reads kernels here
 
 echo "  →  pacstrap base system + duressd deps"
+# git + make so you can `git clone` the repo on the laptop and run
+# `make phys-selftest` / `git pull` fixes directly over SSH (no scp round-trips).
 pacstrap -K "$MNT" base linux linux-firmware mkinitcpio systemd sudo openssh \
     networkmanager cryptsetup socat util-linux openssl coreutils efibootmgr \
-    tpm2-tools vim
+    tpm2-tools vim git make
 
 ROOT_UUID="$(blkid -s UUID -o value "$ROOTP")"
 genfstab -U "$MNT" >> "$MNT"/etc/fstab
@@ -230,9 +232,16 @@ cat <<DONE
     console/ssh user: $USERNAME   (password you set in USER_PASS)
     at boot, unlock LUKS with the LUKS_PASS you set${CRYPTKEY:+ (or it auto-unlocks)}
 
-  Trigger the duress wipe:
-    local:   sudo duressd trigger        # or:  sudo duressd status / health
-    remote:  printf '%s' '<DURESS_PASS>' | ssh -i $KEYOUT -T root@<laptop-ip>
+  Non-destructive self-test first (OS stays alive — iterate to green over SSH):
+    ssh $USERNAME@<laptop-ip>
+    git clone <this-repo-url> && cd Duressd
+    sudo make phys-selftest ARGS=--tpm          # git + make are pre-installed
 
-  Then verify with tests/physical/verify-wipe.sh from a live USB.
+  Trigger the duress wipe (the one irreversible step):
+    baseline: sudo bash tests/physical/baseline.sh
+    local:    sudo duressd trigger       # or:  sudo duressd status / health
+    remote:   printf '%s' '<DURESS_PASS>' | ssh -i $KEYOUT -T root@<laptop-ip>
+
+  Then verify from a live USB:
+    sudo bash tests/physical/verify-wipe.sh /dev/<laptop-disk>
 DONE
