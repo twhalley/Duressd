@@ -28,7 +28,11 @@ if [[ "${1:-}" == --clean ]]; then
     echo "  →  tearing down leftover duressd build state"
     for m in /tmp/duressd-build.*; do
         [[ -d "$m" ]] || continue
-        mountpoint -q "$m" && { echo "     umount -R $m"; umount -R "$m" 2>/dev/null || true; }
+        if mountpoint -q "$m"; then
+            echo "     kill holders + umount -R $m"
+            fuser -kM "$m" 2>/dev/null; pkill -f "$m" 2>/dev/null; sleep 1
+            umount -R "$m" 2>/dev/null || umount -Rl "$m" 2>/dev/null || true
+        fi
         rmdir "$m" 2>/dev/null || true
     done
     for d in /dev/mapper/duressd_build_*; do
@@ -69,14 +73,22 @@ MNT="$(mktemp -d /tmp/duressd-build.XXXXXX)"
 LOOP=""
 cleanup() {
     set +e
-    # Recursive unmount handles the ESP, the root, AND any arch-chroot API binds
-    # (proc/sys/dev/efivars) that a killed run may have left mounted under $MNT.
-    mountpoint -q "$MNT" && umount -R "$MNT" 2>/dev/null
-    [[ -e "/dev/mapper/$MAPNAME" ]] && cryptsetup close "$MAPNAME"
-    [[ -n "$LOOP" ]] && losetup -d "$LOOP"
-    [[ -n "${MNT:-}" ]] && rmdir "$MNT" 2>/dev/null
+    # Kill any keyring/gpg daemons pacstrap left running with the target open
+    # (the usual cause of a "target is busy" unmount), then recursively unmount
+    # (lazy fallback) — this also handles arch-chroot API binds (proc/sys/dev/
+    # efivars) — close the mapping, and detach the loop. Never leaves a stray
+    # mount/mapping/loop on the host, even on an interrupted or failed run.
+    if [[ -n "${MNT:-}" ]] && mountpoint -q "$MNT"; then
+        fuser -kM "$MNT" 2>/dev/null; pkill -f "$MNT" 2>/dev/null; sleep 1
+        umount -R "$MNT" 2>/dev/null || umount -Rl "$MNT" 2>/dev/null
+    fi
+    if [[ -e "/dev/mapper/$MAPNAME" ]]; then
+        cryptsetup close "$MAPNAME" 2>/dev/null || dmsetup remove --force "$MAPNAME" 2>/dev/null
+    fi
+    [[ -n "$LOOP" ]] && losetup -d "$LOOP" 2>/dev/null
+    [[ -n "${MNT:-}" ]] && ! mountpoint -q "$MNT" && rmdir "$MNT" 2>/dev/null
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT INT TERM HUP
 
 echo "  →  allocating $SIZE raw image at $OUT"
 # Detach any stale loop from a previous run and start from a clean file, so
@@ -192,7 +204,7 @@ ENTRY
 
 # pre-configure duressd (custom passphrase, boot-artifact wipe on)
 install -d -m0700 /etc/duressd
-dd if=/dev/zero of=/etc/duressd/passphrase.luks bs=1M count=8 status=none
+dd if=/dev/zero of=/etc/duressd/passphrase.luks bs=1M count=24 status=none
 chmod 0600 /etc/duressd/passphrase.luks
 printf '%s' "$DURESS_PASS" | cryptsetup luksFormat --type luks2 --batch-mode \
     --pbkdf argon2id --key-file=- /etc/duressd/passphrase.luks
@@ -209,7 +221,11 @@ CFG
 chmod 0600 /etc/duressd/config
 CHROOT
 
-umount "$MNT"/boot "$MNT"
+# Kill any keyring daemons pacstrap left holding the mount, sync, then unmount
+# (lazy fallback) so the build never dies on a "target is busy" at the finish.
+sync
+fuser -kM "$MNT" 2>/dev/null || true; pkill -f "$MNT" 2>/dev/null || true; sleep 1
+umount -R "$MNT" 2>/dev/null || umount -Rl "$MNT"
 cryptsetup close "$MAPNAME"
 losetup -d "$LOOP"; LOOP=""
 
