@@ -74,7 +74,8 @@ coproc VM { exec qemu-system-x86_64 "${kvm[@]}" \
     -m "${MEM:-6144}" -smp "${SMP:-4}" \
     -kernel "$KERNEL" -initrd "$INITRD" -append "$APPEND" \
     -drive file="$ISO",media=cdrom,if=virtio,readonly=on \
-    -drive file="$SCRATCH",if=virtio,format=qcow2,serial=duressdgolden \
+    -drive file="$SCRATCH",if=none,id=goldenscratch,format=qcow2 \
+    -device virtio-blk-pci,drive=goldenscratch,serial=duressdgolden \
     -virtfs "local,path=$REPO,mount_tag=duressd,security_model=none,readonly=on" \
     -nic user -display none -serial stdio -monitor none 2>>"$LOG"; }
 QPID=$!
