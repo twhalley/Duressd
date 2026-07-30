@@ -79,12 +79,16 @@ fi
 
 # `duressd.poweroff`: the ISO's self-test service shuts the VM down when the
 # suite finishes, so this script needs to drive nothing.
-APPEND="archisobasedir=arch archisosearchuuid=${UUID} console=ttyS0,115200 systemd.show_status=false rd.systemd.show_status=false modprobe.blacklist=floppy loglevel=3 duressd.poweroff"
+# `cow_spacesize=2G`: the live root's writable overlay (cowspace) defaults to
+# 256M — too small for the integration tests' loopback backing files under
+# /var/tmp (esp. the RAID6 test, whose Phase 3 overwrites ~256M across members).
+# Enlarge it; MEM is raised to 6144 so the RAM-backed overlay has headroom.
+APPEND="archisobasedir=arch archisosearchuuid=${UUID} cow_spacesize=2G console=ttyS0,115200 systemd.show_status=false rd.systemd.show_status=false modprobe.blacklist=floppy loglevel=3 duressd.poweroff"
 
 echo "Booting headless (serial). Live transcript → $LOG" >&2
 # The guest's serial line is this coprocess's stdout: ${VM[0]}.
 coproc VM { exec qemu-system-x86_64 "${kvm[@]}" \
-    -m "${MEM:-4096}" -smp "${SMP:-2}" \
+    -m "${MEM:-6144}" -smp "${SMP:-2}" \
     -kernel "$KERNEL" -initrd "$INITRD" -append "$APPEND" \
     -drive file="$ISO",media=cdrom,if=virtio,readonly=on \
     -virtfs "local,path=$REPO,mount_tag=duressd,security_model=none,readonly=on" \
