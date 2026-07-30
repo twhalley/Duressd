@@ -11,6 +11,7 @@
 #   make iso           build a self-testing duressd ISO — needs sudo + archiso
 #   make golden        build the bootable LUKS-at-boot golden image — sudo
 #   make golden-test   boot test: duress passphrase → wipe → won't boot — sudo
+#   make vm-golden     golden boot test INSIDE the VM (host untouched) — qemu + ISO=
 #   make phys-selftest non-destructive physical self-test (run ON the test box) — sudo
 #   make test-all      every tier this host can run
 #
@@ -28,13 +29,14 @@ SHELL_SOURCES := src/handler src/daemon src/cli install.sh \
                  pam/pam-duress \
                  tests/iso/build.sh tests/iso/overlay/airootfs/usr/local/bin/duressd-selftest \
                  tests/e2e/build-luks-duress.sh tests/e2e/luks-duress-test.sh \
+                 tests/vm/golden-vm.sh tests/vm/golden-inside.sh \
                  tests/physical/self-test.sh tests/physical/baseline.sh \
                  tests/physical/verify-wipe.sh tests/physical/build-laptop-image.sh
 
-.PHONY: help lint unit test integration e2e vm vm-auto vm-shell iso golden golden-test phys-selftest test-all
+.PHONY: help lint unit test integration e2e vm vm-auto vm-shell iso golden golden-test vm-golden phys-selftest test-all
 
 help:
-	@sed -n '3,18p' $(MAKEFILE_LIST) | sed 's/^# \{0,1\}//'
+	@sed -n '3,19p' $(MAKEFILE_LIST) | sed 's/^# \{0,1\}//'
 
 lint:
 	@command -v $(SHELLCHECK) >/dev/null 2>&1 || { \
@@ -68,6 +70,9 @@ vm-auto:
 
 vm-shell:
 	@ISO="$(ISO)" bash tests/vm/shell.sh
+
+vm-golden:
+	@ISO="$(ISO)" bash tests/vm/golden-vm.sh
 
 iso:
 	@if [[ $$EUID -ne 0 ]]; then \

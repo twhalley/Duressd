@@ -42,6 +42,9 @@ openssh
 tor
 torsocks
 spice-vdagent
+qemu-base
+edk2-ovmf
+arch-install-scripts
 PKGS
 
 echo ">> applying overlay (self-test entrypoint + tty1/serial autologin hooks)"

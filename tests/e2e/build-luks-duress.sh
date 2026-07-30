@@ -8,9 +8,15 @@
 # HOST ISOLATION: everything here operates ONLY on a loopback file under
 # tests/e2e/images/ (git-ignored). It NEVER partitions, formats, or mounts any
 # real disk. It uses a PRIVATE temp mountpoint (not /mnt) and a unique dm-crypt
-# mapping name, and the trap cleans up the mount, mapping and loop device on any
-# exit. The one host-visible side effect is packages downloaded into the pacman
-# cache by pacstrap.
+# mapping name. The trap force-unwinds the mount (lazy fallback), mapping and
+# loop device on ANY exit — including SIGINT/SIGTERM — so an interrupted or
+# failed build never leaves the host with a stray mount/mapping/loop.
+# The pacman package cache is redirected to a temp dir under $WORK, so the host's
+# /var/cache/pacman is never written either. Result: zero persistent host trace.
+#
+# Set E2E_WORKDIR to place the scratch build state (image, pkg cache, mountpoint)
+# on a specific filesystem — used by the in-VM runner to keep it off a RAM-backed
+# live root. Defaults to /tmp.
 #
 # Two distinct passphrases:
 #   LUKS_PASS   (default e2e-luks) unlocks the disk normally
@@ -28,22 +34,35 @@ GOLDEN="$OUTDIR/luks-duress.qcow2"
 LUKS_PASS="${E2E_LUKS_PASS:-e2e-luks}"
 DURESS_PASS="${E2E_DURESS_PASS:-wipe-now}"
 
-# Private, unique names so we never touch host /mnt or a host mapping.
-MNT="$(mktemp -d /tmp/duressd-golden.XXXXXX)"
+# Private, unique names so we never touch host /mnt or a host mapping. All
+# scratch state lives under $WORK (honours E2E_WORKDIR) so it can be steered onto
+# a real filesystem when the host root is RAM-backed (in-VM runner).
+WORKPARENT="${E2E_WORKDIR:-/tmp}"
+mkdir -p "$WORKPARENT"
+WORK="$(mktemp -d "$WORKPARENT/duressd-golden-work.XXXXXX")"
+MNT="$WORK/mnt"; mkdir -p "$MNT"
 MAP="duressd_golden_$$"
 LOOP=""
 
 cleanup() {
     set +e
-    mountpoint -q "$MNT/boot/efi" && umount "$MNT/boot/efi"
-    mountpoint -q "$MNT/boot"     && umount "$MNT/boot"
-    mountpoint -q "$MNT"          && umount -R "$MNT"
-    [[ -e "/dev/mapper/$MAP" ]] && cryptsetup close "$MAP"
-    [[ -n "$LOOP" ]] && losetup -d "$LOOP"
-    rm -rf "$MNT"
+    # Force-unwind: try a clean recursive unmount, then a lazy one so a busy
+    # mount can never block teardown of the mapping/loop below.
+    if [[ -n "${MNT:-}" ]] && mountpoint -q "$MNT"; then
+        umount -R "$MNT" 2>/dev/null || umount -Rl "$MNT" 2>/dev/null
+    fi
+    if [[ -e "/dev/mapper/$MAP" ]]; then
+        cryptsetup close "$MAP" 2>/dev/null || dmsetup remove --force "$MAP" 2>/dev/null
+    fi
+    [[ -n "${LOOP:-}" ]] && losetup -d "$LOOP" 2>/dev/null
+    # Remove the scratch tree only once MNT is truly unmounted — never rm -rf a
+    # dir that still contains a live mount.
+    if [[ -n "${WORK:-}" ]] && ! mountpoint -q "$MNT" 2>/dev/null; then
+        rm -rf "$WORK"
+    fi
     rm -f "$RAW"
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM HUP
 
 # Loop is built into this kernel (loop-control exists) but the /dev/loopN nodes
 # may be absent on a host that has never used a loop device, so `losetup --find`
@@ -78,8 +97,18 @@ mount "/dev/mapper/$MAP" "$MNT"
 mkdir -p "$MNT/boot"; mount "$BOOT" "$MNT/boot"
 mkdir -p "$MNT/boot/efi"; mount "$ESP" "$MNT/boot/efi"
 
-echo "  →  pacstrap minimal system"
-pacstrap -K "$MNT" base linux mkinitcpio socat cryptsetup util-linux openssl coreutils systemd
+echo "  →  pacstrap minimal system (isolated package cache — host cache untouched)"
+# Redirect pacman's CacheDir into $WORK so downloads never land in the host's
+# /var/cache/pacman (and don't bloat the image). Cleaned up by the trap.
+install -Dm644 /etc/pacman.conf "$WORK/pacman.conf"
+mkdir -p "$WORK/pkgcache"
+if grep -qE '^[[:space:]]*CacheDir' "$WORK/pacman.conf"; then
+    sed -i "s|^[[:space:]]*CacheDir.*|CacheDir = $WORK/pkgcache|" "$WORK/pacman.conf"
+else
+    sed -i "/^\[options\]/a CacheDir = $WORK/pkgcache" "$WORK/pacman.conf"
+fi
+pacstrap -C "$WORK/pacman.conf" -K "$MNT" \
+    base linux mkinitcpio socat cryptsetup util-linux openssl coreutils systemd
 
 ROOT_UUID="$(blkid -s UUID -o value "$ROOT")"
 genfstab -U "$MNT" >> "$MNT/etc/fstab"

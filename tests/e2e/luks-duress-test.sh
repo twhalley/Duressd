@@ -41,7 +41,10 @@ for _n in 0 1 2 3 4 5 6 7; do
     [[ -e "/dev/loop$_n" ]] || mknod -m 0660 "/dev/loop$_n" b 7 "$_n" 2>/dev/null || true
 done
 
-WORK="$(mktemp -d)"
+# Scratch dir for overlays + the raw inspection image. Honour E2E_WORKDIR so the
+# in-VM runner can keep the multi-GB convert off a RAM-backed live root.
+mkdir -p "${E2E_WORKDIR:-/tmp}"
+WORK="$(mktemp -d "${E2E_WORKDIR:-/tmp}/duressd-goldentest.XXXXXX")"
 INSPECT_LOOP=""
 cleanup() {
     set +e
