@@ -7,8 +7,13 @@ makes each run **repeatable and machine-reported** so results come back in a
 consistent form.
 
 Scripts:
-- `tests/physical/baseline.sh` — run on the target OS **before** wiping.
-- `tests/physical/verify-wipe.sh` — run from a **live USB after** wiping; emits a Markdown report.
+- `tests/physical/build-laptop-image.sh` — build a ready-to-test bootable LUKS image.
+- `tests/physical/self-test.sh` — **non-destructive** on-machine self-test (health → real-machine dry-run → scoped scratch wipe → real TPM enroll/clear/verify). The OS survives; iterate over SSH. Run via `make phys-selftest`.
+- `tests/physical/baseline.sh` — run on the target OS **before** the real wipe.
+- `tests/physical/verify-wipe.sh` — run from a **live USB after** the real wipe; emits a Markdown report.
+
+**Do the non-destructive self-test to green first** (below), then the single
+irreversible baseline → trigger → verify run.
 
 ## ⚠️ Safety first
 
@@ -54,7 +59,45 @@ Requires `arch-install-scripts`, `dosfstools`, `openssh` on the build host. This
 image covers the **systemd-boot + LUKS** scenario; for GRUB and Qubes, install
 those normally on the laptop and follow the loop below.
 
-## The loop (per scenario)
+The image ships `git` + `make`, so on the laptop you can clone this repo and run
+the self-test (and pull fixes) directly over SSH — no `scp`:
+
+```bash
+ssh tester@<laptop-ip>
+git clone <this-repo-url> && cd Duressd
+sudo make phys-selftest ARGS=--tpm
+```
+
+## Step 0 — non-destructive self-test (do this first, iterate to green)
+
+Before you ever fire a real wipe, prove the real-hardware paths **without
+destroying the OS**. `self-test.sh` is recoverable by design — scoped to loopback
+scratch, poweroff suppressed, and the TPM is checked via a runtime unseal (no
+reboot). Your SSH session and the OS stay alive, so you can fix and re-run freely.
+
+```bash
+sudo make phys-selftest ARGS=--tpm
+#   or directly:  sudo bash tests/physical/self-test.sh --tpm
+#   real spare SSD as the scratch target instead of a loopback file:
+#   sudo bash tests/physical/self-test.sh --tpm --scratch-dev /dev/sdX   # /dev/sdX IS wiped
+```
+
+Stages: preflight → `duressd health` → **DRY-RUN against the real machine**
+(prints exactly what a real trigger *would* destroy — your real disks/ESP/TPM/
+NVRAM — touching nothing) → **scoped real wipe of a scratch disk** (proves the
+engine works on this hardware, OS untouched) → **`--tpm`**: enrolls a real
+`systemd-cryptenroll --tpm2` key, proves it unseals, fires duressd's
+`tpm2_clear`, then proves it can **no longer** unseal (catches a silent
+`tpm2_clear` failure).
+
+> `--tpm` clears the **whole machine's** TPM (recoverable by re-enrolling). It's
+> safe only if this machine's root does **not** auto-unlock via TPM — which is
+> why `build-laptop-image.sh` defaults to passphrase unlock (`AUTO_UNLOCK=0`).
+
+Drive it to `✔ PHYSICAL SELF-TEST PASSED`, fixing anything red over SSH, before
+moving to the irreversible run below.
+
+## The irreversible run (per scenario) — after Step 0 is green
 
 ```
  baseline  →  image  →  configure  →  trigger  →  boot live USB  →  verify  →  restore
