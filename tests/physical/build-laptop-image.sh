@@ -30,7 +30,7 @@ if [[ "${1:-}" == --clean ]]; then
         [[ -d "$m" ]] || continue
         if mountpoint -q "$m"; then
             echo "     kill holders + umount -R $m"
-            fuser -kM "$m" 2>/dev/null; pkill -f "$m" 2>/dev/null; sleep 1
+            fuser -kM "$m" 2>/dev/null || true; pkill -f "$m" 2>/dev/null || true; sleep 1
             umount -R "$m" 2>/dev/null || umount -Rl "$m" 2>/dev/null || true
         fi
         rmdir "$m" 2>/dev/null || true
