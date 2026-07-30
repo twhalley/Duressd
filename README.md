@@ -24,6 +24,14 @@ duressd trigger          ← enter duress passphrase
          │    close all dm-crypt mappings
          │    wipefs + luksErase on every device found
          │
+         ├─ Phase 1.5 (optional: wipe_boot_artifacts=true)
+         │    scrub ESP + unencrypted /boot (Qubes, GRUB, systemd-boot)
+         │    overwrite MBR / BIOS-boot gap (GRUB core.img)
+         │    clear UEFI NVRAM boot entries
+         │
+         ├─ Phase 1.6 (optional: wipe_hardware_keys=true)
+         │    tpm2_clear → evict TPM-sealed FDE keys
+         │
          ├─ Phase 2 (optional: overwrite_luks_header=true)
          │    openssl rand | dd  →  40 MiB over each LUKS header
          │    blkdiscard
@@ -57,6 +65,8 @@ duressd trigger          ← enter duress passphrase
 | `findmnt` | `util-linux` | `util-linux` | Locate mountpoints |
 | `shred` | `coreutils` | `coreutils` | Secure-erase passphrase file |
 | `mdadm` *(optional)* | `mdadm` | `mdadm` | RAID teardown (Phase 3 only) |
+| `efibootmgr` *(optional)* | `efibootmgr` | `efibootmgr` | Clear UEFI NVRAM entries (Phase 1.5) |
+| `tpm2_clear` *(optional)* | `tpm2-tools` | `tpm2-tools` | Evict TPM-sealed FDE keys (Phase 1.6) |
 
 `install.sh` checks for all required tools and prints the correct install command for your distro before aborting.
 
@@ -134,6 +144,8 @@ Run `duressd configure` and answer the prompts. Settings are stored in `/etc/dur
 | Option | What it does | Speed |
 |--------|-------------|-------|
 | Phase 1 (always) | `wipefs` + `luksErase` on every LUKS container found | Fast — seconds |
+| Wipe boot artifacts | Scrubs the ESP, unencrypted `/boot`, MBR / BIOS-boot gap, and UEFI NVRAM entries so **no bootable OS remains**. Essential for Qubes (unencrypted `/boot`). | Fast — seconds |
+| Wipe hardware keys | `tpm2_clear` evicts TPM-sealed FDE keys so a TPM-auto-unlock key can never be reused | Instant |
 | Overwrite LUKS header | 40 MiB `openssl rand` over each LUKS partition head + `blkdiscard` | ~1–2 s per device |
 | Wipe full device(s) | Chunked random overwrite of entire parent block device(s), then stops RAID arrays and wipes member superblocks | Slow — minutes per GB |
 
@@ -159,6 +171,8 @@ Configured:                    yes
 Password type:                 custom
 Verify device:                 /dev/sda2
 Overwrite LUKS header:         false
+Wipe boot artifacts:           true
+Wipe hardware keys:            false
 Wipe full device(s):           false
 Countdown (s):                 5
 ```
@@ -260,6 +274,36 @@ duressd logs 100
 
 ---
 
+### `duressd dry-run`
+
+**Non-destructive preview of a *real* trigger.** Runs the exact same discovery,
+device scoping and phase-selection that a real wipe would — against your actual
+configured targets — then lists precisely what each phase *would* destroy
+(LUKS containers, ESP/`/boot`, MBR, BIOS-boot, UEFI NVRAM entries, TPM clear,
+poweroff) **without touching anything**. Every line is shown in **green** and
+the machine is never modified, discovered mappings are never closed, and the
+state file is left untouched.
+
+Because it reuses the real engine (only the destructive primitives are
+neutered), the preview can never drift from what a real trigger does — it is the
+best way to confirm a machine is configured to wipe what you expect.
+
+```bash
+duressd dry-run
+```
+
+It also works over SSH, so you can rehearse the remote kill switch harmlessly:
+
+```bash
+printf '%s' "$DURESS_PASS" | ssh -i duressd_duress -T root@host duressd trigger-remote --dry-run
+```
+
+> **`dry-run` vs `test`:** `dry-run` previews your *real* targets and changes
+> nothing; `test` (below) actually wipes a *throwaway scratch container* to prove
+> the wipe chain executes end-to-end. Both are safe and shown in green.
+
+---
+
 ### `duressd test`  ·  alias: `dwipe_test`
 
 **Non-destructive.** Allocates a 10 MiB throwaway LUKS2 file, runs `luksErase → wipefs` on it, and reports pass/fail. Your real data is never touched.
@@ -287,6 +331,110 @@ duressd trigger
 # or
 dwipe_real
 ```
+
+---
+
+### `duressd trigger-remote`  ·  `duressd install-ssh-trigger`
+
+**Remote / non-interactive wipe** — a duress kill switch over SSH.
+
+`trigger-remote` is `trigger` without prompts or the `WIPE` confirmation: it
+takes the duress passphrase from `--passphrase-file`, `$DURESSD_PASS`, or stdin,
+then fires the wipe. It needs root because the control socket is root-only, so
+the SSH key must live in **root's** `authorized_keys`.
+
+`install-ssh-trigger` sets that up for you — it generates an ed25519 keypair (or
+takes `--pubkey`) and appends a `restrict`ed forced-command entry:
+
+```bash
+sudo duressd install-ssh-trigger
+#   command="duressd trigger-remote",restrict ssh-ed25519 AAAA… duressd-duress
+```
+
+Then trigger the wipe from anywhere you can reach the host — the passphrase
+travels over the encrypted SSH channel and is never stored on the machine:
+
+```bash
+printf '%s' "$DURESS_PASS" | ssh -i duressd_duress -T root@host
+```
+
+For a **key-only** kill switch (no passphrase needed at trigger time), use
+`--embed-passphrase` — the passphrase is stored root-only on the machine and a
+bare `ssh -i duressd_duress root@host` fires the wipe. Trade-off: anyone who
+obtains that private key can wipe the machine.
+
+> If a countdown is configured, keep the SSH session open during it — closing
+> the connection aborts the wipe (the same abort that `Ctrl-C` gives locally).
+
+Add **`--dry-run`** to `trigger-remote` to rehearse the remote path without
+touching anything — the daemon streams a green preview of exactly what a real
+remote trigger would destroy (see `duressd dry-run` above).
+
+---
+
+### Remote trigger from an Android phone
+
+The kill switch is just an SSH key with a forced command, so **any Android SSH
+client works** — no companion app to install on the phone beyond a terminal or
+SSH app. Two ways to reach the machine:
+
+#### A. Direct SSH (host reachable on your LAN / VPN / port-forward)
+
+1. **On the machine**, install the trigger. For a phone, the key-only mode is
+   easiest — a bare connect fires the wipe, no passphrase to type on a
+   touchscreen:
+   ```bash
+   sudo duressd install-ssh-trigger --embed-passphrase
+   #   prints the private key it generated: ~/.ssh/duressd_duress
+   ```
+2. **Move the private key to the phone** over a trusted channel (USB/`adb push`,
+   a one-time encrypted transfer — never leave a copy on the machine you might
+   need to wipe). Store it in the app's protected keystore.
+3. **Trigger** from any Android SSH app:
+   - **Termux** (`pkg install openssh`): `ssh -i duressd_duress -T root@HOST`
+   - **JuiceSSH / Termius / ConnectBot**: import `duressd_duress` as the
+     identity, set the host user to `root`, connect. The forced command runs the
+     wipe automatically — you don't get a shell.
+
+   If you used the default (passphrase) mode instead of `--embed-passphrase`,
+   send the duress passphrase on stdin. In Termux:
+   ```bash
+   printf '%s' 'YOUR-DURESS-PASS' | ssh -i duressd_duress -T root@HOST
+   ```
+
+> Protect the phone-side key with the app's biometric/keystore lock. Anyone who
+> gets both the phone **and** (for `--embed-passphrase`) can trigger the wipe —
+> that's the whole point, but it means the phone is now a live kill switch.
+
+#### B. SSH over Tor (host NOT reachable — no port-forwarding, works anywhere)
+
+This exposes sshd as a **client-authorized v3 onion service**: the machine needs
+no public IP or open port, and only someone holding the onion client-auth key
+can even see the service (a second auth layer in front of the SSH key).
+
+1. **On the machine:**
+   ```bash
+   sudo duressd install-ssh-trigger --embed-passphrase --tor
+   ```
+   It prints the **`.onion` address** and writes the operator client-auth secret
+   to `/etc/duressd/tor-client-auth.private`. Move that file off the machine.
+2. **On the phone**, use **Termux** (it has real `tor`/`torsocks`):
+   ```bash
+   pkg install openssh tor torsocks
+   mkdir -p ~/.tor/onion_auth
+   cp tor-client-auth.private ~/.tor/onion_auth/duressd.auth_private   # from step 1
+   echo 'ClientOnionAuthDir ~/.tor/onion_auth' >> $PREFIX/etc/tor/torrc
+   tor &            # or run the Orbot app instead of this line
+   # then fire the wipe:
+   torsocks ssh -i duressd_duress -T xxxxxxxx.onion
+   ```
+   (Prefer the **Orbot** app for the Tor connection? Put the client-auth key in
+   Orbot's onion-auth settings and route the SSH app through Orbot's VPN mode
+   instead of `torsocks`.)
+
+Either way, add **`--dry-run`** on the far end first
+(`… ssh … root@HOST duressd trigger-remote --dry-run`) to rehearse from the
+phone with nothing destroyed.
 
 ---
 
@@ -399,6 +547,19 @@ Installed by `duressd install-shortcuts`. Double-click from any file manager or 
 
 **After step 4 the data is cryptographically irrecoverable**, even if every raw sector on disk is forensically intact.
 
+### Phase 1.5 — Boot-artifact wipe (optional)
+
+Cryptographic destruction removes the *data*; this phase removes the *bootable OS and its traces* — important because much of the boot chain lives **outside** the LUKS container:
+
+1. **ESP** — every EFI System Partition (`systemd-boot`, GRUB EFI, shim) is overwritten and its signatures cleared.
+2. **`/boot`** — the unencrypted boot partition (kernels, initramfs, and Xen on Qubes) is overwritten. **Qubes and many LUKS setups keep `/boot` in the clear**, so Phase 1 alone leaves it intact.
+3. **MBR / BIOS-boot gap** — legacy GRUB `stage1` and its embedded `core.img` in LBA0 and the alignment gap, plus any BIOS-boot partition, are overwritten.
+4. **UEFI NVRAM** — boot entries are removed via `efibootmgr` (real EFI systems only).
+
+### Phase 1.6 — Hardware-key eviction (optional)
+
+`tpm2_clear` clears the TPM's storage hierarchy, rotating the SRK so any key sealed to the TPM (e.g. `systemd-cryptenroll --tpm2`, Clevis) can never be unsealed again — removing the auto-unlock path. Falls back to the firmware Physical Presence Interface if `tpm2-tools` is absent.
+
 ### Phase 2 — Header overwrite (optional)
 
 For each LUKS partition, writes 40 MiB of `openssl rand` output (AES-CTR via AES-NI, 5–10× faster than `/dev/urandom`) over the header region, then issues a `blkdiscard` TRIM command so the flash controller erases the cells.
@@ -437,6 +598,34 @@ The double `--force` bypasses systemd's graceful shutdown sequence, which would 
 | Passphrase in memory | Passed as `--key-file=-` to cryptsetup stdin; never written to disk or the config file |
 | Config file | `/etc/duressd/config` — root `0600`. Contains only boolean flags and the verify-device path, never the passphrase |
 | SIGPIPE / client disconnect | `trap '' SIGPIPE` in handler ensures a client crash never leaves the daemon in an inconsistent state. During countdown, `printf || exit 0` aborts a wipe if the client disconnects |
+
+---
+
+## Testing
+
+duressd has a layered test pipeline — most of it runs with no privileges, and
+the destructive tiers run only against throwaway loop devices or VMs, never the
+host's disks. See **[docs/TESTING.md](docs/TESTING.md)** for details.
+
+```bash
+make test          # lint + unit tests (safe, no root) — the CI default
+make lint          # shellcheck (static analysis)
+make unit          # bats unit tests, all wipe binaries mocked
+sudo make integration   # real LUKS on loopback devices — headers actually destroyed
+sudo make e2e           # KVM: a booted encrypted OS wipes itself and won't reboot
+make test-all      # every tier this host supports (skips KVM if no /dev/kvm)
+```
+
+Safety rail: every wipe phase honours `DURESSD_TARGET_DEVICES`, which the
+integration harness sets to its loop devices, and a second guard refuses any
+target that is not a loop device backed by the test's temp workdir.
+
+For real-hardware acceptance testing (TPM, NVMe, real bootloaders, Qubes), see
+**[docs/PHYSICAL-TESTING.md](docs/PHYSICAL-TESTING.md)** — a baseline/verify kit
+that images the disk, runs the real wipe, then emits a pass/fail report.
+
+CI runs lint + unit and the loop-device integration tests on every push
+(`.github/workflows/`); the KVM end-to-end suite is opt-in.
 
 ---
 
@@ -496,7 +685,7 @@ Not yet implemented — tracked as a roadmap item below.
 |---------|-----------|-------------|
 | **initramfs hook** | Medium | Intercept the LUKS passphrase at the boot prompt — wipe before the OS ever mounts. No cryptsetup patch needed (see section above). Requires generating a custom initrd on install. |
 | **PAM module** | Medium | Trigger wipe when a "honeypot" username is entered at a login prompt via `pam_exec`. Works without unlocking a desktop session. |
-| **Duress SSH key** | Easy | Add an `authorized_keys` entry whose `command=` runs `duressd trigger`. Remote wipe over SSH — useful if you have remote access but can't run the CLI. |
+| ~~**Duress SSH key**~~ | ✅ Done | `duressd install-ssh-trigger` installs a forced-command key; `duressd trigger-remote` is the non-interactive wipe. See below. |
 | **Network kill-switch** | Medium | A lightweight UDP/HTTP listener that triggers wipe on receipt of a cryptographically signed token from a remote server. Useful when the machine goes missing. |
 | **Dead man's switch** | Medium | Wipe if a heartbeat ping is not received within a configurable window. Pair with a mobile app or cron job on another machine — if you stop checking in, the machine wipes itself. |
 | **USB kill key** | Easy | Monitor `udev` events; wipe when a specific USB device (identified by vendor/product ID or a secret file on the device) is inserted or *removed*. |
@@ -509,8 +698,8 @@ Not yet implemented — tracked as a roadmap item below.
 | Feature | Difficulty | Description |
 |---------|-----------|-------------|
 | **SED / OPAL** | Hard | Issue a hardware `PSID revert` or `ATA Secure Erase` command to self-encrypting drives. Cryptographically instantaneous — the drive's internal key is gone in milliseconds. Falls back to software wipe if unsupported. |
-| **UEFI variable wipe** | Medium | Clear NVRAM variables (`efivar`) and optionally enrolled Secure Boot keys after Phase 1. Prevents booting a known-good OS image from another device that might read leaked memory. |
-| **TPM key eviction** | Medium | Flush TPM-sealed keys (`tpm2_evictcontrol`, `tpm2_flushcontext`) during Phase 1 so TPM-unsealed FDE keys are permanently gone. |
+| ~~**UEFI variable wipe**~~ | ✅ Done | Implemented in Phase 1.5 — UEFI NVRAM boot entries cleared via `efibootmgr`. |
+| ~~**TPM key eviction**~~ | ✅ Done | Implemented in Phase 1.6 (`wipe_hardware_keys=true`) — `tpm2_clear` evicts TPM-sealed FDE keys. |
 | **RAM scrub** | Hard | Write random patterns to all accessible RAM before poweroff. Mitigates cold-boot attacks. Requires a custom kernel module or early-exit userspace loop before the MMU shuts down. |
 | **Multi-pass overwrite** | Easy | Option to run DoD 5220.22-M (3-pass) or Gutmann (35-pass) instead of single-pass random. Mainly useful for rotational HDDs. |
 | **NVMe Sanitize** | Easy | Issue `nvme sanitize` (crypto-erase or block-erase mode) to NVMe drives in addition to software wipe. Faster and more thorough than overwriting sectors. |

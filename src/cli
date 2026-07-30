@@ -4,16 +4,16 @@
 # Interactive: duressd  (no args → menu)
 set -euo pipefail
 
-SOCKET=/run/duressd/control.sock
+SOCKET=${DURESSD_SOCKET:-/run/duressd/control.sock}
 SERVICE=duressd
 
 # ── colours ───────────────────────────────────────────────────────────────────
 if [[ -t 2 ]]; then
     RED=$'\033[1;31m'   YLW=$'\033[1;33m'   GRN=$'\033[1;32m'
-    CYN=$'\033[1;36m'   BLU=$'\033[1;34m'   MAG=$'\033[1;35m'
+    CYN=$'\033[1;36m'   BLU=$'\033[1;34m'
     DIM=$'\033[2m'      BLD=$'\033[1m'       RST=$'\033[0m'
 else
-    RED='' YLW='' GRN='' CYN='' BLU='' MAG='' DIM='' BLD='' RST=''
+    RED='' YLW='' GRN='' CYN='' BLU='' DIM='' BLD='' RST=''
 fi
 
 # ── banners ───────────────────────────────────────────────────────────────────
@@ -22,6 +22,15 @@ banner_test() {
     echo -e "${GRN}╔══════════════════════════════════════════╗${RST}" >&2
     echo -e "${GRN}║       TEST MODE  —  NON-DESTRUCTIVE      ║${RST}" >&2
     echo -e "${GRN}║   No real data will be touched.          ║${RST}" >&2
+    echo -e "${GRN}╚══════════════════════════════════════════╝${RST}" >&2
+    echo >&2
+}
+
+banner_dryrun() {
+    echo >&2
+    echo -e "${GRN}╔══════════════════════════════════════════╗${RST}" >&2
+    echo -e "${GRN}║       DRY RUN  —  PREVIEW ONLY (SAFE)    ║${RST}" >&2
+    echo -e "${GRN}║  Real targets shown. Nothing is touched. ║${RST}" >&2
     echo -e "${GRN}╚══════════════════════════════════════════╝${RST}" >&2
     echo >&2
 }
@@ -59,6 +68,17 @@ render_progress() {
         "$color" "$bar" "$RST" "$pct" "$DIM" "$msg" "$RST" >&2
 }
 
+# ── dry-run plan rendering (all green — this is a safe, non-destructive run) ───
+render_plan() {
+    local kind="$1" text="$2"
+    case "$kind" in
+        head) printf '\n  %s%s▶  %s%s\n'    "$GRN" "$BLD" "$text" "$RST" >&2 ;;
+        item) printf '  %s✔  would %s%s\n'  "$GRN"        "$text" "$RST" >&2 ;;
+        skip) printf '  %s○  %s%s\n'        "$DIM"        "$text" "$RST" >&2 ;;
+        note) printf '  %s%s%s\n'           "$GRN"        "$text" "$RST" >&2 ;;
+    esac
+}
+
 # ── low-level transport ───────────────────────────────────────────────────────
 # send_cmd <color> <CMD> [args…]
 # Streams PROGRESS in-place; returns 0 on OK, 1 on ERROR.
@@ -81,6 +101,11 @@ send_cmd() {
                 local pct="${rest%%$'\t'*}"
                 local msg="${rest#*$'\t'}"
                 render_progress "$color" "$pct" "$msg"
+                ;;
+            PLAN)
+                local kind="${rest%%$'\t'*}"
+                local text="${rest#*$'\t'}"
+                render_plan "$kind" "$text"
                 ;;
             OK)
                 render_progress "$color" 100 "Done"
@@ -132,7 +157,7 @@ cmd_status() {
     local result
     result=$(send_cmd "$CYN" STATUS) || return 1
 
-    local state="" cfgd="" pt="" vdev="" olh="" wfd="" wcd=""
+    local state="" cfgd="" pt="" vdev="" olh="" wfd="" wba="" whk="" wcd=""
     for pair in $result; do
         case "${pair%%=*}" in
             state)                 state="${pair#*=}" ;;
@@ -141,6 +166,8 @@ cmd_status() {
             verify_device)         vdev="${pair#*=}" ;;
             overwrite_luks_header) olh="${pair#*=}" ;;
             wipe_full_device)      wfd="${pair#*=}" ;;
+            wipe_boot_artifacts)   wba="${pair#*=}" ;;
+            wipe_hardware_keys)    whk="${pair#*=}" ;;
             wipe_countdown)        wcd="${pair#*=}" ;;
         esac
     done
@@ -156,6 +183,8 @@ cmd_status() {
     printf '  %-30s %s\n' "Password type:"         "${pt:-none}" >&2
     printf '  %-30s %s\n' "Verify device:"         "${vdev:-none}" >&2
     printf '  %-30s %s\n' "Overwrite LUKS header:" "${olh:-false}" >&2
+    printf '  %-30s %s\n' "Wipe boot artifacts:"   "${wba:-false}" >&2
+    printf '  %-30s %s\n' "Wipe hardware keys:"    "${whk:-false}" >&2
     printf '  %-30s %s\n' "Wipe full device(s):"   "${wfd:-false}" >&2
     printf '  %-30s %s\n' "Countdown (s):"         "${wcd:-0}" >&2
     echo >&2
@@ -211,6 +240,19 @@ cmd_configure() {
     info "  Slower but overwrites raw header bytes for forensic plausible deniability."
     echo >&2
 
+    local wipe_boot_artifacts
+    wipe_boot_artifacts=$(yn_bool "$(ask \
+        "Phase 1.5 — wipe boot artifacts (ESP, /boot, MBR, UEFI entries)?     [y/N]: ")")
+    info "  Removes the bootloader and unencrypted /boot so no OS remains."
+    info "  Recommended for GRUB, systemd-boot, and especially Qubes OS."
+    echo >&2
+
+    local wipe_hardware_keys
+    wipe_hardware_keys=$(yn_bool "$(ask \
+        "Phase 1.6 — clear hardware keys (TPM-sealed FDE keys)?               [y/N]: ")")
+    info "  Clears the TPM so a TPM-sealed unlock key can never be reused."
+    echo >&2
+
     local wipe_full_device
     wipe_full_device=$(yn_bool "$(ask \
         "Phase 3 — overwrite entire parent block device(s) + RAID teardown?   [y/N]: ")")
@@ -233,7 +275,9 @@ cmd_configure() {
         "$(b64 "$duress_pass")" \
         "$overwrite_luks_header" \
         "$wipe_full_device" \
-        "$wipe_countdown"
+        "$wipe_countdown" \
+        "$wipe_boot_artifacts" \
+        "$wipe_hardware_keys"
 }
 
 # ── unconfigure ───────────────────────────────────────────────────────────────
@@ -260,6 +304,22 @@ cmd_test() {
     send_cmd "$GRN" TRIGGER_TEST "$(b64 "$pass")"
 }
 
+# ── dry run — preview every REAL target, touch nothing ────────────────────────
+# Runs the real discovery + phase-selection against the configured targets and
+# lists exactly what a real trigger would destroy, without touching anything.
+cmd_dryrun() {
+    banner_dryrun
+    section "Dry Run — preview the real wipe, change NOTHING"
+    info "Runs the real discovery, device scoping and phase-selection against your"
+    info "configured targets, then lists exactly what a real trigger would destroy."
+    good "Non-destructive: no device, header, boot partition, TPM or power state is changed."
+    echo >&2
+    local pass
+    pass=$(read_pass "Duress passphrase: ")
+    echo >&2
+    send_cmd "$GRN" TRIGGER_DRYRUN "$(b64 "$pass")"
+}
+
 # ── real wipe — red ───────────────────────────────────────────────────────────
 # Alias: dwipe_real
 cmd_trigger() {
@@ -283,6 +343,291 @@ cmd_trigger() {
     info "If a countdown is configured, press Ctrl-C now to abort."
     echo >&2
     send_cmd "$RED" TRIGGER "$(b64 "$pass")"
+}
+
+# ── remote / non-interactive trigger ──────────────────────────────────────────
+# For SSH forced-commands and automation. NO prompts and NO "WIPE" confirmation —
+# the ability to invoke it (e.g. a dedicated SSH key) is the authorization.
+# The duress passphrase is taken from, in order:
+#   1. --passphrase-file FILE   (first line)
+#   2. $DURESSD_PASS            (environment)
+#   3. stdin                    (first line)
+# Requires root: the control socket is root-only.
+cmd_trigger_remote() {
+    local passfile="" pass="" dry=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --passphrase-file) passfile="$2"; shift 2 ;;
+            --dry-run)         dry=true; shift ;;
+            -h|--help)
+                echo "usage: duressd trigger-remote [--passphrase-file FILE] [--dry-run]" >&2
+                echo "  passphrase from --passphrase-file, \$DURESSD_PASS, or stdin" >&2
+                echo "  --dry-run  preview the wipe over SSH without touching anything" >&2
+                return 0 ;;
+            *) shift ;;
+        esac
+    done
+
+    if   [[ -n "$passfile" ]];          then IFS= read -r pass < "$passfile" || true
+    elif [[ -n "${DURESSD_PASS:-}" ]];  then pass="$DURESSD_PASS"
+    else IFS= read -r pass || true
+    fi
+    [[ -n "$pass" ]] || { echo "ERROR: no passphrase (use --passphrase-file, \$DURESSD_PASS, or stdin)" >&2; return 1; }
+
+    if [[ "$dry" == true ]]; then
+        send_cmd "$GRN" TRIGGER_DRYRUN "$(b64 "$pass")"
+    else
+        send_cmd "$RED" TRIGGER "$(b64 "$pass")"
+    fi
+}
+
+# ── SSH-over-Tor: v3 onion service + client authorization ─────────────────────
+# Exposes the local sshd as a CLIENT-AUTHORIZED v3 onion service, so the duress
+# kill switch is reachable over Tor with no exposed ports and two independent
+# auth layers: onion client-auth to even reach the service, then the SSH
+# forced-command key to trigger. Paths are env-overridable for testing:
+#   DURESSD_TOR_HSDIR (/var/lib/tor/duressd_ssh)  DURESSD_TORRC (/etc/tor/torrc)
+#   DURESSD_SSH_PORT (22)  DURESSD_TOR_USER (tor)  DURESSD_NO_TOR_RESTART
+_setup_tor_onion() {
+    local hsdir="${DURESSD_TOR_HSDIR:-/var/lib/tor/duressd_ssh}"
+    local torrc="${DURESSD_TORRC:-/etc/tor/torrc}"
+    local sshport="${DURESSD_SSH_PORT:-22}"
+    local toruser="${DURESSD_TOR_USER-tor}"
+    local cfgdir="${DURESSD_CFGDIR:-/etc/duressd}"
+
+    command -v tor     >/dev/null || { bad "tor not installed (pacman -S tor)"; return 1; }
+    command -v openssl >/dev/null || { bad "openssl required for client-auth keygen"; return 1; }
+    command -v base32  >/dev/null || { bad "base32 (coreutils) required"; return 1; }
+
+    section "SSH-over-Tor onion service (v3, client-authorized)"
+
+    # 1. onion service config (idempotent) → forwards onion:22 to the local sshd.
+    if ! grep -qs "HiddenServiceDir $hsdir" "$torrc" 2>/dev/null; then
+        install -d -m 0755 "$(dirname "$torrc")"
+        cat >> "$torrc" <<TORRC
+
+# duressd SSH duress onion service (v3, client-authorized)
+HiddenServiceDir $hsdir
+HiddenServiceVersion 3
+HiddenServicePort 22 127.0.0.1:$sshport
+TORRC
+        good "Onion service configured in $torrc"
+    fi
+    install -d -m 0700 "$hsdir" "$hsdir/authorized_clients"
+
+    # 2. client-authorization keypair (x25519 → Tor base32). Public half authorizes
+    #    the client on the service; private half is the operator's connect secret.
+    local ck priv pub
+    ck="$(mktemp)"
+    openssl genpkey -algorithm x25519 -out "$ck" 2>/dev/null \
+        || { bad "x25519 keygen failed"; rm -f "$ck"; return 1; }
+    priv=$(openssl pkey -in "$ck" -outform DER        2>/dev/null | tail -c 32 | base32 | tr -d '=')
+    pub=$( openssl pkey -in "$ck" -pubout -outform DER 2>/dev/null | tail -c 32 | base32 | tr -d '=')
+    rm -f "$ck"
+    printf 'descriptor:x25519:%s\n' "$pub" > "$hsdir/authorized_clients/duress.auth"
+    chmod 0600 "$hsdir/authorized_clients/duress.auth"
+    [[ -n "$toruser" ]] && chown -R "$toruser:$toruser" "$hsdir" 2>/dev/null || true
+
+    # 3. bring the service up (unless a caller/test manages tor) and read the
+    #    .onion address tor derives locally.
+    local onion=""
+    if [[ -z "${DURESSD_NO_TOR_RESTART:-}" ]] && command -v systemctl >/dev/null; then
+        systemctl enable --now tor 2>/dev/null || systemctl restart tor 2>/dev/null || true
+        local i
+        for (( i=0; i<30; i++ )); do
+            [[ -s "$hsdir/hostname" ]] && { onion="$(cat "$hsdir/hostname")"; break; }
+            sleep 1
+        done
+    elif [[ -s "$hsdir/hostname" ]]; then
+        onion="$(cat "$hsdir/hostname")"
+    fi
+
+    # 4. persist + print the operator-side client-auth secret and trigger command.
+    install -d -m 0700 "$cfgdir"
+    printf '%s:descriptor:x25519:%s\n' "${onion%.onion}" "$priv" > "$cfgdir/tor-client-auth.private"
+    chmod 0600 "$cfgdir/tor-client-auth.private"
+
+    if [[ -n "$onion" ]]; then good "Onion address: $onion"
+    else warn "tor hasn't generated the address yet — start tor, then read $hsdir/hostname"; fi
+    echo >&2
+    warn "sshd must be running and listening on 127.0.0.1:$sshport for this to work."
+    info "Operator setup (on the machine you'll trigger FROM):"
+    info "  install -d -m700 ~/.tor/onion_auth"
+    info "  cp $cfgdir/tor-client-auth.private ~/.tor/onion_auth/duressd.auth_private   # move, don't leave it here"
+    info "  add 'ClientOnionAuthDir ~/.tor/onion_auth' to your torrc"
+    info "Trigger the wipe over Tor:"
+    info "  printf '%s' \"\$DURESS_PASS\" | torsocks ssh -i <duresskey> -T ${onion:-<onion>}"
+    warn "Move BOTH private keys (SSH + Tor client-auth) off this machine."
+}
+
+# ── install an SSH duress trigger key ─────────────────────────────────────────
+# Installs a forced-command entry in root's authorized_keys so that connecting
+# with a dedicated key fires the wipe — a remote kill switch. Two modes:
+#   default            operator supplies the passphrase over SSH stdin
+#                        printf '%s' "$PASS" | ssh -i key -T root@host
+#   --embed-passphrase key alone triggers (passphrase stored root-only on disk)
+#                        ssh -i key root@host
+# --tor  also expose the sshd as a client-authorized v3 onion service.
+cmd_install_ssh_trigger() {
+    local pubkey="" keydir="${HOME:-/root}/.ssh" embed=false tor=false
+    local authkeys="${DURESSD_SSH_AUTHKEYS:-/root/.ssh/authorized_keys}"
+    local passfile="${DURESSD_CFGDIR:-/etc/duressd}/ssh-trigger.pass"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pubkey)            pubkey="$2"; shift 2 ;;
+            --authorized-keys)   authkeys="$2"; shift 2 ;;
+            --embed-passphrase)  embed=true; shift ;;
+            --tor)               tor=true; shift ;;
+            -h|--help)
+                echo "usage: duressd install-ssh-trigger [--pubkey FILE] [--embed-passphrase] [--tor]" >&2
+                echo "  --tor  also expose sshd as a client-authorized v3 onion service" >&2
+                return 0 ;;
+            *) shift ;;
+        esac
+    done
+
+    section "Install SSH duress trigger"
+
+    # Obtain a public key — reuse a supplied one, or generate a fresh keypair.
+    local generated=""
+    if [[ -z "$pubkey" ]]; then
+        command -v ssh-keygen &>/dev/null || { bad "ssh-keygen not found"; return 1; }
+        install -d -m 0700 "$keydir"
+        generated="$keydir/duressd_duress"
+        [[ -f "$generated" ]] && { bad "$generated already exists — remove it or pass --pubkey"; return 1; }
+        ssh-keygen -t ed25519 -N '' -C duressd-duress -f "$generated" >/dev/null
+        pubkey="${generated}.pub"
+        good "Generated keypair: $generated"
+    fi
+    [[ -f "$pubkey" ]] || { bad "public key not found: $pubkey"; return 1; }
+
+    # Build the forced command.
+    local forced="duressd trigger-remote"
+    if [[ "$embed" == true ]]; then
+        local p1 p2
+        p1=$(read_pass "Duress passphrase to embed: "); echo >&2
+        p2=$(read_pass "Confirm: ");                    echo >&2
+        [[ "$p1" == "$p2" ]] || { bad "passphrases do not match"; return 1; }
+        install -d -m 0700 "$(dirname "$passfile")"
+        printf '%s' "$p1" > "$passfile"; chmod 0600 "$passfile"
+        forced="duressd trigger-remote --passphrase-file $passfile"
+        warn "Passphrase stored at $passfile (root 0600) — key alone now triggers a wipe."
+    fi
+
+    # restrict = no pty/agent/port/x11/user-rc (OpenSSH 7.2+).
+    local keymaterial line
+    keymaterial="$(cat "$pubkey")"
+    line="command=\"$forced\",restrict $keymaterial"
+    install -d -m 0700 "$(dirname "$authkeys")"
+    printf '%s\n' "$line" >> "$authkeys"
+    chmod 0600 "$authkeys"
+    good "Forced-command entry added to $authkeys"
+
+    echo >&2
+    info "Trigger the wipe remotely with:"
+    if [[ "$embed" == true ]]; then
+        info "  ssh -i <private-key> root@<host>"
+    else
+        info "  printf '%s' \"\$DURESS_PASS\" | ssh -i <private-key> -T root@<host>"
+    fi
+    if [[ -n "$generated" ]]; then
+        echo >&2
+        warn "Move the PRIVATE key ($generated) off this machine and delete it here:"
+        warn "  shred -u $generated"
+    fi
+
+    if [[ "$tor" == true ]]; then
+        echo >&2
+        _setup_tor_onion
+    fi
+}
+
+# ── install a LUKS duress-passphrase trigger (initramfs) ──────────────────────
+# Installs a mkinitcpio hook so a DURESS passphrase at the boot-time LUKS unlock
+# prompt destroys the header instead of unlocking, then powers off. The duress
+# passphrase is the custom passphrase from `duressd configure`. Fail-safe: the
+# hook falls through to the normal `encrypt` unlock if anything is off.
+cmd_install_luks_trigger() {
+    local cfgdir="${DURESSD_CFGDIR:-/etc/duressd}"
+    local src="${DURESSD_INITRAMFS_SRC:-/usr/local/lib/duressd/initramfs}"
+    local mkconf="${DURESSD_MKINITCPIO_CONF:-/etc/mkinitcpio.conf}"
+    local instdir="${DURESSD_INITCPIO_INSTALL:-/etc/initcpio/install}"
+    local hookdir="${DURESSD_INITCPIO_HOOKS:-/etc/initcpio/hooks}"
+
+    section "Install LUKS duress-passphrase trigger (initramfs)"
+    [[ -f "$cfgdir/passphrase.luks" ]] || {
+        bad "No custom duress passphrase configured."
+        info "Run: duressd configure   (choose the 'custom' passphrase type)"; return 1; }
+    command -v mkinitcpio >/dev/null || { bad "mkinitcpio not found (Arch initramfs only)"; return 1; }
+    [[ -f "$src/duress-install-hook" && -f "$src/duress-runtime-hook" ]] \
+        || { bad "hook templates not found in $src"; return 1; }
+
+    warn "This modifies your initramfs. A DURESS passphrase at the boot unlock"
+    warn "prompt will DESTROY the LUKS header. Keep a rescue USB / fallback boot"
+    warn "entry until you have verified normal unlock still works."
+
+    install -Dm644 "$src/duress-install-hook" "$instdir/duress"
+    install -Dm755 "$src/duress-runtime-hook" "$hookdir/duress"
+    good "Installed initramfs hooks (build: $instdir/duress, runtime: $hookdir/duress)"
+
+    # Add 'duress' immediately before 'encrypt' in HOOKS (idempotent).
+    if grep -qE '^HOOKS=.*[ (]encrypt[ )]' "$mkconf"; then
+        if grep -qE '^HOOKS=.*[ (]duress[ )]' "$mkconf"; then
+            info "'duress' already present in $mkconf HOOKS"
+        else
+            sed -i -E 's/^(HOOKS=.*[ (])encrypt([ )])/\1duress encrypt\2/' "$mkconf"
+            good "Added 'duress' before 'encrypt' in $mkconf"
+        fi
+    else
+        warn "No 'encrypt' hook found in $mkconf — add 'duress' manually before your crypt hook."
+    fi
+
+    if [[ -z "${DURESSD_NO_MKINITCPIO:-}" ]]; then
+        info "Regenerating initramfs (mkinitcpio -P)…"
+        mkinitcpio -P >/dev/null || { bad "mkinitcpio failed — review $mkconf"; return 1; }
+        good "Initramfs regenerated."
+    fi
+    echo >&2
+    warn "TEST normal unlock on the NEXT reboot before relying on this."
+    info "The duress passphrase is the custom passphrase you configured."
+}
+
+# ── install a PAM login duress trigger ────────────────────────────────────────
+# Adds a pam_exec hook to the auth stack so that entering the duress passphrase
+# at ANY login (console, ssh, su, display manager) fires the wipe. `optional`, so
+# it never blocks or changes normal login; the daemon verifies the passphrase, so
+# only the configured duress passphrase triggers.
+cmd_install_login_trigger() {
+    local cfgdir="${DURESSD_CFGDIR:-/etc/duressd}"
+    local libdir="${DURESSD_LIBDIR:-/usr/local/lib/duressd}"
+    local pamfile="${DURESSD_PAM_FILE:-/etc/pam.d/system-auth}"
+    local src="${DURESSD_PAM_SRC:-/usr/local/lib/duressd}"
+    local script="$libdir/pam-duress"
+
+    section "Install PAM login duress trigger"
+    [[ -f "$cfgdir/passphrase.luks" ]] || {
+        bad "No custom duress passphrase configured."
+        info "Run: duressd configure   (choose the 'custom' passphrase type)"; return 1; }
+    [[ -f "$src/pam-duress" ]] || { bad "pam-duress hook not found in $src"; return 1; }
+
+    install -Dm755 "$src/pam-duress" "$script"
+    good "Installed PAM hook: $script"
+
+    local line="auth optional pam_exec.so expose_authtok quiet $script"
+    if grep -qF "$script" "$pamfile" 2>/dev/null; then
+        info "PAM hook already present in $pamfile"
+    else
+        [[ -f "$pamfile" ]] && cp -a "$pamfile" "$pamfile.duressd.bak"
+        # Prepend so the hook captures the authtok before other auth modules.
+        { printf '%s\n' "$line"; [[ -f "$pamfile" ]] && cat "$pamfile"; } > "$pamfile.tmp"
+        mv "$pamfile.tmp" "$pamfile"
+        good "Added duress hook to $pamfile${pamfile:+ (backup: $pamfile.duressd.bak)}"
+    fi
+
+    echo >&2
+    warn "Entering your configured duress passphrase at ANY login now fires the wipe."
+    warn "It is 'optional' — it never blocks or changes normal login."
+    warn "Verify normal login still works before relying on this."
 }
 
 # ── wipe unused ───────────────────────────────────────────────────────────────
@@ -733,7 +1078,8 @@ cmd_menu() {
         echo -e "  ${CYN}d${RST}  Install desktop shortcuts" >&2
         echo -e "  ${CYN}k${RST}  Install keyboard shortcuts" >&2
         echo -e "  ${DIM}── Wipe ─────────────────────────────────────${RST}" >&2
-        echo -e "  ${GRN}t${RST}  ${GRN}${BLD}Test wipe${RST}  ${DIM}(dry run — safe)${RST}" >&2
+        echo -e "  ${GRN}p${RST}  ${GRN}${BLD}Preview real wipe${RST}  ${DIM}(dry run — nothing touched)${RST}" >&2
+        echo -e "  ${GRN}t${RST}  ${GRN}${BLD}Test wipe${RST}  ${DIM}(scratch container — safe)${RST}" >&2
         echo -e "  ${RED}W${RST}  ${RED}${BLD}TRIGGER REAL WIPE${RST}  ${DIM}(destructive)${RST}" >&2
         echo -e "  ${DIM}────────────────────────────────────────────${RST}" >&2
         echo -e "  ${DIM}q  Quit${RST}" >&2
@@ -753,6 +1099,7 @@ cmd_menu() {
             0) cmd_wipe_unused ;;
             d|D) cmd_install_shortcuts ;;
             k|K) cmd_install_keybindings ;;
+            p|P) cmd_dryrun ;;
             t|T) cmd_test ;;
             W) cmd_trigger ;;
             q|Q) echo >&2; exit 0 ;;
@@ -781,12 +1128,19 @@ ${BLD}Configuration:${RST}
   ${CYN}passgen${RST}                 Generate a strong random passphrase
 
 ${BLD}Actions:${RST}
-  ${GRN}test${RST}                    ${GRN}Non-destructive dry-run of the wipe chain${RST}
+  ${GRN}dry-run${RST}                 ${GRN}Preview the REAL wipe — lists every target, touches nothing${RST}
+  ${GRN}test${RST}                    ${GRN}Non-destructive wipe of a throwaway scratch container${RST}
   ${CYN}wipe-unused${RST}             Zero unallocated sectors on all mounted LUKS volumes
   ${CYN}install-shortcuts${RST}       Create desktop .desktop launchers
   ${CYN}install-keybindings${RST}     Register keyboard shortcuts in the current DE
   ${CYN}service <action>${RST}        Pass action to systemctl (start/stop/status/restart)
   ${RED}trigger${RST}                 ${RED}DESTRUCTIVE: wipe all LUKS volumes and power off${RST}
+
+${BLD}Remote (SSH / automation):${RST}
+  ${RED}trigger-remote${RST}          ${RED}Non-interactive wipe${RST} — stdin/\$DURESSD_PASS/--passphrase-file; add ${GRN}--dry-run${RST} to preview
+  ${CYN}install-ssh-trigger${RST}     Install an SSH forced-command duress key (remote kill switch)
+  ${CYN}install-luks-trigger${RST}    Install a boot-time LUKS duress-passphrase wipe (initramfs)
+  ${CYN}install-login-trigger${RST}   Install a PAM login duress-passphrase wipe (any login)
 
 ${BLD}Aliases:${RST}
   dwipe_test   →  duressd test
@@ -798,6 +1152,12 @@ EOF
 }
 
 # ── main ──────────────────────────────────────────────────────────────────────
+# Source guard: tests set DURESSD_LIB_ONLY=1 to load the helper functions
+# without launching the interactive menu or dispatching a command.
+if [[ "${DURESSD_LIB_ONLY:-}" == 1 ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 if [[ $# -eq 0 ]]; then
     cmd_menu
 else
@@ -809,6 +1169,7 @@ else
         change-passphrase)    cmd_change_passphrase ;;
         unconfigure)          cmd_unconfigure ;;
         passgen)              cmd_passgen ;;
+        dry-run|dryrun)       cmd_dryrun ;;
         test)                 cmd_test ;;
         wipe-unused)          cmd_wipe_unused ;;
         scan)                 cmd_scan ;;
@@ -817,6 +1178,10 @@ else
         install-keybindings)  cmd_install_keybindings ;;
         service)              cmd_service "${2:-status}" ;;
         trigger)              cmd_trigger ;;
+        trigger-remote)       shift; cmd_trigger_remote "$@" ;;
+        install-ssh-trigger)  shift; cmd_install_ssh_trigger "$@" ;;
+        install-luks-trigger) shift; cmd_install_luks_trigger "$@" ;;
+        install-login-trigger) shift; cmd_install_login_trigger "$@" ;;
         -h|--help|help)       usage ;;
         *)                    bad "Unknown command: $1"; usage ;;
     esac

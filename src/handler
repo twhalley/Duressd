@@ -5,19 +5,64 @@
 set -euo pipefail
 trap '' SIGPIPE   # write failures after client disconnect are non-fatal
 
-RUNDIR=/run/duressd
-CFGFILE=/etc/duressd/config
-PASSPHRASE_LUKS=/etc/duressd/passphrase.luks
+# Paths are overridable via env so the test harness can point them at a temp
+# dir. In production (systemd) these env vars are unset → the defaults apply.
+RUNDIR=${DURESSD_RUNDIR:-/run/duressd}
+CFGDIR=${DURESSD_CFGDIR:-/etc/duressd}
+CFGFILE=$CFGDIR/config
+PASSPHRASE_LUKS=$CFGDIR/passphrase.luks
 LOCKFILE=$RUNDIR/lock
 STATEFILE=$RUNDIR/state
 
 # ── I/O helpers ───────────────────────────────────────────────────────────────
-prog()  { printf 'PROGRESS\t%s\t%s\n' "$1" "$2"; }
+# DRYRUN=1 turns the wipe engine into a preview: discovery, device scoping and
+# phase selection all run for real, but every destructive primitive is replaced
+# by a green "would …" PLAN line and NOTHING on the system is modified. It is set
+# only by the TRIGGER_DRYRUN dispatch arm — and because socat forks a fresh
+# handler per connection, it can never leak into a real TRIGGER.
+DRYRUN=0
+prog()  { (( DRYRUN )) && return 0; printf 'PROGRESS\t%s\t%s\n' "$1" "$2"; }
 ok()    { printf 'OK\t%s\n' "$*"; }
 die()   { printf 'ERROR\t%s\n' "$*"; exit 1; }
 
+# ── dry-run preview plumbing ──────────────────────────────────────────────────
+# PLAN lines carry a kind (head|item|skip|note) the CLI renders in green so the
+# operator always sees this is a safe, non-destructive rehearsal.
+plan()      { printf 'PLAN\t%s\t%s\n' "$1" "$2"; }
+plan_head() { plan head "$1"; }
+plan_item() { plan item "$1"; }
+plan_skip() { plan skip "$1"; }
+plan_note() { plan note "$1"; }
+# drun/dhead/dskip/dnote: emit a preview line only on a dry run, and ALWAYS
+# return 0. The explicit `return 0` is load-bearing: `(( DRYRUN )) && plan …`
+# evaluates to status 1 when DRYRUN=0, and under the handler's `set -e` a bare
+# guard as a function's last statement would abort the caller (a real wipe).
+drun()      { (( DRYRUN )) && plan_item "$1"; return 0; }
+dhead()     { (( DRYRUN )) && plan_head "$1"; return 0; }
+dskip()     { (( DRYRUN )) && plan_skip "$1"; return 0; }
+dnote()     { (( DRYRUN )) && plan_note "$1"; return 0; }
+# mutate: run a destructive command — but never during a dry run.
+mutate()    { (( DRYRUN )) && return 0; "$@"; }
+
+# Block-device test, wrapped so unit tests (which have no real block devices)
+# can override it. Production behaviour is unchanged.
+_is_block() { [[ -b "$1" ]]; }
+
+# Print the TPM resource-manager/char device if present. Wrapped so unit tests
+# (which have no TPM) can override it.
+_tpm_device() {
+    local d
+    for d in /dev/tpmrm0 /dev/tpm0; do [[ -c "$d" ]] && { printf '%s' "$d"; return 0; }; done
+    return 1
+}
+
+# True if the firmware Physical Presence Interface can request a TPM clear.
+# Wrapped so unit tests can simulate its absence (it is writable as root whenever
+# a TPM — including an emulated one — is present).
+_tpm_ppi() { [[ -w /sys/class/tpm/tpm0/ppi/request ]]; }
+
 get_state() { cat "$STATEFILE" 2>/dev/null || echo IDLE; }
-set_state() { echo "$1" > "$STATEFILE"; }
+set_state() { (( DRYRUN )) && return 0; echo "$1" > "$STATEFILE"; }
 
 load_config() {
     [[ -f "$CFGFILE" ]] || return 1
@@ -31,7 +76,7 @@ load_config() {
 verify_luks() {
     local pass="$1"
     local dev="${VERIFY_DEVICE:-}"
-    if [[ -z "$dev" ]] || [[ ! -b "$dev" ]]; then
+    if [[ -z "$dev" ]] || ! _is_block "$dev"; then
         die "Verification device '${dev:-<unset>}' not found — re-run: duressd configure"
     fi
     printf '%s' "$pass" | cryptsetup open --test-passphrase --key-file=- "$dev" 2>/dev/null
@@ -77,35 +122,71 @@ destroy_passphrase_luks() {
     shred -u "$PASSPHRASE_LUKS" 2>/dev/null || rm -f "$PASSPHRASE_LUKS"
 }
 
+# ── target scoping (test safety rail) ─────────────────────────────────────────
+# In production DURESSD_TARGET_DEVICES is unset and every device is in scope.
+# Integration tests set it to a list of loopback devices so the wipe engine can
+# NEVER touch the host's real disks — discovery, parent collection, RAID
+# teardown and dm-crypt teardown all honour it.
+_in_scope() {
+    [[ -z "${DURESSD_TARGET_DEVICES:-}" ]] && return 0
+    local dev="$1" t
+    for t in ${DURESSD_TARGET_DEVICES}; do
+        [[ "$t" == "$dev" ]] && return 0
+    done
+    return 1
+}
+
 # ── dynamic device discovery ──────────────────────────────────────────────────
 # Enumerate every block device visible to the kernel (partitions, md RAID,
 # LVM logical volumes, loop devices, NVMe namespaces …) and return those that
 # carry a LUKS header.  Uses lsblk so the list is always current.
 discover_luks_devices() {
     while IFS= read -r dev; do
-        [[ -b "$dev" ]] || continue
+        _is_block "$dev" || continue
+        _in_scope "$dev" || continue
         cryptsetup isLuks "$dev" 2>/dev/null && printf '%s\n' "$dev"
     done < <(lsblk -lnpo NAME 2>/dev/null)
+    return 0   # exit status must not depend on whether the last device was LUKS
 }
 
 # Tear down every active dm-crypt mapping (unmount first so nothing is "in use").
 close_all_crypt_mappings() {
     while IFS=$'\t' read -r name _; do
         [[ -z "$name" ]] && continue
+        # `dmsetup ls` prints this literal line when there are no mappings — it
+        # is not a device name.
+        [[ "$name" == "No devices found" ]] && continue
+        # When scoped, only close mappings backed by an in-scope device so an
+        # integration run never tears down the host's own encrypted volumes.
+        if [[ -n "${DURESSD_TARGET_DEVICES:-}" ]]; then
+            local backing
+            # Tolerate a failing `cryptsetup status` (|| true) so set -e can't
+            # abort the whole wipe over one unreadable mapping.
+            backing=$(cryptsetup status "$name" 2>/dev/null \
+                | awk '/^[[:space:]]*device:/ {print $2}') || true
+            _in_scope "$backing" || continue
+        fi
         local mp
         mp=$(findmnt -n -o TARGET --source "/dev/mapper/$name" 2>/dev/null || true)
-        [[ -n "$mp" ]] && umount --lazy "$mp" 2>/dev/null || true
+        drun "close dm-crypt mapping: $name${mp:+ (unmount $mp)}"
+        [[ -n "$mp" ]] && mutate umount --lazy "$mp" 2>/dev/null || true
         # dmsetup --force: bypasses "device still in use" after lazy unmount.
-        dmsetup remove --force "$name" 2>/dev/null || true
+        mutate dmsetup remove --force "$name" 2>/dev/null || true
     done < <(dmsetup ls --target crypt 2>/dev/null)
 }
 
 # ── fast random write (AES-NI via openssl, 5-10× faster than /dev/urandom) ───
+# iflag=fullblock is load-bearing: reading bs=4M from a PIPE returns short reads
+# (~64 KiB), which dd would otherwise count as whole blocks — stopping early,
+# closing the pipe (openssl gets EPIPE → non-zero under pipefail) and leaving the
+# device only partially overwritten. fullblock makes dd assemble full 4 MiB
+# blocks, so it consumes exactly what openssl produces.
 rand_write() {
     local dest="$1" seek="$2" count="$3"
     local bytes=$(( count * 4 * 1024 * 1024 ))
     openssl rand "$bytes" 2>/dev/null \
-        | dd of="$dest" bs=4M seek="$seek" count="$count" conv=fdatasync 2>/dev/null
+        | dd of="$dest" bs=4M seek="$seek" count="$count" \
+             iflag=fullblock conv=fdatasync 2>/dev/null
 }
 
 # ── wipe phases ───────────────────────────────────────────────────────────────
@@ -125,17 +206,19 @@ phase1_crypto_destruction() {
     local total=${#luks_devs[@]} i=0
     if (( total == 0 )); then
         prog 30 "Phase 1 — no LUKS containers found"
-        return
+        dnote "no LUKS containers found — nothing to erase"
+        return 0
     fi
 
     for dev in "${luks_devs[@]}"; do
-        (( i++ ))
+        (( ++i ))   # pre-increment: never returns 1 (would abort under set -e)
         local pct=$(( 10 + i * 25 / total ))
         prog "$pct" "Phase 1 [$i/$total] — wipefs + luksErase: $dev"
-        wipefs -a "$dev"                              2>/dev/null || true
+        drun "wipefs + luksErase — destroy LUKS header and keyslots (data becomes irrecoverable): $dev"
+        mutate wipefs -a "$dev"                         2>/dev/null || true
         # luksErase may fail if wipefs already zeroed the magic — acceptable,
         # the header region is already gone.
-        cryptsetup luksErase --batch-mode "$dev"      2>/dev/null || true
+        mutate cryptsetup luksErase --batch-mode "$dev" 2>/dev/null || true
     done
 }
 
@@ -147,11 +230,12 @@ phase2_overwrite_headers() {
     local total=${#luks_devs[@]} i=0
 
     for dev in "${luks_devs[@]}"; do
-        (( i++ ))
+        (( ++i ))   # pre-increment: never returns 1 (would abort under set -e)
         prog $(( 40 + i * 10 / (total > 0 ? total : 1) )) \
             "Phase 2 [$i/$total] — 40 MiB random overwrite: $dev"
-        rand_write "$dev" 0 10
-        blkdiscard "$dev" 2>/dev/null || true
+        drun "overwrite first 40 MiB with random data + blkdiscard: $dev"
+        mutate rand_write "$dev" 0 10
+        mutate blkdiscard "$dev" 2>/dev/null || true
     done
 }
 
@@ -164,51 +248,179 @@ phase3_wipe_full_devices() {
     local total=${#parent_devs[@]} i=0
 
     for dev in "${parent_devs[@]}"; do
-        [[ -b "$dev" ]] || continue
-        (( i++ ))
+        _is_block "$dev" || continue
+        (( ++i ))   # pre-increment: never returns 1 (would abort under set -e)
 
         local size_bytes total_blocks chunk=32 written=0
         size_bytes=$(lsblk -nbdo SIZE "$dev" 2>/dev/null || echo 0)
         total_blocks=$(( (size_bytes + 4*1024*1024 - 1) / (4*1024*1024) ))
 
-        wipefs -a "$dev" 2>/dev/null || true
+        drun "wipefs signatures: $dev"
+        mutate wipefs -a "$dev" 2>/dev/null || true
 
-        while (( written < total_blocks )); do
-            local count=$(( total_blocks - written ))
-            (( count > chunk )) && count=$chunk
-            rand_write "$dev" "$written" "$count"
-            written=$(( written + count ))
-            prog $(( 55 + written * 35 / (total_blocks > 0 ? total_blocks : 1) )) \
-                "Phase 3 [$i/$total] — $dev  $written/$total_blocks blocks"
-        done
-
-        blkdiscard "$dev" 2>/dev/null || true
+        # A dry run never enters the byte loop — on a real disk it would iterate
+        # millions of times. Report the size once instead.
+        if (( DRYRUN )); then
+            plan_item "overwrite the ENTIRE device with random data ($(( size_bytes / 1024 / 1024 )) MiB, ${total_blocks} × 4 MiB blocks) + blkdiscard: $dev"
+        else
+            while (( written < total_blocks )); do
+                local count=$(( total_blocks - written ))
+                (( count > chunk )) && count=$chunk
+                rand_write "$dev" "$written" "$count"
+                written=$(( written + count ))
+                prog $(( 55 + written * 35 / (total_blocks > 0 ? total_blocks : 1) )) \
+                    "Phase 3 [$i/$total] — $dev  $written/$total_blocks blocks"
+            done
+            blkdiscard "$dev" 2>/dev/null || true
+        fi
     done
 
     # Stop RAID arrays whose members were just overwritten
     prog 92 "Phase 3 — stopping RAID arrays"
     while IFS= read -r dev type; do
-        [[ "$type" =~ ^raid ]] && [[ -b "$dev" ]] || continue
-        mdadm --stop "$dev" 2>/dev/null || true
-        wipefs -a "$dev"    2>/dev/null || true
+        [[ "$type" =~ ^raid ]] && _is_block "$dev" || continue
+        _in_scope "$dev" || continue
+        drun "stop RAID array + wipe its signatures: $dev"
+        mutate mdadm --stop "$dev" 2>/dev/null || true
+        mutate wipefs -a "$dev"    2>/dev/null || true
     done < <(lsblk -lnpo NAME,TYPE 2>/dev/null)
 
     # Wipe RAID superblocks on member drives so mdadm --assemble --scan cannot
     # reconstruct the array from scratch after a reboot.
     prog 96 "Phase 3 — wiping RAID member superblocks"
     while IFS= read -r dev; do
-        [[ -b "$dev" ]] || continue
+        _is_block "$dev" || continue
+        _in_scope "$dev" || continue
         local fstype
         fstype=$(lsblk -ndo FSTYPE "$dev" 2>/dev/null || true)
-        [[ "$fstype" == "linux_raid_member" ]] && wipefs -a "$dev" 2>/dev/null || true
+        if [[ "$fstype" == "linux_raid_member" ]]; then
+            drun "wipe RAID member superblock: $dev"
+            mutate wipefs -a "$dev" 2>/dev/null || true
+        fi
     done < <(lsblk -lnpo NAME 2>/dev/null)
+}
+
+# GPT partition-type GUIDs used by the boot-artifact wipe.
+ESP_GUID=c12a7328-f81f-11d2-ba4b-00a0c93ec93b       # EFI System Partition
+BIOSBOOT_GUID=21686148-6449-6e6f-744e-656564454649  # BIOS boot (GRUB core.img)
+
+# Phase 1.5 — optional (WIPE_BOOT_ARTIFACTS=true).
+# Destroys the OS boot chain so nothing bootable remains after the wipe:
+#   • EFI System Partitions (systemd-boot, GRUB EFI, shim)
+#   • the unencrypted /boot — which Qubes and many LUKS setups keep in the clear
+#     (kernels, initramfs, Xen)
+#   • the BIOS-boot partition + MBR/boot-gap where legacy GRUB embeds core.img
+#   • UEFI NVRAM boot entries
+# Cryptographic destruction (Phase 1) already makes data irrecoverable; this
+# phase removes the *evidence and bootability* of the OS itself. Scoped by
+# DURESSD_TARGET_DEVICES exactly like every other phase.
+wipe_boot_artifacts() {
+    local -a parent_devs=("$@")   # parent disks, for MBR/gap overwrite
+    local dev
+
+    # 1. ESP + /boot partitions — small, so overwrite the head and drop sigs.
+    prog 42 "Boot wipe — scrubbing ESP and /boot partitions"
+    while IFS=$'\t' read -r name parttype fstype mountpoint; do
+        [[ -z "$name" ]] && continue
+        _is_block "$name" || continue
+        _in_scope "$name" || continue
+        local target=no
+        if   [[ "${parttype,,}" == "$ESP_GUID" ]];                   then target=esp
+        elif [[ "$fstype" == vfat && "$mountpoint" == *efi* ]];      then target=esp
+        elif [[ "$mountpoint" == /boot || "$mountpoint" == /boot/* ]]; then target=boot
+        fi
+        [[ "$target" == no ]] && continue
+        prog 43 "Boot wipe — $target: $name"
+        drun "boot wipe — overwrite ${target^^} head (32 MiB random) + wipefs + blkdiscard: $name"
+        mutate rand_write "$name" 0 8        # 32 MiB covers bootloaders + stubs
+        mutate wipefs -a "$name"  2>/dev/null || true
+        mutate blkdiscard "$name" 2>/dev/null || true
+    done < <(lsblk -lnpo NAME,PARTTYPE,FSTYPE,MOUNTPOINT 2>/dev/null)
+
+    # 2. BIOS-boot partitions (GRUB core.img on GPT + legacy BIOS).
+    while IFS=$'\t' read -r name parttype; do
+        [[ -z "$name" ]] && continue
+        _is_block "$name" || continue
+        _in_scope "$name" || continue
+        [[ "${parttype,,}" == "$BIOSBOOT_GUID" ]] || continue
+        prog 44 "Boot wipe — BIOS-boot: $name"
+        drun "boot wipe — overwrite BIOS-boot partition (GRUB core.img) + wipefs: $name"
+        mutate rand_write "$name" 0 1
+        mutate wipefs -a "$name" 2>/dev/null || true
+    done < <(lsblk -lnpo NAME,PARTTYPE 2>/dev/null)
+
+    # 3. MBR + pre-first-partition gap on each parent disk. Legacy GRUB stage1
+    #    and its embedded core.img live in LBA0 and the alignment gap; the GPT
+    #    header lives here too. Do this LAST so partition enumeration above still
+    #    saw a valid table.
+    prog 46 "Boot wipe — overwriting MBR and boot gap on parent disks"
+    for dev in "${parent_devs[@]}"; do
+        _is_block "$dev" || continue
+        _in_scope "$dev" || continue
+        drun "boot wipe — overwrite MBR + GPT header + boot gap (first 4 MiB): $dev"
+        mutate rand_write "$dev" 0 1        # first 4 MiB: MBR + GPT + gap
+    done
+
+    # 4. UEFI NVRAM boot entries — only on a real EFI system, never under a
+    #    scoped test run (host NVRAM must never be touched by the harness).
+    if [[ -d /sys/firmware/efi ]] && command -v efibootmgr &>/dev/null \
+       && [[ -z "${DURESSD_TARGET_DEVICES:-}" ]]; then
+        prog 48 "Boot wipe — clearing UEFI NVRAM boot entries"
+        local bootnum
+        while read -r bootnum; do
+            drun "boot wipe — delete UEFI NVRAM boot entry Boot${bootnum}"
+            mutate efibootmgr -b "$bootnum" -B &>/dev/null || true
+        done < <(efibootmgr 2>/dev/null | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\).*/\1/p')
+    fi
+}
+
+# Phase 1.6 — optional (WIPE_HARDWARE_KEYS=true).
+# Destroys hardware-held key material so a TPM-sealed FDE key (systemd-cryptenroll
+# --tpm2, Clevis, etc.) can never be unsealed again. luksErase already removed
+# the volume key; clearing the TPM removes the auto-unlock capability and any
+# residual sealed secrets. Never runs under a scoped test (real hardware only).
+wipe_hardware_keys() {
+    if [[ -n "${DURESSD_TARGET_DEVICES:-}" ]]; then
+        prog 50 "Hardware wipe — skipped (test mode)"
+        return 0
+    fi
+
+    prog 49 "Hardware wipe — clearing TPM-sealed keys"
+    local tpm_dev=""
+    tpm_dev=$(_tpm_device) || tpm_dev=""
+    if [[ -n "$tpm_dev" ]] && command -v tpm2_clear &>/dev/null; then
+        # Clearing the platform/owner hierarchy rotates the SRK, so any object
+        # sealed to the TPM becomes permanently unsealable.
+        drun "clear TPM owner/platform hierarchy via ${tpm_dev} (tpm2_clear) — any TPM-bound FDE key becomes permanently unsealable"
+        mutate tpm2_clear -c platform &>/dev/null \
+            || mutate tpm2_clear &>/dev/null \
+            || true
+    elif _tpm_ppi; then
+        # Firmware Physical Presence Interface fallback: request a clear on the
+        # next boot (op 5 = Clear). Best-effort — some firmware needs confirmation.
+        drun "request a TPM clear on next boot via the firmware PPI (op 5)"
+        (( DRYRUN )) || echo 5 > /sys/class/tpm/tpm0/ppi/request 2>/dev/null || true
+    else
+        prog 50 "Hardware wipe — no TPM found, nothing to clear"
+        dnote "no TPM present — nothing to clear"
+    fi
+    return 0
 }
 
 # Phase 4 — always.
 # Double --force makes systemd call reboot(RB_POWER_OFF) directly instead of
 # doing a graceful teardown that would try to stop this running daemon.
 phase4_poweroff() {
+    if (( DRYRUN )); then
+        plan_item "power off the system immediately (systemctl poweroff --force --force)"
+        return 0
+    fi
     sync
+    # Never power off the host during tests. Any scoped run implies test mode.
+    if [[ -n "${DURESSD_NO_POWEROFF:-}" ]] || [[ -n "${DURESSD_TARGET_DEVICES:-}" ]]; then
+        prog 100 "Phase 4 — poweroff suppressed (test mode)"
+        return 0
+    fi
     systemctl poweroff --force --force &
     sleep 3
     echo o > /proc/sysrq-trigger 2>/dev/null || true
@@ -218,6 +430,8 @@ phase4_poweroff() {
 wipe_real() {
     set_state WIPING
 
+    dhead "Discovery — real scan of this system's block devices"
+
     # Snapshot the device list NOW — after phase 1 the LUKS headers are gone
     # and discovery would return empty.
     prog 5 "Discovering LUKS containers and parent devices"
@@ -225,36 +439,74 @@ wipe_real() {
     while IFS= read -r dev; do luks_devs+=("$dev"); done \
         < <(discover_luks_devices)
 
-    # Collect unique parent block devices for optional full-device wipe
+    # Collect unique parent block devices — needed by the full-device wipe and
+    # by the boot-artifact wipe (MBR/gap overwrite).
     local -a parent_devs=()
-    if [[ "${WIPE_FULL_DEVICE:-false}" == true ]]; then
+    if [[ "${WIPE_FULL_DEVICE:-false}" == true ]] \
+    || [[ "${WIPE_BOOT_ARTIFACTS:-false}" == true ]]; then
         declare -A _seen=()
         for dev in "${luks_devs[@]}"; do
             local parent
             parent=$(lsblk -ndo PKNAME "$dev" 2>/dev/null || true)
             if [[ -n "$parent" ]] && [[ -z "${_seen[$parent]:-}" ]]; then
                 _seen["$parent"]=1
-                [[ -b "/dev/$parent" ]] && parent_devs+=("/dev/$parent")
+                _is_block "/dev/$parent" && parent_devs+=("/dev/$parent")
             fi
         done
         unset _seen
     fi
 
     prog 7 "Found ${#luks_devs[@]} LUKS container(s)${luks_devs[*]:+: ${luks_devs[*]}}"
+    if (( DRYRUN )); then
+        if (( ${#luks_devs[@]} )); then
+            plan_note "Found ${#luks_devs[@]} LUKS container(s): ${luks_devs[*]}"
+        else
+            plan_note "No LUKS containers found on this system"
+        fi
+        (( ${#parent_devs[@]} )) && plan_note "Parent disk(s) in scope: ${parent_devs[*]}" || true
+    fi
 
+    dhead "Phase 1 — cryptographic destruction (always runs)"
     phase1_crypto_destruction "${luks_devs[@]}"
+
+    if [[ "${WIPE_BOOT_ARTIFACTS:-false}" == true ]]; then
+        dhead "Phase 1.5 — boot-artifact wipe (ESP, /boot, MBR, UEFI NVRAM)"
+        prog 41 "Phase 1.5 — wiping boot artifacts (ESP, /boot, MBR, NVRAM)"
+        wipe_boot_artifacts "${parent_devs[@]}"
+    elif (( DRYRUN )); then
+        plan_head "Phase 1.5 — boot-artifact wipe"
+        plan_skip "disabled (WIPE_BOOT_ARTIFACTS=false)"
+    fi
+
+    if [[ "${WIPE_HARDWARE_KEYS:-false}" == true ]]; then
+        dhead "Phase 1.6 — hardware key wipe (TPM)"
+        prog 49 "Phase 1.6 — clearing hardware-held keys (TPM)"
+        wipe_hardware_keys
+    elif (( DRYRUN )); then
+        plan_head "Phase 1.6 — hardware key wipe (TPM)"
+        plan_skip "disabled (WIPE_HARDWARE_KEYS=false)"
+    fi
 
     if [[ "${OVERWRITE_LUKS_HEADER:-false}" == true ]] \
     && [[ "${WIPE_FULL_DEVICE:-false}"      != true ]]; then
+        dhead "Phase 2 — LUKS header-region overwrite"
         prog 38 "Phase 2 — overwriting LUKS header regions"
         phase2_overwrite_headers "${luks_devs[@]}"
+    elif (( DRYRUN )); then
+        plan_head "Phase 2 — LUKS header-region overwrite"
+        plan_skip "disabled (needs OVERWRITE_LUKS_HEADER=true and no full-device wipe)"
     fi
 
     if [[ "${WIPE_FULL_DEVICE:-false}" == true ]]; then
+        dhead "Phase 3 — full block-device overwrite + RAID teardown"
         prog 52 "Phase 3 — wiping full block device(s) + RAID teardown"
         phase3_wipe_full_devices "${parent_devs[@]}"
+    elif (( DRYRUN )); then
+        plan_head "Phase 3 — full block-device overwrite"
+        plan_skip "disabled (WIPE_FULL_DEVICE=false)"
     fi
 
+    dhead "Phase 4 — power off"
     prog 99 "Phase 4 — sync and power off"
     set_state DONE
     phase4_poweroff
@@ -293,7 +545,7 @@ wipe_test() {
 cmd_status() {
     local state configured=false
     local password_type=none verify_device="" overwrite=false
-    local wipe_full=false countdown=0
+    local wipe_full=false wipe_boot=false wipe_hw=false countdown=0
     state=$(get_state)
 
     if load_config 2>/dev/null; then
@@ -302,6 +554,8 @@ cmd_status() {
         verify_device="${VERIFY_DEVICE:-}"
         overwrite="${OVERWRITE_LUKS_HEADER:-false}"
         wipe_full="${WIPE_FULL_DEVICE:-false}"
+        wipe_boot="${WIPE_BOOT_ARTIFACTS:-false}"
+        wipe_hw="${WIPE_HARDWARE_KEYS:-false}"
         countdown="${WIPE_COUNTDOWN:-0}"
     fi
 
@@ -311,20 +565,26 @@ cmd_status() {
        "verify_device=${verify_device:-none}" \
        "overwrite_luks_header=${overwrite}" \
        "wipe_full_device=${wipe_full}" \
+       "wipe_boot_artifacts=${wipe_boot}" \
+       "wipe_hardware_keys=${wipe_hw}" \
        "wipe_countdown=${countdown}"
 }
 
 cmd_configure() {
-    # argv: b64(luks_pass) b64(type) b64(duress_pass) overwrite wipe_full countdown
-    local luks_pass password_type duress_pass overwrite wipe_full countdown
+    # argv: b64(luks_pass) b64(type) b64(duress_pass) overwrite wipe_full countdown wipe_boot
+    local luks_pass password_type duress_pass overwrite wipe_full countdown wipe_boot
     luks_pass=$(printf '%s'     "${argv[0]}" | base64 -d)
     password_type=$(printf '%s' "${argv[1]}" | base64 -d)
     duress_pass=$(printf '%s'   "${argv[2]}" | base64 -d)
     overwrite="${argv[3]}"
     wipe_full="${argv[4]}"
     countdown="${argv[5]}"
+    wipe_boot="${argv[6]:-false}"
+    local wipe_hw="${argv[7]:-false}"
 
-    install -d -m 0700 -o root -g root /etc/duressd
+    # Running as root under systemd, so root ownership is implicit; the explicit
+    # -o/-g is dropped so the same code path works under an unprivileged test.
+    install -d -m 0700 "$CFGDIR"
 
     # For LUKS-type auth, scan block devices to find one the passphrase unlocks.
     # We store that device path so future verifications are O(1), not O(devices).
@@ -332,7 +592,8 @@ cmd_configure() {
     if [[ "$password_type" == luks ]]; then
         prog 10 "Scanning block devices to locate your LUKS container"
         while IFS= read -r dev; do
-            [[ -b "$dev" ]] || continue
+            _is_block "$dev" || continue
+            _in_scope "$dev" || continue
             if cryptsetup isLuks "$dev" 2>/dev/null; then
                 prog 20 "Trying passphrase against $dev"
                 if printf '%s' "$luks_pass" | \
@@ -362,6 +623,8 @@ PASSWORD_TYPE=${password_type}
 VERIFY_DEVICE=${verify_dev}
 OVERWRITE_LUKS_HEADER=${overwrite}
 WIPE_FULL_DEVICE=${wipe_full}
+WIPE_BOOT_ARTIFACTS=${wipe_boot}
+WIPE_HARDWARE_KEYS=${wipe_hw}
 WIPE_COUNTDOWN=${countdown}
 EOF
     chmod 0600 "$CFGFILE"
@@ -408,6 +671,13 @@ cmd_wipe_unused() {
     # Fill free space on every currently-mounted LUKS volume.
     while IFS=$'\t' read -r name _; do
         [[ -z "$name" ]] && continue
+        [[ "$name" == "No devices found" ]] && continue
+        if [[ -n "${DURESSD_TARGET_DEVICES:-}" ]]; then
+            local backing
+            backing=$(cryptsetup status "$name" 2>/dev/null \
+                | awk '/^[[:space:]]*device:/ {print $2}') || true
+            _in_scope "$backing" || continue
+        fi
         local mp
         mp=$(findmnt -n -o TARGET --source "/dev/mapper/$name" 2>/dev/null || true)
         [[ -z "$mp" ]] && continue
@@ -448,7 +718,7 @@ cmd_health() {
     if load_config 2>/dev/null && [[ "${CONFIGURED:-false}" == true ]]; then
         case "${PASSWORD_TYPE:-}" in
             luks)
-                if [[ -n "${VERIFY_DEVICE:-}" ]] && [[ -b "${VERIFY_DEVICE}" ]]; then
+                if [[ -n "${VERIFY_DEVICE:-}" ]] && _is_block "${VERIFY_DEVICE}"; then
                     checks+=("ok:auth_backend:LUKS device ${VERIFY_DEVICE} accessible")
                 else
                     checks+=("fail:auth_backend:verify device '${VERIFY_DEVICE:-<unset>}' not found — re-run configure")
@@ -481,7 +751,7 @@ cmd_health() {
 
     # 5 — at least one LUKS container discoverable
     local luks_count=0
-    while IFS= read -r _; do (( luks_count++ )); done < <(discover_luks_devices)
+    while IFS= read -r _; do (( ++luks_count )); done < <(discover_luks_devices)
     if (( luks_count > 0 )); then
         checks+=("ok:luks_devices:${luks_count} LUKS container(s) found")
     else
@@ -496,9 +766,9 @@ cmd_health() {
         local msg="${rest#*:}"
         printf 'CHECK\t%s\t%s\t%s\n' "$level" "$key" "$msg"
         case "$level" in
-            ok)   (( ok_count++   )) ;;
-            warn) (( warn_count++ )) ;;
-            fail) (( fail_count++ )) ;;
+            ok)   (( ++ok_count   )) ;;
+            warn) (( ++warn_count )) ;;
+            fail) (( ++fail_count )) ;;
         esac
     done
 
@@ -536,11 +806,64 @@ acquire_lock() {
     flock -n 9 || die "Service busy (state: $(get_state))"
 }
 
+# ── TRIGGER handler ───────────────────────────────────────────────────────────
+# NB: this MUST be a function — the optional countdown declares `local`
+# variables, which are only valid inside a function body.
+run_trigger() {
+    [[ "${#argv[@]}" -ge 1 ]] || die "Missing passphrase"
+    local pass
+    pass=$(printf '%s' "${argv[0]}" | base64 -d)
+    prog 0 "Verifying passphrase"
+    load_config || die "Not configured"
+    verify_passphrase "$pass" || die "Passphrase incorrect"
+    acquire_lock
+
+    # Optional countdown — client disconnect during this window aborts the
+    # wipe cleanly.  printf returns non-zero when the socket is closed, and
+    # || exit 0 catches that without starting the wipe.
+    local countdown="${WIPE_COUNTDOWN:-0}"
+    if (( countdown > 0 )); then
+        prog 1 "Countdown — close this connection (Ctrl-C) to abort"
+        local i
+        for (( i=countdown; i>0; i-- )); do
+            printf 'PROGRESS\t2\tWiping in %ds — Ctrl-C to abort\n' "$i" || exit 0
+            sleep 1
+        done
+    fi
+
+    prog 3 "Passphrase accepted — starting destructive wipe"
+    wipe_real
+}
+
+# ── DRY-RUN handler ───────────────────────────────────────────────────────────
+# Rehearses a real trigger end-to-end: verifies the passphrase for real, then
+# runs the SAME discovery, scoping and phase-selection as wipe_real — but with
+# DRYRUN=1 so every destructive primitive is previewed as a green PLAN line and
+# nothing is modified. No lock is taken (it is read-only) and the state file is
+# left untouched. Reachable locally and over SSH (trigger-remote --dry-run).
+run_dryrun() {
+    [[ "${#argv[@]}" -ge 1 ]] || die "Missing passphrase"
+    local pass
+    pass=$(printf '%s' "${argv[0]}" | base64 -d)
+    load_config || die "Not configured"
+    verify_passphrase "$pass" || die "Passphrase incorrect"
+
+    DRYRUN=1
+    plan_note "DRY RUN — discovery, device scoping and phase-selection are REAL; every action below is only previewed. NOTHING will be modified and the machine will NOT power off."
+    local countdown="${WIPE_COUNTDOWN:-0}"
+    (( countdown > 0 )) && plan_note "A real trigger would first count down ${countdown}s (abortable via Ctrl-C) before starting."
+    wipe_real
+    ok "Dry run complete — no data was touched and nothing was powered off"
+}
+
 # ── dispatch ──────────────────────────────────────────────────────────────────
-IFS= read -r -t 30 line || die "Read timeout"
-IFS=$'\t' read -ra parts <<< "$line"
-cmd="${parts[0]:-}"
-argv=("${parts[@]:1}")
+# Source guard: tests set DURESSD_LIB_ONLY=1 to load the functions above without
+# reading a command from stdin or executing anything.
+dispatch() {
+    IFS= read -r -t 30 line || die "Read timeout"
+    IFS=$'\t' read -ra parts <<< "$line"
+    cmd="${parts[0]:-}"
+    argv=("${parts[@]:1}")
 
 case "$cmd" in
     STATUS)
@@ -548,28 +871,11 @@ case "$cmd" in
         ;;
 
     TRIGGER)
-        [[ "${#argv[@]}" -ge 1 ]] || die "Missing passphrase"
-        pass=$(printf '%s' "${argv[0]}" | base64 -d)
-        prog 0 "Verifying passphrase"
-        load_config || die "Not configured"
-        verify_passphrase "$pass" || die "Passphrase incorrect"
-        acquire_lock
+        run_trigger
+        ;;
 
-        # Optional countdown — client disconnect during this window aborts the
-        # wipe cleanly.  printf returns non-zero when the socket is closed, and
-        # || exit 0 catches that without starting the wipe.
-        local countdown="${WIPE_COUNTDOWN:-0}"
-        if (( countdown > 0 )); then
-            prog 1 "Countdown — close this connection (Ctrl-C) to abort"
-            local i
-            for (( i=countdown; i>0; i-- )); do
-                printf 'PROGRESS\t2\tWiping in %ds — Ctrl-C to abort\n' "$i" || exit 0
-                sleep 1
-            done
-        fi
-
-        prog 3 "Passphrase accepted — starting destructive wipe"
-        wipe_real
+    TRIGGER_DRYRUN)
+        run_dryrun
         ;;
 
     TRIGGER_TEST)
@@ -584,7 +890,7 @@ case "$cmd" in
         ;;
 
     CONFIGURE)
-        [[ "${#argv[@]}" -ge 6 ]] || die "Expected 6 arguments"
+        [[ "${#argv[@]}" -ge 6 ]] || die "Expected at least 6 arguments"
         acquire_lock
         cmd_configure
         ;;
@@ -628,3 +934,8 @@ case "$cmd" in
         die "Unknown command: ${cmd}"
         ;;
 esac
+}
+
+if [[ "${DURESSD_LIB_ONLY:-}" != 1 ]]; then
+    dispatch
+fi

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Runs on first autologin in the duressd test ISO: executes the full OFFLINE
+# suite (lint -> unit -> loop integration -> real scoped wipe) and prints a
+# clear PASS/FAIL, then returns so you land at an interactive root shell.
+# Re-run any time with:  duressd-selftest --force
+set -uo pipefail
+
+FLAG=/run/duressd-selftest.done
+[[ "${1:-}" == --force ]] && rm -f "$FLAG"
+[[ -e "$FLAG" ]] && exit 0
+: > "$FLAG"
+
+cd /root/duressd 2>/dev/null || { echo "duressd repo not found at /root/duressd" >&2; exit 0; }
+export DURESSD_SKIP_PACMAN=1   # deps are baked into the image
+
+# Golden mode: booted with `duressd.golden=1` (tests/vm/golden-vm.sh). Build the
+# LUKS-at-boot image on the attached scratch disk and run the nested boot test —
+# the host is never involved. Runs INSTEAD of the standard suite.
+if grep -qw duressd.golden /proc/cmdline 2>/dev/null; then
+    printf '\n\033[1;36m════════ duressd GOLDEN boot test (in-VM) ════════\033[0m\n'
+    disk="$(sed -n 's/.*duressd\.golden\.disk=\([^ ]*\).*/\1/p' /proc/cmdline)"
+    DURESSD_GOLDEN_DISK="${disk:-/dev/vda}" bash tests/vm/golden-inside.sh
+    if grep -qw duressd.poweroff /proc/cmdline 2>/dev/null; then
+        printf 'Powering off (duressd.poweroff on cmdline)…\n'; systemctl poweroff
+    fi
+    exit 0
+fi
+
+printf '\n\033[1;36m════════ duressd self-test (offline) ════════\033[0m\n'
+if bash tests/vm/inside.sh; then
+    printf '\n\033[1;42m  ✔  DURESSD SELF-TEST PASSED  \033[0m\n'
+else
+    printf '\n\033[1;41m  ✘  DURESSD SELF-TEST FAILED — see output above  \033[0m\n'
+fi
+cat <<'TIP'
+
+duressd is installed and running as a service. From the shell, try:
+  duressd status        duressd health       duressd dry-run
+  duressd test          duressd configure    systemctl status duressd
+Repo/source: /root/duressd     Re-run the suite: duressd-selftest --force
+
+TIP
+
+# Headless runs pass `duressd.poweroff` on the kernel cmdline so the VM shuts
+# itself down when the suite finishes (make vm-auto watches for that).
+if grep -qw duressd.poweroff /proc/cmdline 2>/dev/null; then
+    printf 'Powering off (duressd.poweroff on cmdline)…\n'
+    systemctl poweroff
+fi

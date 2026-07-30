@@ -1,0 +1,19 @@
+[Unit]
+Description=duressd offline self-test
+# Run late in boot, after the daemon is up and loop devices are available.
+After=systemd-user-sessions.service duressd.service
+Wants=duressd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Stream to the serial/VGA console so a headless `make vm-auto` can read the
+# PASS/FAIL result (and it also lands in the journal).
+StandardOutput=journal+console
+StandardError=journal+console
+Environment=DURESSD_SKIP_PACMAN=1
+ExecStart=/usr/local/bin/duressd-selftest
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target
