@@ -12,7 +12,7 @@
 # otherwise it falls back to slow-but-correct TCG emulation.
 set -uo pipefail
 
-REPO="$(cd "$(dirname "$0")/../.." && pwd)"; cd "$REPO"
+REPO="$(cd "$(dirname "$0")/../.." && pwd)"; cd "$REPO" || exit 1
 DISK="${DURESSD_GOLDEN_DISK:-/dev/vda}"
 BUILD="/mnt/golden-build"
 
