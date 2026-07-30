@@ -11,6 +11,7 @@
 #   make iso           build a self-testing duressd ISO — needs sudo + archiso
 #   make golden        build the bootable LUKS-at-boot golden image — sudo
 #   make golden-test   boot test: duress passphrase → wipe → won't boot — sudo
+#   make phys-selftest non-destructive physical self-test (run ON the test box) — sudo
 #   make test-all      every tier this host can run
 #
 # Override tool paths when vendored, e.g.:
@@ -26,9 +27,11 @@ SHELL_SOURCES := src/handler src/daemon src/cli install.sh \
                  tests/vm/ssh-e2e.sh tests/vm/tor-e2e.sh tests/vm/pam-e2e.sh \
                  pam/pam-duress \
                  tests/iso/build.sh tests/iso/overlay/airootfs/usr/local/bin/duressd-selftest \
-                 tests/e2e/build-luks-duress.sh tests/e2e/luks-duress-test.sh
+                 tests/e2e/build-luks-duress.sh tests/e2e/luks-duress-test.sh \
+                 tests/physical/self-test.sh tests/physical/baseline.sh \
+                 tests/physical/verify-wipe.sh tests/physical/build-laptop-image.sh
 
-.PHONY: help lint unit test integration e2e vm vm-auto vm-shell iso golden golden-test test-all
+.PHONY: help lint unit test integration e2e vm vm-auto vm-shell iso golden golden-test phys-selftest test-all
 
 help:
 	@sed -n '3,18p' $(MAKEFILE_LIST) | sed 's/^# \{0,1\}//'
@@ -79,6 +82,12 @@ golden:
 golden-test:
 	@if [[ $$EUID -ne 0 ]]; then sudo bash tests/e2e/luks-duress-test.sh; \
 	 else bash tests/e2e/luks-duress-test.sh; fi
+
+# Run this ON the test machine (over SSH). Non-destructive: the OS stays alive.
+# Add --tpm to include the real TPM clear stage:  make phys-selftest ARGS=--tpm
+phys-selftest:
+	@if [[ $$EUID -ne 0 ]]; then sudo bash tests/physical/self-test.sh $(ARGS); \
+	 else bash tests/physical/self-test.sh $(ARGS); fi
 
 test-all: lint unit
 	@bash tests/integration/run.sh 2>/dev/null || echo "  ⚠  integration tier skipped (needs root)"

@@ -372,6 +372,72 @@ remote trigger would destroy (see `duressd dry-run` above).
 
 ---
 
+### Remote trigger from an Android phone
+
+The kill switch is just an SSH key with a forced command, so **any Android SSH
+client works** — no companion app to install on the phone beyond a terminal or
+SSH app. Two ways to reach the machine:
+
+#### A. Direct SSH (host reachable on your LAN / VPN / port-forward)
+
+1. **On the machine**, install the trigger. For a phone, the key-only mode is
+   easiest — a bare connect fires the wipe, no passphrase to type on a
+   touchscreen:
+   ```bash
+   sudo duressd install-ssh-trigger --embed-passphrase
+   #   prints the private key it generated: ~/.ssh/duressd_duress
+   ```
+2. **Move the private key to the phone** over a trusted channel (USB/`adb push`,
+   a one-time encrypted transfer — never leave a copy on the machine you might
+   need to wipe). Store it in the app's protected keystore.
+3. **Trigger** from any Android SSH app:
+   - **Termux** (`pkg install openssh`): `ssh -i duressd_duress -T root@HOST`
+   - **JuiceSSH / Termius / ConnectBot**: import `duressd_duress` as the
+     identity, set the host user to `root`, connect. The forced command runs the
+     wipe automatically — you don't get a shell.
+
+   If you used the default (passphrase) mode instead of `--embed-passphrase`,
+   send the duress passphrase on stdin. In Termux:
+   ```bash
+   printf '%s' 'YOUR-DURESS-PASS' | ssh -i duressd_duress -T root@HOST
+   ```
+
+> Protect the phone-side key with the app's biometric/keystore lock. Anyone who
+> gets both the phone **and** (for `--embed-passphrase`) can trigger the wipe —
+> that's the whole point, but it means the phone is now a live kill switch.
+
+#### B. SSH over Tor (host NOT reachable — no port-forwarding, works anywhere)
+
+This exposes sshd as a **client-authorized v3 onion service**: the machine needs
+no public IP or open port, and only someone holding the onion client-auth key
+can even see the service (a second auth layer in front of the SSH key).
+
+1. **On the machine:**
+   ```bash
+   sudo duressd install-ssh-trigger --embed-passphrase --tor
+   ```
+   It prints the **`.onion` address** and writes the operator client-auth secret
+   to `/etc/duressd/tor-client-auth.private`. Move that file off the machine.
+2. **On the phone**, use **Termux** (it has real `tor`/`torsocks`):
+   ```bash
+   pkg install openssh tor torsocks
+   mkdir -p ~/.tor/onion_auth
+   cp tor-client-auth.private ~/.tor/onion_auth/duressd.auth_private   # from step 1
+   echo 'ClientOnionAuthDir ~/.tor/onion_auth' >> $PREFIX/etc/tor/torrc
+   tor &            # or run the Orbot app instead of this line
+   # then fire the wipe:
+   torsocks ssh -i duressd_duress -T xxxxxxxx.onion
+   ```
+   (Prefer the **Orbot** app for the Tor connection? Put the client-auth key in
+   Orbot's onion-auth settings and route the SSH app through Orbot's VPN mode
+   instead of `torsocks`.)
+
+Either way, add **`--dry-run`** on the far end first
+(`… ssh … root@HOST duressd trigger-remote --dry-run`) to rehearse from the
+phone with nothing destroyed.
+
+---
+
 ### `duressd wipe-unused`
 
 Fills unallocated sectors on every **currently mounted** LUKS volume with zeros, then deletes the fill file. Makes deleted files unrecoverable without triggering a full wipe.
