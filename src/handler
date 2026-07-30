@@ -275,29 +275,46 @@ phase3_wipe_full_devices() {
         fi
     done
 
-    # Stop RAID arrays whose members were just overwritten
-    prog 92 "Phase 3 — stopping RAID arrays"
-    while IFS= read -r dev type; do
-        [[ "$type" =~ ^raid ]] && _is_block "$dev" || continue
-        _in_scope "$dev" || continue
-        drun "stop RAID array + wipe its signatures: $dev"
-        mutate mdadm --stop "$dev" 2>/dev/null || true
-        mutate wipefs -a "$dev"    2>/dev/null || true
-    done < <(lsblk -lnpo NAME,TYPE 2>/dev/null)
+    # Dismantle software RAID so the array cannot be reassembled after a reboot.
+    # Two subtleties this handles:
+    #   • `lsblk -lnpo NAME,TYPE` is TWO space-separated columns — parse with the
+    #     default IFS, NOT `IFS=` (which would swallow the whole line into $array
+    #     and leave $type empty, so the stop below would never fire).
+    #   • `mdadm --stop` emits change uevents that can trigger udev incremental
+    #     assembly (`mdadm -I`) and resurrect the array before its members are
+    #     wiped. So stop the arrays AND zero the member superblocks, then retry
+    #     until no in-scope member still advertises a RAID superblock.
+    prog 92 "Phase 3 — dismantling RAID arrays"
+    local _attempt array member type fstype _left
+    for _attempt in 1 2 3 4 5; do
+        # Stop every active in-scope RAID array.
+        while IFS=$' \t' read -r array type; do
+            [[ "$type" =~ ^raid ]] && _is_block "$array" || continue
+            _in_scope "$array" || continue
+            drun "stop RAID array + wipe its signatures: $array"
+            mutate mdadm --stop "$array" 2>/dev/null || true
+            mutate wipefs -a "$array"    2>/dev/null || true
+        done < <(lsblk -lnpo NAME,TYPE 2>/dev/null)
 
-    # Wipe RAID superblocks on member drives so mdadm --assemble --scan cannot
-    # reconstruct the array from scratch after a reboot.
-    prog 96 "Phase 3 — wiping RAID member superblocks"
-    while IFS= read -r dev; do
-        _is_block "$dev" || continue
-        _in_scope "$dev" || continue
-        local fstype
-        fstype=$(lsblk -ndo FSTYPE "$dev" 2>/dev/null || true)
-        if [[ "$fstype" == "linux_raid_member" ]]; then
-            drun "wipe RAID member superblock: $dev"
-            mutate wipefs -a "$dev" 2>/dev/null || true
-        fi
-    done < <(lsblk -lnpo NAME 2>/dev/null)
+        # Zero the member superblocks — `mdadm --zero-superblock` is the
+        # authoritative anti-reassembly step; fall back to wipefs if mdadm is
+        # absent. `--assemble --scan` cannot rebuild the array afterwards.
+        _left=0
+        while IFS= read -r member; do
+            _is_block "$member" || continue
+            _in_scope "$member" || continue
+            fstype=$(lsblk -ndo FSTYPE "$member" 2>/dev/null || true)
+            [[ "$fstype" == "linux_raid_member" ]] || continue
+            drun "zero RAID member superblock: $member"
+            mutate mdadm --zero-superblock "$member" 2>/dev/null || true
+            mutate wipefs -a "$member" 2>/dev/null || true
+            [[ "$(lsblk -ndo FSTYPE "$member" 2>/dev/null || true)" == "linux_raid_member" ]] && _left=1
+        done < <(lsblk -lnpo NAME 2>/dev/null)
+
+        (( DRYRUN )) && break     # a single pass produces the full plan preview
+        (( _left )) || break      # no member still carries a superblock — done
+        udevadm settle 2>/dev/null || true
+    done
 }
 
 # GPT partition-type GUIDs used by the boot-artifact wipe.

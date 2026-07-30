@@ -656,10 +656,17 @@ No cryptsetup source changes are needed. The hook uses cryptsetup as shipped.
 
 The `local-top` script runs before `cryptroot`, has access to block devices, and can call cryptsetup freely.
 
-**Arch / dracut**:
+**Arch (mkinitcpio)** — this is the implemented path (`duressd install-luks-trigger`):
 
 ```
-/etc/dracut.conf.d/duressd.conf    ← install_items += ...
+/etc/initcpio/install/duress   ← build hook (adds cryptsetup + the oracle to the initrd)
+/etc/initcpio/hooks/duress     ← runtime hook (tests the passphrase before `encrypt`)
+```
+
+**Fedora / Qubes (dracut)** — not yet ported:
+
+```
+/etc/dracut.conf.d/duressd.conf       ← install_items += ...
 /usr/lib/dracut/modules.d/99duressd/  ← hook module
 ```
 
@@ -671,9 +678,18 @@ Because the duress passphrase is a real LUKS keyslot, someone who obtains the pa
 - Use a passphrase that differs from your normal unlock key (`type=custom` is already recommended for this).
 - Phase 2 header overwrite makes forensic recovery significantly harder even if the raw sectors survive.
 
+### Secure Boot
+
+The boot-time trigger lives in the **initramfs**, so under **Secure Boot** the initramfs must be part of a signed boot chain — either a signed **Unified Kernel Image** (`ukify` + `sbctl`/shim) or a signed kernel+initrd. On a machine with Secure Boot **enabled**, install the duress hook and then re-sign the boot chain exactly as you sign your normal kernel; the hook *logic* is unchanged, only the packaging (UKI + signature) differs. With Secure Boot **disabled** (as the golden test image is built), the hook works as-is.
+
+Two clarifications:
+
+- **duressd does not clear Secure Boot keys** (PK/KEK/db/dbx or enrolled MOK). Those are not secret data, and clearing them risks bricking boot — so they are intentionally left alone. The boot-artifact phase still deletes UEFI *boot entries* and scrubs the ESP.
+- **The runtime triggers are unaffected by Secure Boot.** `duressd trigger`, the SSH/Tor remote kill switch, and the PAM login trigger are userspace wiping block devices — Secure Boot does not gate them. Only the *boot-prompt* trigger depends on the signed boot chain above.
+
 ### Status
 
-Not yet implemented — tracked as a roadmap item below.
+**Implemented for mkinitcpio (Arch)** — `duressd install-luks-trigger` adds the duress keyslot and installs the hook; validated end-to-end by the in-VM golden boot test (`make vm-golden`): correct passphrase boots, duress passphrase wipes the header and the disk no longer boots. **dracut** (Fedora/Qubes) still needs a module port (see the Qubes notes). Debian/Ubuntu `initramfs-tools` is sketched above but not yet packaged.
 
 ---
 
