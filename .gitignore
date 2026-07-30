@@ -7,4 +7,5 @@ tests/e2e/images/
 /out/
 /.iso-work/
 *.iso
-vm-autorun.log
+# VM run transcripts (make vm-auto / vm-golden)
+vm-*.log
