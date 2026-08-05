@@ -14,6 +14,9 @@
 # Env (optional): USERNAME=tester HOSTNAME=duressd-test SIZE=12G
 #                 OUT=duressd-laptop.raw AUTO_UNLOCK=0 QCOW2=0
 #                 WIPE_HARDWARE_KEYS=true WIPE_COUNTDOWN=0
+#                 FLASH_DEV=/dev/sdX  (after building, RESET+dd+verify onto this
+#                   USB; refuses a non-removable device unless FLASH_FORCE=1, and
+#                   never the disk backing this host's root)
 #
 # Boot model: at power-on you type LUKS_PASS to unlock and boot normally; the
 # separate DURESS_PASS fires the wipe (locally `sudo duressd trigger`, or over
@@ -233,6 +236,37 @@ if [[ "${QCOW2:-0}" == 1 ]] && command -v qemu-img >/dev/null; then
     echo "  →  converting to qcow2"
     qemu-img convert -f raw -O qcow2 "$OUT" "${OUT%.raw}.qcow2"
     echo "  ✔  ${OUT%.raw}.qcow2"
+fi
+
+# Optional: flash the finished image straight onto a USB and verify it.
+#   FLASH_DEV=/dev/sdX   the target (RESET + dd + cmp). REFUSED unless it is a
+#                        removable block device (set FLASH_FORCE=1 to override),
+#                        and NEVER the disk backing this host's root.
+if [[ -n "${FLASH_DEV:-}" ]]; then
+    echo
+    if [[ ! -b "$FLASH_DEV" ]]; then
+        echo "  ✘  FLASH_DEV=$FLASH_DEV is not a block device — not flashing" >&2
+    else
+        _root_src="$(findmnt -no SOURCE / 2>/dev/null || true)"
+        _root_disk="/dev/$(lsblk -no PKNAME "$_root_src" 2>/dev/null | head -1)"
+        _rm="$(lsblk -ndo RM "$FLASH_DEV" 2>/dev/null || echo 0)"
+        if [[ "$FLASH_DEV" == "$_root_disk" ]]; then
+            echo "  ✘  REFUSING to flash $FLASH_DEV — it backs this host's root filesystem" >&2
+        elif [[ "$_rm" != 1 && "${FLASH_FORCE:-}" != 1 ]]; then
+            echo "  ✘  REFUSING to flash $FLASH_DEV — not a removable device (set FLASH_FORCE=1 to override)" >&2
+        else
+            echo "  →  flashing $OUT onto $FLASH_DEV ($(lsblk -ndo MODEL "$FLASH_DEV" 2>/dev/null || echo '?'))"
+            wipefs -a "$FLASH_DEV"           2>/dev/null || true
+            sgdisk --zap-all "$FLASH_DEV"    2>/dev/null || true
+            dd if="$OUT" of="$FLASH_DEV" bs=4M conv=fsync status=progress
+            sync
+            if cmp -n "$(stat -c %s "$OUT")" "$OUT" "$FLASH_DEV"; then
+                echo "  ✔  flashed + verified — $FLASH_DEV is byte-identical to the image; safe to boot"
+            else
+                echo "  ✘  verify FAILED — $FLASH_DEV differs from the image (bad/too-small USB?)" >&2
+            fi
+        fi
+    fi
 fi
 
 cat <<DONE
