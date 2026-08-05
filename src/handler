@@ -174,6 +174,14 @@ close_all_crypt_mappings() {
         fi
         local mp
         mp=$(findmnt -n -o TARGET --source "/dev/mapper/$name" 2>/dev/null || true)
+        # NEVER tear down the mapping backing the RUNNING root ("/"): force-removing
+        # it error-targets / and kills the wipe before the later phases + poweroff
+        # can run. luksErase already destroys the data; the in-RAM key keeps / usable
+        # only until Phase 4 powers the machine off (dropping the key for good).
+        if [[ "$mp" == "/" ]]; then
+            drun "leave the running-root dm-crypt mapping open until poweroff: $name"
+            continue
+        fi
         drun "close dm-crypt mapping: $name${mp:+ (unmount $mp)}"
         [[ -n "$mp" ]] && mutate umount --lazy "$mp" 2>/dev/null || true
         # dmsetup --force: bypasses "device still in use" after lazy unmount.
@@ -354,7 +362,14 @@ wipe_boot_artifacts() {
         fi
         [[ "$target" == no ]] && continue
         prog 43 "Boot wipe — $target: $name"
-        drun "boot wipe — overwrite ${target^^} head (32 MiB random) + wipefs + blkdiscard: $name"
+        drun "boot wipe — unmount + overwrite ${target^^} head (32 MiB random) + wipefs + blkdiscard: $name"
+        # Unmount first, or the scrub is a no-op: wipefs refuses on a mounted
+        # device and raw writes to a mounted fs are masked by the page cache (and
+        # can be overwritten by cached metadata on eventual flush). Plain umount
+        # fully releases it (best); lazy is the fallback if something holds it.
+        if [[ -n "$mountpoint" ]]; then
+            mutate umount "$name" 2>/dev/null || mutate umount -l "$name" 2>/dev/null || true
+        fi
         mutate rand_write "$name" 0 8        # 32 MiB covers bootloaders + stubs
         mutate wipefs -a "$name"  2>/dev/null || true
         mutate blkdiscard "$name" 2>/dev/null || true
@@ -470,7 +485,13 @@ phase4_poweroff() {
     fi
     systemctl poweroff --force --force &
     sleep 3
-    echo o > /proc/sysrq-trigger 2>/dev/null || true
+    # Fallback if systemd can't shut down cleanly (root torn down mid-wipe):
+    # force an immediate poweroff via SysRq. Enable SysRq first — many systems
+    # ship kernel.sysrq=0 or a restricted bitmask that ignores 'o' otherwise.
+    echo 1 > /proc/sys/kernel/sysrq 2>/dev/null || true
+    echo o > /proc/sysrq-trigger   2>/dev/null || true
+    sleep 3
+    echo o > /proc/sysrq-trigger   2>/dev/null || true
 }
 
 # ── wipe_real ─────────────────────────────────────────────────────────────────
@@ -628,6 +649,17 @@ cmd_configure() {
     countdown="${argv[5]}"
     wipe_boot="${argv[6]:-false}"
     local wipe_hw="${argv[7]:-false}"
+
+    # Reject a weak custom duress passphrase (authoritative check — the CLI also
+    # pre-checks for nicer UX). A short pin is a remote-wipe risk: with the PAM
+    # login trigger + SSH password auth it becomes remotely typeable. Override with
+    # DURESSD_ALLOW_WEAK=1 for controlled/test setups.
+    if [[ "$password_type" == custom ]]; then
+        local minlen="${DURESSD_MIN_PASSPHRASE:-8}"
+        if (( ${#duress_pass} < minlen )) && [[ "${DURESSD_ALLOW_WEAK:-}" != 1 ]]; then
+            die "Duress passphrase too short (${#duress_pass} chars; minimum ${minlen}) — a weak pin is a remote-wipe risk (set DURESSD_ALLOW_WEAK=1 to override)"
+        fi
+    fi
 
     # Running as root under systemd, so root ownership is implicit; the explicit
     # -o/-g is dropped so the same code path works under an unprivileged test.

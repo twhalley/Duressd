@@ -219,6 +219,16 @@ cmd_configure() {
             if [[ "$duress_pass" != "$confirm" ]]; then
                 bad "Passphrases do not match."; return 1
             fi
+            # Require a minimum-strength duress passphrase. A weak pin is dangerous:
+            # with the PAM login trigger + SSH password auth it becomes remotely
+            # typeable, so a short/guessable pin is a network-reachable self-destruct.
+            local minlen="${DURESSD_MIN_PASSPHRASE:-8}"
+            if (( ${#duress_pass} < minlen )) && [[ "${DURESSD_ALLOW_WEAK:-}" != 1 ]]; then
+                bad "Duress passphrase too short (${#duress_pass} chars; minimum ${minlen})."
+                warn "A weak duress pin is a remote-wipe risk — especially with the PAM login trigger."
+                info "Use a longer passphrase, or set DURESSD_ALLOW_WEAK=1 to override (not advised)."
+                return 1
+            fi
             good "Password type: custom (Argon2id hash will be stored)"
             ;;
         *)
