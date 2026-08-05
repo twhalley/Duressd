@@ -76,7 +76,10 @@ pass "duress password fired the wipe (scratch disk destroyed)"
 hr "install-login-trigger wires the pam_exec hook into the auth stack"
 : > "$WORK/cfg/passphrase.luks.exists" ; : > "$WORK/cfg/passphrase.luks"
 printf 'auth required pam_unix.so\n' > "$WORK/pam-test"
+# DURESSD_SSHD_PASSWORD_AUTH=no simulates key-only SSH so the remote-wipe guard
+# (which refuses when SSH password auth is on) does not block this hook test.
 DURESSD_PAM_FILE="$WORK/pam-test" DURESSD_PAM_SRC="$REPO/pam" DURESSD_LIBDIR="$WORK/lib" \
+    DURESSD_SSHD_PASSWORD_AUTH=no \
     bash src/cli install-login-trigger >/dev/null 2>&1 || fail "install-login-trigger failed"
 grep -q 'auth optional pam_exec.so expose_authtok quiet' "$WORK/pam-test" \
     || fail "pam_exec hook was not added to the auth stack"

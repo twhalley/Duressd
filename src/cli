@@ -597,7 +597,42 @@ cmd_install_luks_trigger() {
 # at ANY login (console, ssh, su, display manager) fires the wipe. `optional`, so
 # it never blocks or changes normal login; the daemon verifies the passphrase, so
 # only the configured duress passphrase triggers.
+# Effective sshd PasswordAuthentication ("yes"/"no"). Prefers `sshd -T` (accounts
+# for defaults + Include drop-ins); falls back to the last explicit directive in
+# sshd_config(.d); assumes "yes" (OpenSSH's default, and the RISKY state) when
+# unset. Overridable via DURESSD_SSHD_PASSWORD_AUTH for tests.
+_sshd_password_auth() {
+    if [[ -n "${DURESSD_SSHD_PASSWORD_AUTH:-}" ]]; then
+        printf '%s' "$DURESSD_SSHD_PASSWORD_AUTH"; return 0
+    fi
+    local v=""
+    if command -v sshd >/dev/null 2>&1; then
+        v="$(sshd -T 2>/dev/null | awk '/^passwordauthentication /{print $2}')"
+    fi
+    if [[ -z "$v" ]]; then
+        local f m
+        for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
+            [[ -r "$f" ]] || continue
+            m="$(grep -iE '^[[:space:]]*PasswordAuthentication[[:space:]]' "$f" 2>/dev/null \
+                 | tail -1 | awk '{print tolower($2)}')"
+            [[ -n "$m" ]] && v="$m"
+        done
+    fi
+    printf '%s' "${v:-yes}"
+}
+
 cmd_install_login_trigger() {
+    local force=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force) force=true; shift ;;
+            -h|--help)
+                echo "usage: duressd install-login-trigger [--force]" >&2
+                echo "  --force  install even when SSH password auth is on (accepts remote-wipe risk)" >&2
+                return 0 ;;
+            *) shift ;;
+        esac
+    done
     local cfgdir="${DURESSD_CFGDIR:-/etc/duressd}"
     local libdir="${DURESSD_LIBDIR:-/usr/local/lib/duressd}"
     local pamfile="${DURESSD_PAM_FILE:-/etc/pam.d/system-auth}"
@@ -609,6 +644,28 @@ cmd_install_login_trigger() {
         bad "No custom duress passphrase configured."
         info "Run: duressd configure   (choose the 'custom' passphrase type)"; return 1; }
     [[ -f "$src/pam-duress" ]] || { bad "pam-duress hook not found in $src"; return 1; }
+
+    # SAFETY GUARD — a PAM login trigger + SSH password auth makes the duress
+    # passphrase REMOTELY TYPEABLE: an SSH login that submits the duress pin fires
+    # the wipe even though the login itself fails (the hook is `auth optional`, so
+    # it runs on every attempt). Anyone who can reach sshd and guess/know the pin
+    # could remote-wipe the machine. Refuse unless the operator opts in.
+    if [[ "$(_sshd_password_auth)" == yes ]]; then
+        if [[ "$force" != true ]]; then
+            bad "REFUSING: SSH PasswordAuthentication is enabled — the duress passphrase would be remotely typeable."
+            warn "An SSH login submitting the duress pin fires the wipe EVEN ON A FAILED login."
+            warn "Anyone who can reach port 22 and guess/know the pin could remote-wipe this machine."
+            echo >&2
+            info "Do ONE of these, then re-run:"
+            info "  • Key-only SSH (recommended): set 'PasswordAuthentication no' in sshd_config, then"
+            info "      sudo systemctl reload sshd"
+            info "  • Accept the risk with a STRONG duress passphrase (never a short pin):"
+            info "      duressd install-login-trigger --force"
+            return 1
+        fi
+        warn "PROCEEDING with SSH PasswordAuthentication=yes (--force): the duress pin is REMOTELY TYPEABLE."
+        warn "Use a STRONG duress passphrase — a weak pin is a network-reachable self-destruct."
+    fi
 
     install -Dm755 "$src/pam-duress" "$script"
     good "Installed PAM hook: $script"
@@ -1140,7 +1197,7 @@ ${BLD}Remote (SSH / automation):${RST}
   ${RED}trigger-remote${RST}          ${RED}Non-interactive wipe${RST} — stdin/\$DURESSD_PASS/--passphrase-file; add ${GRN}--dry-run${RST} to preview
   ${CYN}install-ssh-trigger${RST}     Install an SSH forced-command duress key (remote kill switch)
   ${CYN}install-luks-trigger${RST}    Install a boot-time LUKS duress-passphrase wipe (initramfs)
-  ${CYN}install-login-trigger${RST}   Install a PAM login duress-passphrase wipe (any login)
+  ${CYN}install-login-trigger${RST}   Install a PAM login duress-passphrase wipe (refuses if SSH password auth is on; --force to override)
 
 ${BLD}Aliases:${RST}
   dwipe_test   →  duressd test

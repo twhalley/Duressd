@@ -438,6 +438,20 @@ phone with nothing destroyed.
 
 ---
 
+### `duressd install-login-trigger`  ·  PAM login duress passphrase
+
+Installs a PAM hook (`auth optional pam_exec.so`) so that entering your **duress passphrase at any login prompt** fires the wipe. Because it's `optional`, it never blocks or changes a normal login.
+
+> ⚠️ **Remote-wipe footgun — the guard exists for a reason.** The hook runs on **every** auth attempt, including **failed** ones, and sshd uses PAM. So if **SSH `PasswordAuthentication` is enabled**, an SSH login that submits the duress passphrase **fires the wipe even though the login fails** — anyone who can reach port 22 and guess/know the pin could **remote-wipe the machine**.
+>
+> For this reason `install-login-trigger` **refuses** when `PasswordAuthentication yes` is detected (`sshd -T`). Do one of:
+> - **Key-only SSH (recommended):** `PasswordAuthentication no` in `sshd_config` → `systemctl reload sshd`. The trigger then only fires at the *physical console*.
+> - **Accept the risk with `--force`** — only with a **strong** duress passphrase, never a short pin. A weak pin + password SSH is a network-reachable self-destruct.
+>
+> The **key-based** kill switch (`install-ssh-trigger`) is different: it's gated by possession of a dedicated SSH key, so a weak passphrase alone can't trigger it remotely.
+
+---
+
 ### `duressd wipe-unused`
 
 Fills unallocated sectors on every **currently mounted** LUKS volume with zeros, then deletes the fill file. Makes deleted files unrecoverable without triggering a full wipe.
