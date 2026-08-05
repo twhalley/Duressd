@@ -3,7 +3,9 @@
 # the Unix socket. Reads one tab-separated command line, streams
 # PROGRESS/OK/ERROR lines back, then exits (closing the connection).
 set -euo pipefail
-trap '' SIGPIPE   # write failures after client disconnect are non-fatal
+trap '' SIGPIPE   # ignore the SIGPIPE signal itself; prog/ok also swallow the
+                  # resulting write error so a client disconnect can't abort a
+                  # committed wipe (an unscoped wipe closes root → disconnects).
 
 # Paths are overridable via env so the test harness can point them at a temp
 # dir. In production (systemd) these env vars are unset → the defaults apply.
@@ -21,8 +23,12 @@ STATEFILE=$RUNDIR/state
 # only by the TRIGGER_DRYRUN dispatch arm — and because socat forks a fresh
 # handler per connection, it can never leak into a real TRIGGER.
 DRYRUN=0
-prog()  { (( DRYRUN )) && return 0; printf 'PROGRESS\t%s\t%s\n' "$1" "$2"; }
-ok()    { printf 'OK\t%s\n' "$*"; }
+# prog/ok are best-effort: a failed write (EPIPE after the client disconnects)
+# must NOT abort the wipe under `set -e`. `trap '' SIGPIPE` stops the signal but
+# printf still returns non-zero on a broken pipe, so swallow it explicitly. The
+# countdown's abort-on-disconnect is separate (an explicit `printf … || exit 0`).
+prog()  { (( DRYRUN )) && return 0; printf 'PROGRESS\t%s\t%s\n' "$1" "$2" 2>/dev/null || return 0; }
+ok()    { printf 'OK\t%s\n' "$*" 2>/dev/null || return 0; }
 die()   { printf 'ERROR\t%s\n' "$*"; exit 1; }
 
 # ── dry-run preview plumbing ──────────────────────────────────────────────────
