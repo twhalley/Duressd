@@ -59,7 +59,7 @@ _tpm_device() {
 # True if the firmware Physical Presence Interface can request a TPM clear.
 # Wrapped so unit tests can simulate its absence (it is writable as root whenever
 # a TPM — including an emulated one — is present).
-_tpm_ppi() { [[ -w /sys/class/tpm/tpm0/ppi/request ]]; }
+_tpm_ppi() { [[ -w "${_TPM_PPI_REQUEST:-/sys/class/tpm/tpm0/ppi/request}" ]]; }
 
 get_state() { cat "$STATEFILE" 2>/dev/null || echo IDLE; }
 set_state() { (( DRYRUN )) && return 0; echo "$1" > "$STATEFILE"; }
@@ -403,24 +403,48 @@ wipe_hardware_keys() {
     fi
 
     prog 49 "Hardware wipe — clearing TPM-sealed keys"
-    local tpm_dev=""
+    local tpm_dev="" have_tools=0
     tpm_dev=$(_tpm_device) || tpm_dev=""
-    if [[ -n "$tpm_dev" ]] && command -v tpm2_clear &>/dev/null; then
-        # Clearing the platform/owner hierarchy rotates the SRK, so any object
-        # sealed to the TPM becomes permanently unsealable.
-        drun "clear TPM owner/platform hierarchy via ${tpm_dev} (tpm2_clear) — any TPM-bound FDE key becomes permanently unsealable"
-        mutate tpm2_clear -c platform &>/dev/null \
-            || mutate tpm2_clear &>/dev/null \
-            || true
-    elif _tpm_ppi; then
-        # Firmware Physical Presence Interface fallback: request a clear on the
-        # next boot (op 5 = Clear). Best-effort — some firmware needs confirmation.
-        drun "request a TPM clear on next boot via the firmware PPI (op 5)"
-        (( DRYRUN )) || echo 5 > /sys/class/tpm/tpm0/ppi/request 2>/dev/null || true
-    else
+    if command -v tpm2_clear &>/dev/null; then have_tools=1; fi
+
+    # Nothing to clear: no TPM char device AND no firmware PPI interface.
+    if [[ -z "$tpm_dev" ]] && ! _tpm_ppi; then
         prog 50 "Hardware wipe — no TPM found, nothing to clear"
         dnote "no TPM present — nothing to clear"
+        return 0
     fi
+
+    # Dry run: preview the paths, touch nothing. (Text must include "clear TPM".)
+    if (( DRYRUN )); then
+        if (( have_tools )) && [[ -n "$tpm_dev" ]]; then
+            drun "clear TPM via the lockout hierarchy (tpm2_clear -c l) — any TPM-sealed FDE key becomes unsealable"
+        fi
+        _tpm_ppi && drun "if the OS cannot clear it, request a firmware TPM clear on next boot via the PPI (op 5 = Clear)"
+        return 0
+    fi
+
+    # Real clear. Try the LOCKOUT hierarchy exactly once — it is the only clear
+    # hierarchy the OS can normally use (platform auth belongs to firmware). One
+    # attempt is deliberate: repeated bad-auth clears only drive the TPM deeper
+    # into dictionary-attack lockout, where nothing can clear it.
+    local cleared=0
+    if [[ -n "$tpm_dev" ]] && (( have_tools )); then
+        if tpm2_clear -c l &>/dev/null; then cleared=1; fi
+    fi
+
+    # If the OS could not clear it (lockout auth set, DA lockout, disableClear, or
+    # no tpm2-tools), ask the firmware to clear on the next boot via the Physical
+    # Presence Interface. Op 5 = Clear (TCG PPI). Best-effort: some firmware
+    # prompts for physical-presence confirmation at boot.
+    if (( ! cleared )) && _tpm_ppi; then
+        if echo 5 > "${_TPM_PPI_REQUEST:-/sys/class/tpm/tpm0/ppi/request}" 2>/dev/null; then cleared=2; fi
+    fi
+
+    case "$cleared" in
+        1) prog 50 "Hardware wipe — TPM cleared (sealed keys are now unsealable)" ;;
+        2) prog 50 "Hardware wipe — OS could not clear the TPM; firmware clear requested for next boot (PPI)" ;;
+        *) prog 50 "Hardware wipe — WARNING: TPM could not be cleared; sealed keys are moot anyway (Phase 1 erased the LUKS header they unlock)" ;;
+    esac
     return 0
 }
 

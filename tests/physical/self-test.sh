@@ -140,18 +140,31 @@ else
             "$SCS" detach tpmtest >/dev/null 2>&1; pass "BEFORE: the TPM unseals the key (runtime, no reboot)"
         else bad "the freshly-enrolled TPM key did not unseal — enrollment problem"; fi
 
-        echo "  firing duressd's hardware-key wipe (real tpm2_clear)…"
+        echo "  firing duressd's hardware-key wipe (real TPM clear)…"
+        _ppireq="/sys/class/tpm/tpm0/ppi/request"
         # shellcheck disable=SC1090,SC2034  # dynamic source; DRYRUN read by the handler
         ( DURESSD_LIB_ONLY=1 source "$HANDLER"; unset DURESSD_TARGET_DEVICES; DRYRUN=0; wipe_hardware_keys ) \
             2>&1 | sed 's/^/    /'
+        _ppiafter=""; [[ -r "$_ppireq" ]] && _ppiafter="$(cat "$_ppireq" 2>/dev/null)"
 
-        if "$SCS" attach tpmtest "$LOOP" - tpm2-device=auto >/dev/null 2>&1; then
+        # Three real-hardware outcomes:
+        #  • the OS cleared the TPM directly  → the sealed key no longer unseals;
+        #  • the OS can't clear this TPM (lockout auth set / DA lockout) but duressd
+        #    scheduled a FIRMWARE clear via the PPI (op 5, applied on next boot) —
+        #    a runtime unseal can't observe that, so treat it as a pass-with-note;
+        #  • neither → the hardware-key wipe genuinely failed.
+        if ! "$SCS" attach tpmtest "$LOOP" - tpm2-device=auto >/dev/null 2>&1; then
+            pass "AFTER: the TPM can no longer unseal — the sealed key is destroyed (immediate clear)"
+        elif [[ "$_ppiafter" == 5* ]]; then
             "$SCS" detach tpmtest >/dev/null 2>&1
-            bad "AFTER: the TPM STILL unseals — tpm2_clear did NOT take effect (silent failure?)"
+            warn "AFTER: the OS can't clear this TPM directly (lockout auth / DA lockout) — a FIRMWARE clear (PPI op 5) is queued for next boot; verify after reboot"
+            warn "data is safe regardless: Phase 1 erases the LUKS header the sealed key unlocks"
+            echo 0 > "$_ppireq" 2>/dev/null || true   # keep the self-test non-destructive: cancel the queued clear
         else
-            pass "AFTER: the TPM can no longer unseal — the sealed key is destroyed"
+            "$SCS" detach tpmtest >/dev/null 2>&1
+            bad "AFTER: the TPM still unseals AND no clear was scheduled — the hardware-key wipe failed"
         fi
-        warn "the machine's TPM was cleared — re-enroll any real TPM unlocks you rely on"
+        warn "the machine's TPM was targeted — re-enroll any real TPM unlocks you rely on"
     else
         bad "systemd-cryptenroll --tpm2 failed — cannot test the TPM path here"
     fi

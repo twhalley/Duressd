@@ -14,6 +14,29 @@ teardown() { teardown_stubs; }
     stub_called tpm2_clear
 }
 
+@test "wipe_hardware_keys falls back to a firmware PPI clear when software clear fails" {
+    unset DURESSD_TARGET_DEVICES
+    _tpm_device() { printf '/dev/tpmrm0'; }
+    tpm2_clear() { return 1; }   # TPM the OS can't clear (lockout auth set / DA lockout)
+    export _TPM_PPI_REQUEST="$BATS_TMPDIR/ppi_request.$$"; : > "$_TPM_PPI_REQUEST"
+    run wipe_hardware_keys
+    assert_ok
+    assert_output_contains "firmware clear requested"
+    run cat "$_TPM_PPI_REQUEST"
+    assert_output_contains "5"                 # PPI op 5 = Clear was requested
+    rm -f "$_TPM_PPI_REQUEST"; unset _TPM_PPI_REQUEST
+}
+
+@test "wipe_hardware_keys warns (no silent success) when it cannot clear at all" {
+    unset DURESSD_TARGET_DEVICES
+    _tpm_device() { printf '/dev/tpmrm0'; }
+    tpm2_clear() { return 1; }                 # software clear fails
+    _tpm_ppi()   { return 1; }                 # and no firmware PPI available
+    run wipe_hardware_keys
+    assert_ok
+    assert_output_contains "could not be cleared"   # honest failure, not a claimed success
+}
+
 @test "wipe_hardware_keys is a no-op when no TPM is present" {
     unset DURESSD_TARGET_DEVICES
     _tpm_device() { return 1; }
