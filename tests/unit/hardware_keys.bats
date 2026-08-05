@@ -3,7 +3,7 @@
 
 load '../lib/common'
 
-setup()    { setup_stubs; load_handler; }
+setup()    { setup_stubs; load_handler; export DURESSD_ALLOW_WEAK=1; }  # short test passphrases
 teardown() { teardown_stubs; }
 
 @test "wipe_hardware_keys clears the TPM when one is present" {

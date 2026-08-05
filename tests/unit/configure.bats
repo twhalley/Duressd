@@ -3,10 +3,27 @@
 
 load '../lib/common'
 
-setup()    { setup_stubs; load_handler; }
+setup()    { setup_stubs; load_handler; export DURESSD_ALLOW_WEAK=1; }  # strength tests unset this
 teardown() { teardown_stubs; }
 
 b64() { printf '%s' "$1" | base64 -w0; }
+
+@test "cmd_configure (custom) REJECTS a weak duress passphrase (remote-wipe risk)" {
+    unset DURESSD_ALLOW_WEAK
+    argv=( "$(b64 x)" "$(b64 custom)" "$(b64 short)" false false 0 )   # 'short' = 5 chars
+    run cmd_configure
+    assert_fail
+    assert_output_contains "too short"
+}
+
+@test "cmd_configure (custom) accepts a strong (>=8) duress passphrase" {
+    unset DURESSD_ALLOW_WEAK
+    argv=( "$(b64 x)" "$(b64 custom)" "$(b64 correcthorse)" false false 0 )   # 12 chars
+    run cmd_configure
+    assert_ok
+    run cat "$DURESSD_CFGDIR/config"
+    assert_output_contains "PASSWORD_TYPE=custom"
+}
 
 @test "cmd_configure (custom) writes a correct config file" {
     argv=( "$(b64 lukspass)" "$(b64 custom)" "$(b64 duresspass)" false false 5 )
