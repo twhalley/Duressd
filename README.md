@@ -647,6 +647,13 @@ CI runs lint + unit and the loop-device integration tests on every push
 
 It is possible to fire a wipe when the duress passphrase is typed at the **full-disk-encryption boot prompt** — no terminal, no desktop, no login required — without patching or rebuilding cryptsetup.
 
+> ### Which trigger for which disk?
+> The **runtime** triggers (`duressd trigger`, the SSH/Tor kill switch, the PAM login hook) reliably and cleanly destroy **any LUKS volume that is *not* the running root** — data disks, external drives, RAID arrays, home/swap. That path is proven end-to-end.
+>
+> The **running root disk is the hard case**: the wipe runs from userspace on the very disk it is destroying. duressd handles it as robustly as possible — `luksErase` **and** a direct overwrite of the LUKS header (which works even while the mapping is open), the parent-disk partition-table overwrite deferred to the very last step, and a SysRq poweroff with a reboot fallback — so the **data is destroyed**. But finishing cleanly (scrub every boot artifact, guarantee a clean power-off) is inherently fragile there.
+>
+> **For the root disk, the boot-time hook below is the robust mechanism**: it runs in the initramfs *before* the root is ever mounted, so there is no live-root to saw through. Use the boot hook to wipe the root; use the runtime triggers to wipe everything else (and as a best-effort root wipe when you can't reach the boot prompt).
+
 ### How it works (initramfs hook)
 
 LUKS2 supports up to 32 keyslots. The trick is to:

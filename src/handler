@@ -242,11 +242,16 @@ phase1_crypto_destruction() {
         (( ++i ))   # pre-increment: never returns 1 (would abort under set -e)
         local pct=$(( 10 + i * 25 / total ))
         prog "$pct" "Phase 1 [$i/$total] — wipefs + luksErase: $dev"
-        drun "wipefs + luksErase — destroy LUKS header and keyslots (data becomes irrecoverable): $dev"
+        drun "luksErase + overwrite the LUKS header region (data becomes irrecoverable): $dev"
         mutate wipefs -a "$dev"                         2>/dev/null || true
-        # luksErase may fail if wipefs already zeroed the magic — acceptable,
-        # the header region is already gone.
+        # luksErase destroys the keyslots (works even on an OPEN device).
         mutate cryptsetup luksErase --batch-mode "$dev" 2>/dev/null || true
+        # Then overwrite the LUKS2 header region directly. wipefs REFUSES on a
+        # device whose dm-crypt mapping is open (e.g. the running root), so the
+        # magic can survive it — a raw overwrite of the first 16 MiB destroys the
+        # header + keyslots regardless. It does NOT disturb the live mapping,
+        # whose data area starts *past* the header.
+        mutate rand_write "$dev" 0 4                    # 16 MiB = LUKS2 header
     done
 }
 
@@ -401,17 +406,11 @@ wipe_boot_artifacts() {
         mutate wipefs -a "$name" 2>/dev/null || true
     done < <(lsblk -lnpo NAME,PARTTYPE 2>/dev/null)
 
-    # 3. MBR + pre-first-partition gap on each parent disk. Legacy GRUB stage1
-    #    and its embedded core.img live in LBA0 and the alignment gap; the GPT
-    #    header lives here too. Do this LAST so partition enumeration above still
-    #    saw a valid table.
-    prog 46 "Boot wipe — overwriting MBR and boot gap on parent disks"
-    for dev in "${parent_devs[@]}"; do
-        _is_block "$dev" || continue
-        _in_scope "$dev" || continue
-        drun "boot wipe — overwrite MBR + GPT header + boot gap (first 4 MiB): $dev"
-        mutate rand_write "$dev" 0 1        # first 4 MiB: MBR + GPT + gap
-    done
+    # NB: the MBR / GPT / boot-gap overwrite of the PARENT disks is deliberately
+    # NOT done here — see wipe_parent_tables(), called LAST by wipe_real. Trashing
+    # the parent's partition table invalidates the partition the running root sits
+    # on, so doing it now would break / (and every binary the later phases need)
+    # mid-wipe. Deferring it keeps the system alive until just before poweroff.
 
     # 4. UEFI NVRAM boot entries — only on a real EFI system, never under a
     #    scoped test run (host NVRAM must never be touched by the harness).
@@ -424,6 +423,23 @@ wipe_boot_artifacts() {
             mutate efibootmgr -b "$bootnum" -B &>/dev/null || true
         done < <(efibootmgr 2>/dev/null | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\).*/\1/p')
     fi
+}
+
+# Final parent-disk table overwrite — run LAST (just before poweroff). It
+# invalidates the partition table the running root depends on, which breaks / and
+# every binary the earlier phases need, so it must come AFTER all data destruction
+# and boot-artifact scrubbing. Removes the disk layout + legacy GRUB stage1/gap.
+wipe_parent_tables() {
+    local -a parent_devs=("$@")
+    local dev
+    (( ${#parent_devs[@]} )) || return 0
+    prog 98 "Final — overwriting MBR + GPT + boot gap on parent disk(s)"
+    for dev in "${parent_devs[@]}"; do
+        _is_block "$dev" || continue
+        _in_scope "$dev" || continue
+        drun "overwrite MBR + GPT header + boot gap (first 4 MiB): $dev"
+        mutate rand_write "$dev" 0 1        # first 4 MiB: MBR + GPT + gap
+    done
 }
 
 # Phase 1.6 — optional (WIPE_HARDWARE_KEYS=true).
@@ -488,24 +504,31 @@ wipe_hardware_keys() {
 # doing a graceful teardown that would try to stop this running daemon.
 phase4_poweroff() {
     if (( DRYRUN )); then
-        plan_item "power off the system immediately (systemctl poweroff --force --force)"
+        plan_item "power off the system immediately (SysRq, with a reboot fallback)"
         return 0
     fi
-    sync
     # Never power off the host during tests. Any scoped run implies test mode.
     if [[ -n "${DURESSD_NO_POWEROFF:-}" ]] || [[ -n "${DURESSD_TARGET_DEVICES:-}" ]]; then
         prog 100 "Phase 4 — poweroff suppressed (test mode)"
         return 0
     fi
-    systemctl poweroff --force --force &
-    sleep 3
-    # Fallback if systemd can't shut down cleanly (root torn down mid-wipe):
-    # force an immediate poweroff via SysRq. Enable SysRq first — many systems
-    # ship kernel.sysrq=0 or a restricted bitmask that ignores 'o' otherwise.
+    prog 100 "Phase 4 — powering off"
+    # By now the parent tables are gone and / is broken, so anything that exec's a
+    # binary from / (systemctl, sync, sleep) may be unloadable. Drive shutdown
+    # through the SysRq kernel path — bash builtins (`echo`) + procfs only.
+    # Enable SysRq first (many systems ship kernel.sysrq=0 or a restricted mask).
     echo 1 > /proc/sys/kernel/sysrq 2>/dev/null || true
-    echo o > /proc/sysrq-trigger   2>/dev/null || true
-    sleep 3
-    echo o > /proc/sysrq-trigger   2>/dev/null || true
+    echo s > /proc/sysrq-trigger    2>/dev/null || true   # emergency sync
+    systemctl poweroff --force --force 2>/dev/null &      # best-effort if / still works
+    echo o > /proc/sysrq-trigger    2>/dev/null || true   # poweroff — if the firmware supports it
+    # Brief builtin spin to let 'o' take effect before the reboot fallback (no
+    # `sleep`; that is a binary which may no longer load).
+    local _s; for (( _s=0; _s<50000000; _s++ )); do :; done
+    echo o > /proc/sysrq-trigger    2>/dev/null || true
+    # Last resort: SysRq reboot ALWAYS works where 'o' may not. A reset drops the
+    # in-RAM master key and the wiped disk no longer boots — the security goal is
+    # met even though it is a reboot rather than a full power-off.
+    echo b > /proc/sysrq-trigger    2>/dev/null || true
 }
 
 # ── wipe_real ─────────────────────────────────────────────────────────────────
@@ -588,8 +611,15 @@ wipe_real() {
         plan_skip "disabled (WIPE_FULL_DEVICE=false)"
     fi
 
+    # LAST destructive step — overwrite the parent-disk tables. This breaks the
+    # running root, so it must come after every phase that needs a live / and
+    # working binaries. After this, only bash builtins + procfs are reliable.
+    if [[ "${WIPE_BOOT_ARTIFACTS:-false}" == true ]]; then
+        wipe_parent_tables "${parent_devs[@]}"
+    fi
+
     dhead "Phase 4 — power off"
-    prog 99 "Phase 4 — sync and power off"
+    prog 99 "Phase 4 — power off"
     set_state DONE
     phase4_poweroff
 }
