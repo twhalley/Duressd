@@ -29,7 +29,7 @@ REC
     sed -i "s#REC_RECORD#$RECORD#" "$PAMTEST/rec"
     chmod +x "$PAMTEST/rec"
     # pam-duress sources trigger.env for a DURESSD_BIN override.
-    printf 'DURESSD_BIN=%q\n' "$PAMTEST/rec" > "$DURESSD_CFGDIR/trigger.env"
+    printf 'DURESSD_BIN=%s\n' "$PAMTEST/rec" > "$DURESSD_CFGDIR/trigger.env"
 }
 teardown() { rm -rf "$PAMTEST"; }
 

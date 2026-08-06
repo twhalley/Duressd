@@ -10,12 +10,19 @@ set -euo pipefail
 _self="${BASH_SOURCE[0]:-}"
 _dir="$(cd "$(dirname "${_self:-/}")" 2>/dev/null && pwd)" || _dir=""
 if [[ -z "$_dir" ]] || [[ ! -d "${_dir}/src" ]]; then
-    if [[ -t 1 ]]; then CYN=$'\033[1;36m' RED=$'\033[1;31m' RST=$'\033[0m'
-    else CYN='' RED='' RST=''; fi
+    if [[ -t 1 ]]; then CYN=$'\033[1;36m' RED=$'\033[1;31m' YLW=$'\033[1;33m' RST=$'\033[0m'
+    else CYN='' RED='' YLW='' RST=''; fi
     [[ $EUID -eq 0 ]] || { printf '%s\n' "${RED}  ✘  Must be run as root — use: curl ... | sudo bash${RST}" >&2; exit 1; }
-    printf '%s\n' "${CYN}  →  Downloading duressd from GitHub${RST}"
+    # SECURITY: `curl … | sudo bash` runs unverified remote code AS ROOT. There is
+    # no signature/checksum here. For a security tool the safer path is to clone,
+    # review, then run:  git clone …/Duressd && sudo bash Duressd/install.sh
+    printf '%s\n' "${YLW}  ⚠  Installing code fetched over the network as root, unverified.${RST}" >&2
+    printf '%s\n' "${YLW}     Safer: git clone the repo, review it, then run sudo bash install.sh.${RST}" >&2
+    # DURESSD_REF lets you pin a reviewed tag/branch instead of the moving 'main'.
+    _ref="${DURESSD_REF:-main}"
+    printf '%s\n' "${CYN}  →  Downloading duressd (${_ref}) from GitHub${RST}"
     _work=$(mktemp -d)
-    _url="https://github.com/twhalley/Duressd/archive/refs/heads/main.tar.gz"
+    _url="https://github.com/twhalley/Duressd/archive/refs/heads/${_ref}.tar.gz"
     if   command -v curl &>/dev/null; then curl -fsSL "$_url" -o "$_work/s.tar.gz"
     elif command -v wget &>/dev/null; then wget  -q    "$_url" -O "$_work/s.tar.gz"
     else printf '%s\n' "${RED}  ✘  curl or wget required${RST}" >&2; exit 1; fi
