@@ -34,6 +34,9 @@ EOF
     # shellcheck disable=SC2086
     assert_safe_targets $loop $esp $boot $root
 
+    # mkfs.vfat + luksFormat above trigger a udev re-scan; wait for it to settle so
+    # `lsblk PARTTYPE` reliably reports the ESP GUID (else the ESP goes undetected).
+    udevadm settle 2>/dev/null || sleep 0.5
     wipe_boot_artifacts "$loop"
     phase1_crypto_destruction "$root"
 
