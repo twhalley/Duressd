@@ -46,8 +46,11 @@ teardown() { teardown_stubs; }
     stub_called_with wipefs "/dev/sda4"
 }
 
-@test "MBR / boot-gap of the parent disk is overwritten" {
-    run wipe_boot_artifacts /dev/sda
+@test "MBR / boot-gap of the parent disk is overwritten (deferred to wipe_parent_tables)" {
+    # The parent-disk MBR/GPT overwrite is deliberately NOT part of
+    # wipe_boot_artifacts (it would break the running root mid-wipe) — it lives in
+    # wipe_parent_tables(), which wipe_real runs LAST, just before poweroff.
+    run wipe_parent_tables /dev/sda
     assert_ok
     # rand_write on the bare parent disk => a dd seek=0 to /dev/sda
     stub_called_with dd "of=/dev/sda "

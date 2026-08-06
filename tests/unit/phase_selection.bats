@@ -24,8 +24,8 @@ teardown() { teardown_stubs; }
     refute_output_contains "Phase 3 — wiping full"
     stub_called wipefs
     stub_called_with cryptsetup luksErase
-    stub_not_called dd          # rand_write only runs in phase 2/3
-    stub_not_called blkdiscard
+    stub_called dd              # Phase 1 now overwrites the LUKS header region (rand_write)
+    stub_not_called blkdiscard  # blkdiscard is Phase 3 only
 }
 
 @test "overwrite-header flag: Phase 2 runs, Phase 3 does not" {

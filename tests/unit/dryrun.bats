@@ -48,7 +48,7 @@ teardown() { teardown_stubs; }
     assert_ok
     assert_output_contains "PLAN"
     assert_output_contains "Phase 1 — cryptographic destruction"
-    assert_output_contains "wipefs + luksErase"
+    assert_output_contains "luksErase + overwrite the LUKS header"
     assert_output_contains "/dev/sda3"
 }
 
