@@ -111,3 +111,21 @@ teardown() { teardown_stubs; }
     stub_not_called dd
     stub_not_called blkdiscard
 }
+
+@test "live-root: the parent-disk MBR/GPT overwrite is DEFERRED out of wipe_boot_artifacts" {
+    export DURESSD_TARGET_DEVICES="/dev/sda /dev/sda1 /dev/sda2 /dev/sda3"
+    DRYRUN=1
+    run wipe_boot_artifacts /dev/sda
+    assert_ok
+    # It must NOT trash the parent table here — that would break the running root
+    # mid-wipe. It's moved to wipe_parent_tables(), which wipe_real runs LAST.
+    refute_output_contains "MBR + GPT header"
+}
+
+@test "live-root: wipe_parent_tables previews the MBR/GPT overwrite (the deferred step)" {
+    export DURESSD_TARGET_DEVICES="/dev/sda"
+    DRYRUN=1
+    run wipe_parent_tables /dev/sda
+    assert_ok
+    assert_output_contains "MBR + GPT header"
+}
