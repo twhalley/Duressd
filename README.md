@@ -686,11 +686,14 @@ The `local-top` script runs before `cryptroot`, has access to block devices, and
 
 ### Security note
 
-Because the duress passphrase is a real LUKS keyslot, someone who obtains the passphrase *and* physically blocks the hook from running (e.g. boots a live OS) could decrypt the volume. Mitigations:
+The duress passphrase is **not** a LUKS keyslot on your disk — the mkinitcpio hook matches it against a **separate Argon2id oracle** (`/duress-oracle.luks`, baked into the initramfs). So the duress passphrase **cannot decrypt the volume**; it can only *trigger the wipe*. Someone who learns it — or who boots a live OS to bypass the hook — still cannot read your data with it.
 
-- Combine with a countdown so the wipe cannot be interrupted.
-- Use a passphrase that differs from your normal unlock key (`type=custom` is already recommended for this).
-- Phase 2 header overwrite makes forensic recovery significantly harder even if the raw sectors survive.
+The real residual risk is different: the duress passphrase must remain **secret from an adversary who could coerce your *normal* passphrase from you but not the duress one**. Hardening:
+
+- Use a duress passphrase distinct from your normal unlock key (`type=custom`, enforced ≥ 8 chars).
+- Combine with a countdown so the wipe cannot be interrupted once started.
+- Enable Phase 2 header overwrite / full-device wipe for defence-in-depth beyond the header erase.
+- The oracle (`/etc/duressd/passphrase.luks`, mode `0600`) reveals nothing about the passphrase — it is Argon2id-hashed, like any LUKS keyslot.
 
 ### Secure Boot
 

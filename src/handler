@@ -72,8 +72,22 @@ set_state() { (( DRYRUN )) && return 0; echo "$1" > "$STATEFILE"; }
 
 load_config() {
     [[ -f "$CFGFILE" ]] || return 1
-    # shellcheck source=/dev/null
-    source "$CFGFILE"
+    # SECURITY: parse KEY=value ourselves — NEVER `source` the config. Sourcing
+    # would execute any shell code in /etc/duressd/config as root (a latent RCE if
+    # the file's integrity is ever lost). Only an allowlist of known keys is
+    # accepted, and each value is taken literally (no expansion, no execution).
+    local line key val
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        case "$line" in ''|'#'*) continue ;; esac
+        [[ "$line" == *=* ]] || continue
+        key="${line%%=*}"; val="${line#*=}"
+        case "$key" in
+            CONFIGURED|PASSWORD_TYPE|VERIFY_DEVICE|OVERWRITE_LUKS_HEADER|\
+            WIPE_FULL_DEVICE|WIPE_BOOT_ARTIFACTS|WIPE_HARDWARE_KEYS|WIPE_COUNTDOWN)
+                printf -v "$key" '%s' "$val" ;;
+        esac
+    done < "$CFGFILE"
+    return 0
 }
 
 # ── passphrase verification ───────────────────────────────────────────────────

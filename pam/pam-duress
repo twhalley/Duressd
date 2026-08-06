@@ -7,8 +7,17 @@
 set -u
 
 CFGDIR="${DURESSD_CFGDIR:-/etc/duressd}"
-# Optional socket/override env (used by tests; absent in production → defaults).
-[ -r "$CFGDIR/trigger.env" ] && . "$CFGDIR/trigger.env"
+# Optional overrides (used by tests; absent in production → defaults). SECURITY:
+# parse KEY=value explicitly rather than `.`-sourcing, which would execute any
+# code in the file as root.
+if [ -r "$CFGDIR/trigger.env" ]; then
+    while IFS='=' read -r _k _v; do
+        case "$_k" in
+            DURESSD_BIN)       DURESSD_BIN="$_v" ;;
+            DURESSD_DEBUG_LOG) DURESSD_DEBUG_LOG="$_v" ;;
+        esac
+    done < "$CFGDIR/trigger.env"
+fi
 DURESSD_BIN="${DURESSD_BIN:-duressd}"
 
 # NB: the authtok may arrive WITHOUT a trailing newline, so `read` returns
