@@ -274,9 +274,13 @@ cat <<DONE
   ✔  built $OUT
   ✔  duress SSH private key: $KEYOUT
 
-  Provision the laptop (DESTROYS its current disk):
-    sudo dd if=$OUT of=/dev/<laptop-disk> bs=64M conv=fsync status=progress
-    # confirm the target with: lsblk -o NAME,SIZE,MODEL,SERIAL
+  Provision a USB / disk — REFORMAT + FLASH + VERIFY (confirm the target first!):
+    lsblk -o NAME,SIZE,MODEL,SERIAL,RM      # pick your device, e.g. /dev/sdX (RM=1)
+    sudo bash -c 'D=/dev/sdX; \\
+      wipefs -a "\$D"; sgdisk --zap-all "\$D" 2>/dev/null || true; \\
+      dd if=$OUT of="\$D" bs=4M conv=fsync status=progress; sync; \\
+      cmp -n \$(stat -c %s $OUT) $OUT "\$D" && echo "✔ MATCH — safe to boot" || echo "✘ MISMATCH — re-flash"'
+    # …or let the build do it next time:  FLASH_DEV=/dev/sdX bash $0
 
   Log in:
     console/ssh user: $USERNAME   (password you set in USER_PASS)
