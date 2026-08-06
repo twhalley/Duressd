@@ -77,3 +77,47 @@ expect_b64() { printf '%s' "$1" | base64 -w0; }
     grep -q 'trigger-remote --passphrase-file' "$ak"
     rm -f "$pub"
 }
+
+# ── security properties of the public-key forced-command entry ────────────────
+
+@test "security: the forced-command entry is RESTRICTED and locked to trigger-remote" {
+    pub="$(mktemp)"; echo "ssh-ed25519 AAAAKEYR duressd-test" > "$pub"
+    ak="$DURESSD_TESTROOT/authorized_keys"
+    run cmd_install_ssh_trigger --pubkey "$pub" --authorized-keys "$ak"
+    assert_ok
+    run cat "$ak"
+    # a matching key can ONLY run trigger-remote — no arbitrary command, no shell
+    assert_output_contains 'command="duressd trigger-remote"'
+    # restrict disables pty, agent/port/X11 forwarding and user rc (OpenSSH 7.2+)
+    assert_output_contains 'restrict'
+    rm -f "$pub"
+}
+
+@test "security: authorized_keys is written mode 0600" {
+    pub="$(mktemp)"; echo "ssh-ed25519 AAAAKEY6 duressd-test" > "$pub"
+    ak="$DURESSD_TESTROOT/authorized_keys"
+    run cmd_install_ssh_trigger --pubkey "$pub" --authorized-keys "$ak"
+    assert_ok
+    [ "$(stat -c %a "$ak")" = "600" ]
+    rm -f "$pub"
+}
+
+@test "security: default (no --embed) NEVER persists the passphrase to disk" {
+    pub="$(mktemp)"; echo "ssh-ed25519 AAAAKEYN duressd-test" > "$pub"
+    ak="$DURESSD_TESTROOT/authorized_keys"
+    run cmd_install_ssh_trigger --pubkey "$pub" --authorized-keys "$ak"
+    assert_ok
+    [ ! -e "$DURESSD_CFGDIR/ssh-trigger.pass" ]    # no stored secret on disk
+    run cat "$ak"
+    refute_output_contains 'passphrase-file'        # key alone can't trigger
+    rm -f "$pub"
+}
+
+@test "security: --embed-passphrase stores the secret root-only (0600)" {
+    pub="$(mktemp)"; echo "ssh-ed25519 AAAAKEYE duressd-test" > "$pub"
+    ak="$DURESSD_TESTROOT/authorized_keys"
+    printf '%s\n%s\n' "embedpass" "embedpass" \
+        | cmd_install_ssh_trigger --embed-passphrase --pubkey "$pub" --authorized-keys "$ak"
+    [ "$(stat -c %a "$DURESSD_CFGDIR/ssh-trigger.pass")" = "600" ]
+    rm -f "$pub"
+}
