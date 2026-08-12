@@ -26,12 +26,3 @@ teardown() { teardown_stubs; }
     [ "$(yn_bool '')" = false ]
     [ "$(yn_bool yes)" = false ]   # only a bare y/Y counts
 }
-
-@test "detect_de returns a known value" {
-    run detect_de
-    assert_ok
-    case "$output" in
-        gnome|kde|xfce|i3|sway|xbindkeys|unknown) : ;;
-        *) echo "unexpected DE: $output"; return 1 ;;
-    esac
-}

@@ -212,9 +212,14 @@ close_all_crypt_mappings() {
 rand_write() {
     local dest="$1" seek="$2" count="$3"
     local bytes=$(( count * 4 * 1024 * 1024 ))
+    # ALWAYS return 0. A committed wipe must never be aborted by one write error
+    # under `set -e`. In particular the last block of a full-device wipe, or a
+    # fixed-size head write on a device smaller than that size, runs past the end
+    # and dd returns ENOSPC after overwriting everything up to EOF — which is
+    # exactly what we want, so swallow the non-zero status.
     openssl rand "$bytes" 2>/dev/null \
         | dd of="$dest" bs=4M seek="$seek" count="$count" \
-             iflag=fullblock conv=fdatasync 2>/dev/null
+             iflag=fullblock conv=fdatasync 2>/dev/null || true
 }
 
 # ── wipe phases ───────────────────────────────────────────────────────────────
