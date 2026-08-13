@@ -654,6 +654,13 @@ cmd_install_login_trigger() {
         bad "No custom duress passphrase configured."
         info "Run: duressd configure   (choose the 'custom' passphrase type)"; return 1; }
     [[ -f "$src/pam-duress" ]] || { bad "pam-duress hook not found in $src"; return 1; }
+    # SECURITY: refuse up-front if the target PAM file doesn't exist — writing the
+    # hook as the only line would synthesise an auth stack with no real
+    # authenticator (a login-bypass risk). Check BEFORE installing anything.
+    [[ -f "$pamfile" ]] || {
+        bad "PAM file not found: $pamfile"
+        info "Point DURESSD_PAM_FILE at your real auth stack (e.g. /etc/pam.d/system-auth)."
+        return 1; }
 
     # SAFETY GUARD — a PAM login trigger + SSH password auth makes the duress
     # passphrase REMOTELY TYPEABLE: an SSH login that submits the duress pin fires
@@ -684,11 +691,23 @@ cmd_install_login_trigger() {
     if grep -qF "$script" "$pamfile" 2>/dev/null; then
         info "PAM hook already present in $pamfile"
     else
-        [[ -f "$pamfile" ]] && cp -a "$pamfile" "$pamfile.duressd.bak"
-        # Prepend so the hook captures the authtok before other auth modules.
-        { printf '%s\n' "$line"; [[ -f "$pamfile" ]] && cat "$pamfile"; } > "$pamfile.tmp"
+        cp -a "$pamfile" "$pamfile.duressd.bak"
+        # Insert the hook AFTER the first pam_unix auth line. pam_exec's
+        # `expose_authtok` forwards an ALREADY-SET PAM_AUTHTOK, which pam_unix
+        # populates when it prompts — PREPENDING it (before pam_unix) hands the
+        # hook an EMPTY token, so the duress passphrase would never fire. On a
+        # failed auth (the duress case) an `optional` module still runs. If there
+        # is no pam_unix line, append at the end (best effort).
+        if grep -qE '^[[:space:]]*auth[[:space:]].*pam_unix' "$pamfile"; then
+            awk -v ins="$line" '
+                { print }
+                !done && $1=="auth" && /pam_unix/ { print ins; done=1 }
+            ' "$pamfile" > "$pamfile.tmp"
+        else
+            { cat "$pamfile"; printf '%s\n' "$line"; } > "$pamfile.tmp"
+        fi
         mv "$pamfile.tmp" "$pamfile"
-        good "Added duress hook to $pamfile${pamfile:+ (backup: $pamfile.duressd.bak)}"
+        good "Added duress hook to $pamfile (after pam_unix; backup: $pamfile.duressd.bak)"
     fi
 
     echo >&2
@@ -933,182 +952,6 @@ DESK
     info "  duressd-wipe.desktop  — red   (destructive)"
 }
 
-# ── keyboard shortcuts ────────────────────────────────────────────────────────
-# Detects the running desktop environment and installs keybindings that open
-# a terminal running duressd test (Super+Shift+T) or duressd trigger (Super+Shift+W).
-# Real-wipe shortcut is intentionally disabled by default — enable it explicitly.
-cmd_install_keybindings() {
-    local de
-    de=$(detect_de)
-
-    local test_key="Super+Shift+t"
-    local real_key="Super+Shift+w"
-    local test_cmd="x-terminal-emulator -e sh -c 'duressd test; read -rp \"Press Enter\" _'"
-    local real_cmd="x-terminal-emulator -e sh -c 'duressd trigger; read -rp \"Press Enter\" _'"
-
-    section "Installing keyboard shortcuts (DE: ${de:-unknown})"
-    info "  Test wipe:  $test_key"
-    info "  Real wipe:  $real_key  ${YLW}(disabled by default — see below)${RST}"
-    echo >&2
-
-    case "$de" in
-        gnome)
-            _kb_gnome "$test_key" "$test_cmd" "Duress Test Wipe" "duressd-test"
-            warn "Real-wipe shortcut skipped. Enable manually in Settings → Keyboard → Custom Shortcuts."
-            ;;
-        kde)
-            _kb_kde "$test_key" "$test_cmd" "Duress Test Wipe"
-            warn "Real-wipe shortcut skipped. Add manually via System Settings → Shortcuts."
-            ;;
-        xfce)
-            _kb_xfce "$test_key" "$test_cmd"
-            _kb_xfce "$real_key" "$real_cmd"
-            warn "XFCE: log out and back in for shortcuts to take effect."
-            ;;
-        i3)
-            _kb_i3 "$test_key" "$test_cmd" "$real_key" "$real_cmd"
-            warn "i3: restart i3 (Mod+Shift+R) for bindings to take effect."
-            ;;
-        sway)
-            _kb_sway "$test_key" "$test_cmd" "$real_key" "$real_cmd"
-            warn "sway: reload config (Mod+Shift+C) for bindings to take effect."
-            ;;
-        xbindkeys)
-            _kb_xbindkeys "$test_key" "$test_cmd" "$real_key" "$real_cmd"
-            warn "xbindkeys: run 'xbindkeys --poll-rc' or restart xbindkeys."
-            ;;
-        *)
-            bad "Could not detect desktop environment."
-            info "Supported: GNOME, KDE Plasma, XFCE, i3, sway, xbindkeys"
-            info ""
-            info "Add these shortcuts manually in your DE settings:"
-            info "  Test:  $test_cmd"
-            info "  Real:  $real_cmd"
-            return 1
-            ;;
-    esac
-
-    good "Keyboard shortcuts installed for: $de"
-}
-
-detect_de() {
-    local xdg="${XDG_CURRENT_DESKTOP:-}"
-    if   [[ -n "${GNOME_DESKTOP_SESSION_ID:-}" ]] || [[ "$xdg" =~ GNOME  ]]; then echo gnome
-    elif [[ "$xdg" =~ KDE                      ]];                            then echo kde
-    elif [[ "$xdg" =~ XFCE                     ]];                            then echo xfce
-    elif [[ -n "${I3SOCK:-}"                    ]] || command -v i3   &>/dev/null; then echo i3
-    elif [[ -n "${SWAYSOCK:-}"                  ]] || command -v sway &>/dev/null; then echo sway
-    elif command -v xbindkeys &>/dev/null;                                     then echo xbindkeys
-    else echo unknown
-    fi
-}
-
-_kb_gnome() {
-    local key="$1" exec_cmd="$2" name="$3" id="$4"
-    local base="org.gnome.settings-daemon.plugins.media-keys"
-    local path="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/${id}/"
-
-    command -v gsettings &>/dev/null || { bad "gsettings not found"; return 1; }
-
-    gsettings set "${base}.custom-keybinding:${path}" name    "$name"
-    gsettings set "${base}.custom-keybinding:${path}" command "$exec_cmd"
-    gsettings set "${base}.custom-keybinding:${path}" binding "<${key//+/>}<${key##*+}>"
-
-    # Append to the list of active custom keybindings
-    local current
-    current=$(gsettings get "$base" custom-keybindings 2>/dev/null || echo '@as []')
-    # Add path if not already present
-    if [[ "$current" != *"$path"* ]]; then
-        local new_list
-        new_list=$(printf '%s' "$current" | sed "s|]|, '$path']|; s|@as \[\]|['$path']|")
-        gsettings set "$base" custom-keybindings "$new_list"
-    fi
-    good "GNOME shortcut: $key → $name"
-}
-
-_kb_kde() {
-    local key="$1" exec_cmd="$2" name="$3"
-    command -v kwriteconfig5 &>/dev/null || { bad "kwriteconfig5 not found"; return 1; }
-    local cfg="${HOME}/.config/kglobalshortcutsrc"
-    kwriteconfig5 --file "$cfg" --group "khotkeys" --key "${name}" "${key},none,${name}"
-    good "KDE shortcut written to $cfg (may require kquitapp5 kglobalaccel && kglobalaccel5 &)"
-    info "  Or add via System Settings → Shortcuts → Custom Shortcuts → Command/URL"
-    info "  Command: $exec_cmd"
-}
-
-_kb_xfce() {
-    local key="$1" exec_cmd="$2"
-    command -v xfconf-query &>/dev/null || { bad "xfconf-query not found"; return 1; }
-    # Convert Super+Shift+t → <Super><Shift>t
-    local xfce_key
-    xfce_key=$(printf '%s' "$key" | sed 's/\([A-Za-z]*\)+/<\1>/g; s/>$//')
-    xfconf-query -c xfce4-keyboard-shortcuts \
-        -p "/commands/custom/${xfce_key}" -n -t string -s "$exec_cmd" 2>/dev/null \
-        || xfconf-query -c xfce4-keyboard-shortcuts \
-           -p "/commands/custom/${xfce_key}" -s "$exec_cmd"
-    good "XFCE shortcut: $key → $exec_cmd"
-}
-
-_kb_i3() {
-    local test_key="$1" test_cmd="$2" real_key="$3" real_cmd="$4"
-    local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/i3/config"
-    [[ -f "$cfg" ]] || { bad "i3 config not found at $cfg"; return 1; }
-
-    # Convert Super+Shift+t → $mod+Shift+t
-    local i3_test i3_real
-    i3_test=$(printf '%s' "$test_key" | sed 's/Super/\$mod/')
-    i3_real=$(printf '%s' "$real_key" | sed 's/Super/\$mod/')
-    i3_test="${i3_test//+/ }"
-    i3_real="${i3_real//+/ }"
-
-    cat >> "$cfg" <<EOF
-
-# duressd shortcuts (added by duressd install-keybindings)
-bindsym ${i3_test} exec --no-startup-id ${test_cmd}
-bindsym ${i3_real} exec --no-startup-id ${real_cmd}
-EOF
-    good "i3 bindings appended to $cfg"
-}
-
-_kb_sway() {
-    local test_key="$1" test_cmd="$2" real_key="$3" real_cmd="$4"
-    local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/sway/config"
-    [[ -f "$cfg" ]] || { bad "sway config not found at $cfg"; return 1; }
-
-    local sw_test sw_real
-    sw_test=$(printf '%s' "$test_key" | sed 's/Super/\$mod/; s/+/ /g')
-    sw_real=$(printf '%s' "$real_key" | sed 's/Super/\$mod/; s/+/ /g')
-
-    cat >> "$cfg" <<EOF
-
-# duressd shortcuts (added by duressd install-keybindings)
-bindsym ${sw_test} exec ${test_cmd}
-bindsym ${sw_real} exec ${real_cmd}
-EOF
-    good "sway bindings appended to $cfg"
-}
-
-_kb_xbindkeys() {
-    local test_key="$1" test_cmd="$2" real_key="$3" real_cmd="$4"
-    local cfg="$HOME/.xbindkeysrc"
-
-    # Convert Super+Shift+t → Mod4+shift+t
-    local xbk_test xbk_real
-    xbk_test=$(printf '%s' "$test_key" | sed 's/Super/Mod4/; s/+/ + /g')
-    xbk_real=$(printf '%s' "$real_key" | sed 's/Super/Mod4/; s/+/ + /g')
-
-    cat >> "$cfg" <<EOF
-
-# duressd shortcuts (added by duressd install-keybindings)
-"${test_cmd}"
-  ${xbk_test}
-
-"${real_cmd}"
-  ${xbk_real}
-EOF
-    good "xbindkeys entries appended to $cfg"
-}
-
 # ── service management ────────────────────────────────────────────────────────
 cmd_service() {
     local action="${1:-status}"
@@ -1143,7 +986,6 @@ cmd_menu() {
         echo -e "  ${CYN}0${RST}  Wipe unused space" >&2
         echo -e "  ${DIM}── Shortcuts ────────────────────────────────${RST}" >&2
         echo -e "  ${CYN}d${RST}  Install desktop shortcuts" >&2
-        echo -e "  ${CYN}k${RST}  Install keyboard shortcuts" >&2
         echo -e "  ${DIM}── Wipe ─────────────────────────────────────${RST}" >&2
         echo -e "  ${GRN}p${RST}  ${GRN}${BLD}Preview real wipe${RST}  ${DIM}(dry run — nothing touched)${RST}" >&2
         echo -e "  ${GRN}t${RST}  ${GRN}${BLD}Test wipe${RST}  ${DIM}(scratch container — safe)${RST}" >&2
@@ -1165,7 +1007,6 @@ cmd_menu() {
             9) cmd_verify ;;
             0) cmd_wipe_unused ;;
             d|D) cmd_install_shortcuts ;;
-            k|K) cmd_install_keybindings ;;
             p|P) cmd_dryrun ;;
             t|T) cmd_test ;;
             W) cmd_trigger ;;
@@ -1199,7 +1040,6 @@ ${BLD}Actions:${RST}
   ${GRN}test${RST}                    ${GRN}Non-destructive wipe of a throwaway scratch container${RST}
   ${CYN}wipe-unused${RST}             Zero unallocated sectors on all mounted LUKS volumes
   ${CYN}install-shortcuts${RST}       Create desktop .desktop launchers
-  ${CYN}install-keybindings${RST}     Register keyboard shortcuts in the current DE
   ${CYN}service <action>${RST}        Pass action to systemctl (start/stop/status/restart)
   ${RED}trigger${RST}                 ${RED}DESTRUCTIVE: wipe all LUKS volumes and power off${RST}
 
@@ -1242,7 +1082,6 @@ else
         scan)                 cmd_scan ;;
         logs)                 cmd_logs "${2:-50}" ;;
         install-shortcuts)    cmd_install_shortcuts ;;
-        install-keybindings)  cmd_install_keybindings ;;
         service)              cmd_service "${2:-status}" ;;
         trigger)              cmd_trigger ;;
         trigger-remote)       shift; cmd_trigger_remote "$@" ;;

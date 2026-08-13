@@ -70,6 +70,31 @@ assert_safe_targets() {
     return 0
 }
 
+# Wait until lsblk actually reports a PARTTYPE for a freshly-created partition.
+# The udev/blkid database is populated ASYNCHRONOUSLY after losetup -P / mkfs, and
+# wipe_boot_artifacts keys ESP detection off the PARTTYPE column (handler:383).
+# `udevadm settle` alone is not enough: it drains the *queued* events, but the
+# event for a just-appeared partition may not be queued yet — so we poll the exact
+# column the handler reads, re-triggering udev each round. Best-effort: return
+# after the deadline regardless so a stuck udevd can't hang the whole suite (the
+# test's own assertion then reports the real failure).
+# Usage: wait_for_parttype <dev> [expected-guid]
+wait_for_parttype() {
+    local dev="$1" want="${2:-}" i cur
+    for i in $(seq 1 100); do
+        udevadm trigger --settle "$dev" 2>/dev/null \
+            || udevadm settle 2>/dev/null || true
+        cur="$(lsblk -ndo PARTTYPE "$dev" 2>/dev/null || true)"
+        if [[ -n "$want" ]]; then
+            [[ "${cur,,}" == "${want,,}" ]] && return 0
+        else
+            [[ -n "$cur" ]] && return 0
+        fi
+        sleep 0.1
+    done
+    return 0
+}
+
 # Assert a device no longer carries a LUKS header.
 refute_is_luks() { ! cryptsetup isLuks "$1" 2>/dev/null; }
 # Assert a device still carries a LUKS header (sanity before wiping).

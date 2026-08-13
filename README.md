@@ -123,7 +123,6 @@ duressd test
 
 # 5. (Optional) Install shortcuts for your desktop
 duressd install-shortcuts
-duressd install-keybindings
 ```
 
 ---
@@ -484,30 +483,6 @@ Writes two `.desktop` launchers to `~/Desktop/`:
 
 ---
 
-### `duressd install-keybindings`
-
-Detects the running desktop environment and registers keyboard shortcuts:
-
-| Shortcut | Action |
-|----------|--------|
-| `Super + Shift + T` | Open terminal → `duressd test` (non-destructive) |
-| `Super + Shift + W` | Open terminal → `duressd trigger` (destructive) |
-
-> The real-wipe shortcut (`Super+Shift+W`) is intentionally skipped on GNOME and KDE — add it manually if you want it, to prevent accidental triggers from muscle memory.
-
-**Supported desktop environments:**
-
-| DE | Method | Notes |
-|----|--------|-------|
-| GNOME | `gsettings` custom keybinding | Takes effect immediately |
-| KDE Plasma | `kwriteconfig5` → `kglobalshortcutsrc` | May need `kglobalaccel5 &` |
-| XFCE | `xfconf-query` → `xfce4-keyboard-shortcuts` | Log out/in to activate |
-| i3 | Appended `bindsym` lines to `~/.config/i3/config` | `Mod+Shift+R` to reload |
-| sway | Appended `bindsym` lines to `~/.config/sway/config` | `Mod+Shift+C` to reload |
-| xbindkeys | Appended entries to `~/.xbindkeysrc` | Restart xbindkeys |
-
----
-
 ### `duressd service <action>`
 
 Thin wrapper around `systemctl`:
@@ -700,7 +675,11 @@ The real residual risk is different: the duress passphrase must remain **secret 
 - Use a duress passphrase distinct from your normal unlock key (`type=custom`, enforced ≥ 8 chars).
 - Combine with a countdown so the wipe cannot be interrupted once started.
 - Enable Phase 2 header overwrite / full-device wipe for defence-in-depth beyond the header erase.
-- The oracle (`/etc/duressd/passphrase.luks`, mode `0600`) reveals nothing about the passphrase — it is Argon2id-hashed, like any LUKS keyslot.
+
+**Two limitations you must plan around — the boot oracle is *not* a secret and *not* hidden:**
+
+- **Offline brute-force.** The boot-time oracle (`/duress-oracle.luks`) is baked into the initramfs (`/boot/initramfs-linux.img`), which lives on the **unencrypted, world-readable `/boot`**. An adversary with disk access can copy it and brute-force the duress passphrase **offline**. Argon2id makes each guess expensive but does not make a weak passphrase safe. **Treat the boot-hook duress passphrase like a real key: high-entropy (a long random phrase), not a short human PIN.** The ≥ 8-char floor is a footgun guard, *not* a security level for the boot hook. (The runtime-side oracle `/etc/duressd/passphrase.luks` is mode `0600` and only exposed to a *running* root, so it is not offline-readable the same way — the initramfs copy is the exposed one.)
+- **No deniability.** The hook and the oracle file are visible to anyone who inspects the initramfs. The boot trigger is a **wipe mechanism, not a hidden feature** — do not rely on an adversary *not knowing* a duress capability exists. If plausible deniability matters, the boot hook does not provide it.
 
 ### Secure Boot
 

@@ -212,9 +212,14 @@ close_all_crypt_mappings() {
 rand_write() {
     local dest="$1" seek="$2" count="$3"
     local bytes=$(( count * 4 * 1024 * 1024 ))
+    # ALWAYS return 0. A committed wipe must never be aborted by one write error
+    # under `set -e`. In particular the last block of a full-device wipe, or a
+    # fixed-size head write on a device smaller than that size, runs past the end
+    # and dd returns ENOSPC after overwriting everything up to EOF — which is
+    # exactly what we want, so swallow the non-zero status.
     openssl rand "$bytes" 2>/dev/null \
         | dd of="$dest" bs=4M seek="$seek" count="$count" \
-             iflag=fullblock conv=fdatasync 2>/dev/null
+             iflag=fullblock conv=fdatasync 2>/dev/null || true
 }
 
 # ── wipe phases ───────────────────────────────────────────────────────────────
@@ -354,6 +359,20 @@ phase3_wipe_full_devices() {
 ESP_GUID=c12a7328-f81f-11d2-ba4b-00a0c93ec93b       # EFI System Partition
 BIOSBOOT_GUID=21686148-6449-6e6f-744e-656564454649  # BIOS boot (GRUB core.img)
 
+# Extract KEY="value" from one line of `lsblk -P` (pairs) output; empty/absent
+# key → empty string. We use -P instead of positional columns because real lsblk
+# delimits `-o` output with PADDED SPACES (not tabs) and PARTTYPE/MOUNTPOINT are
+# frequently EMPTY — positional splitting silently mis-parses both, which made
+# the boot-artifact ESP/boot scrub a no-op on real hardware (the tab-emitting
+# unit stub hid it). The leading (^|space) anchor keeps FSTYPE/PARTTYPE distinct.
+_pval() {
+    local line="$1" key="$2"
+    [[ "$line" =~ (^|[[:space:]])"$key"=\"([^\"]*)\" ]] && printf '%s' "${BASH_REMATCH[2]}"
+    # ALWAYS succeed: a parse miss must never fail `name=$(_pval …)` under set -e
+    # and abort a committed wipe. Absent key → empty string, handled by callers.
+    return 0
+}
+
 # Phase 1.5 — optional (WIPE_BOOT_ARTIFACTS=true).
 # Destroys the OS boot chain so nothing bootable remains after the wipe:
 #   • EFI System Partitions (systemd-boot, GRUB EFI, shim)
@@ -370,7 +389,13 @@ wipe_boot_artifacts() {
 
     # 1. ESP + /boot partitions — small, so overwrite the head and drop sigs.
     prog 42 "Boot wipe — scrubbing ESP and /boot partitions"
-    while IFS=$'\t' read -r name parttype fstype mountpoint; do
+    local _l name parttype fstype mountpoint
+    while IFS= read -r _l; do
+        [[ -z "$_l" ]] && continue
+        name=$(_pval "$_l" NAME)
+        parttype=$(_pval "$_l" PARTTYPE)
+        fstype=$(_pval "$_l" FSTYPE)
+        mountpoint=$(_pval "$_l" MOUNTPOINT)
         [[ -z "$name" ]] && continue
         _is_block "$name" || continue
         _in_scope "$name" || continue
@@ -392,10 +417,13 @@ wipe_boot_artifacts() {
         mutate rand_write "$name" 0 8        # 32 MiB covers bootloaders + stubs
         mutate wipefs -a "$name"  2>/dev/null || true
         mutate blkdiscard "$name" 2>/dev/null || true
-    done < <(lsblk -lnpo NAME,PARTTYPE,FSTYPE,MOUNTPOINT 2>/dev/null)
+    done < <(lsblk -Ppo NAME,PARTTYPE,FSTYPE,MOUNTPOINT 2>/dev/null)
 
     # 2. BIOS-boot partitions (GRUB core.img on GPT + legacy BIOS).
-    while IFS=$'\t' read -r name parttype; do
+    while IFS= read -r _l; do
+        [[ -z "$_l" ]] && continue
+        name=$(_pval "$_l" NAME)
+        parttype=$(_pval "$_l" PARTTYPE)
         [[ -z "$name" ]] && continue
         _is_block "$name" || continue
         _in_scope "$name" || continue
@@ -404,7 +432,7 @@ wipe_boot_artifacts() {
         drun "boot wipe — overwrite BIOS-boot partition (GRUB core.img) + wipefs: $name"
         mutate rand_write "$name" 0 1
         mutate wipefs -a "$name" 2>/dev/null || true
-    done < <(lsblk -lnpo NAME,PARTTYPE 2>/dev/null)
+    done < <(lsblk -Ppo NAME,PARTTYPE 2>/dev/null)
 
     # NB: the MBR / GPT / boot-gap overwrite of the PARENT disks is deliberately
     # NOT done here — see wipe_parent_tables(), called LAST by wipe_real. Trashing

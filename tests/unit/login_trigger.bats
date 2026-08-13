@@ -33,6 +33,29 @@ teardown() { teardown_stubs; }
     [ -f "$DURESSD_PAM_FILE.duressd.bak" ]     # backup made
 }
 
+@test "install-login-trigger places the hook AFTER pam_unix (expose_authtok needs a set token)" {
+    : > "$DURESSD_CFGDIR/passphrase.luks"
+    cmd_install_login_trigger >/dev/null 2>&1
+    # pam_exec relies on PAM_AUTHTOK, which pam_unix sets when it prompts. If the
+    # hook were prepended (before pam_unix) it would see an EMPTY token and never
+    # fire. Assert pam_unix's line comes strictly before the pam_exec line.
+    local unix_ln exec_ln
+    unix_ln=$(grep -n 'pam_unix.so'  "$DURESSD_PAM_FILE" | head -1 | cut -d: -f1)
+    exec_ln=$(grep -n 'pam_exec.so'  "$DURESSD_PAM_FILE" | head -1 | cut -d: -f1)
+    [ -n "$unix_ln" ] && [ -n "$exec_ln" ]
+    [ "$unix_ln" -lt "$exec_ln" ]
+}
+
+@test "install-login-trigger REFUSES when the PAM file does not exist (no synthesised stack)" {
+    : > "$DURESSD_CFGDIR/passphrase.luks"
+    rm -f "$DURESSD_PAM_FILE"
+    run cmd_install_login_trigger
+    assert_fail
+    assert_output_contains "PAM file not found"
+    # It must NOT create a new (bypassable) single-module stack.
+    [ ! -f "$DURESSD_PAM_FILE" ]
+}
+
 @test "install-login-trigger is idempotent" {
     : > "$DURESSD_CFGDIR/passphrase.luks"
     cmd_install_login_trigger >/dev/null 2>&1

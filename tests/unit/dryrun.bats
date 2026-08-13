@@ -17,10 +17,10 @@ setup() {
     export STUB_LUKS_DEVICES="/dev/sda3"
     export STUB_PKNAME="sda"
     export STUB_SIZE=10485760   # 10 MiB
-    # A Qubes-style GPT for the boot-artifact preview.
-    export STUB_LSBLK_BOOTSCAN="/dev/sda1	${ESP_GUID}	vfat	/boot/efi
-/dev/sda2	${LINUX_GUID}	ext4	/boot
-/dev/sda3	${LUKS_GUID}	crypto_LUKS	"
+    # A Qubes-style GPT for the boot-artifact preview (lsblk -P key="value" form).
+    export STUB_LSBLK_BOOTSCAN="NAME=\"/dev/sda1\" PARTTYPE=\"${ESP_GUID}\" FSTYPE=\"vfat\" MOUNTPOINT=\"/boot/efi\"
+NAME=\"/dev/sda2\" PARTTYPE=\"${LINUX_GUID}\" FSTYPE=\"ext4\" MOUNTPOINT=\"/boot\"
+NAME=\"/dev/sda3\" PARTTYPE=\"${LUKS_GUID}\" FSTYPE=\"crypto_LUKS\" MOUNTPOINT=\"\""
 }
 teardown() { teardown_stubs; }
 
