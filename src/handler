@@ -368,6 +368,9 @@ BIOSBOOT_GUID=21686148-6449-6e6f-744e-656564454649  # BIOS boot (GRUB core.img)
 _pval() {
     local line="$1" key="$2"
     [[ "$line" =~ (^|[[:space:]])"$key"=\"([^\"]*)\" ]] && printf '%s' "${BASH_REMATCH[2]}"
+    # ALWAYS succeed: a parse miss must never fail `name=$(_pval …)` under set -e
+    # and abort a committed wipe. Absent key → empty string, handled by callers.
+    return 0
 }
 
 # Phase 1.5 — optional (WIPE_BOOT_ARTIFACTS=true).
