@@ -1,5 +1,8 @@
 #!/usr/bin/env bats
 # Unit tests for wipe_boot_artifacts — ESP/boot/BIOS-boot/MBR targeting.
+# Fixtures use lsblk's -P (key="value") format — the same empty-safe format the
+# handler parses, and what real lsblk emits (its -o columns are space-padded, not
+# tab-delimited, so a tab-based fixture would not exercise the real parse path).
 
 load '../lib/common'
 
@@ -12,10 +15,10 @@ setup() {
     setup_stubs
     load_handler
     # A Qubes-style GPT: ESP + ext4 /boot + LUKS root, plus a BIOS-boot part.
-    export STUB_LSBLK_BOOTSCAN="/dev/sda1	${ESP_GUID}	vfat	/boot/efi
-/dev/sda2	${LINUX_GUID}	ext4	/boot
-/dev/sda3	${LUKS_GUID}	crypto_LUKS	"
-    export STUB_LSBLK_PARTTYPE="/dev/sda4	${BIOSBOOT_GUID}"
+    export STUB_LSBLK_BOOTSCAN="NAME=\"/dev/sda1\" PARTTYPE=\"${ESP_GUID}\" FSTYPE=\"vfat\" MOUNTPOINT=\"/boot/efi\"
+NAME=\"/dev/sda2\" PARTTYPE=\"${LINUX_GUID}\" FSTYPE=\"ext4\" MOUNTPOINT=\"/boot\"
+NAME=\"/dev/sda3\" PARTTYPE=\"${LUKS_GUID}\" FSTYPE=\"crypto_LUKS\" MOUNTPOINT=\"\""
+    export STUB_LSBLK_PARTTYPE="NAME=\"/dev/sda4\" PARTTYPE=\"${BIOSBOOT_GUID}\""
     export DURESSD_TARGET_DEVICES="/dev/sda /dev/sda1 /dev/sda2 /dev/sda3 /dev/sda4"
 }
 teardown() { teardown_stubs; }
