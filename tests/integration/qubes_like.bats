@@ -4,6 +4,8 @@
 
 load 'helpers'
 
+ESP_GUID="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"   # EFI System Partition type GUID
+
 setup()    { int_setup; }
 teardown() { int_teardown; }
 
@@ -34,9 +36,10 @@ EOF
     # shellcheck disable=SC2086
     assert_safe_targets $loop $esp $boot $root
 
-    # mkfs.vfat + luksFormat above trigger a udev re-scan; wait for it to settle so
-    # `lsblk PARTTYPE` reliably reports the ESP GUID (else the ESP goes undetected).
-    udevadm settle 2>/dev/null || sleep 0.5
+    # mkfs.vfat + luksFormat above trigger a udev re-scan; block until lsblk really
+    # reports the ESP's PARTTYPE GUID (the column wipe_boot_artifacts keys off), or
+    # the ESP goes undetected and its vfat signature survives the scrub.
+    wait_for_parttype "$esp" "$ESP_GUID"
     wipe_boot_artifacts "$loop"
     phase1_crypto_destruction "$root"
 
