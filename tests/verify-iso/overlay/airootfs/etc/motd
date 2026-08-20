@@ -1,0 +1,28 @@
+
+  ██████╗ ██╗   ██╗██████╗ ███████╗███████╗███████╗██████╗
+  ██╔══██╗██║   ██║██╔══██╗██╔════╝██╔════╝██╔════╝██╔══██╗   live wipe VERIFIER
+  ██║  ██║██║   ██║██████╔╝█████╗  ███████╗███████╗██║  ██║
+  ██████╔╝╚██████╔╝██║  ██║███████╗███████║███████║██████╔╝
+
+  You are root on a live Arch environment. Nothing here touches any disk
+  unless you tell it to — the verifier is READ-ONLY.
+
+  1) WiFi (interactive):   nmtui
+        or one-shot:       nmcli device wifi connect "SSID" password "PASSWORD"
+
+  2) Find the wiped disk BY MODEL/SIZE (device letters vary):
+        lsblk -o NAME,SIZE,MODEL,SERIAL
+
+  3) Verify it (repo is baked in at /root/Duressd):
+        duressd-verify /dev/sdX
+        # equivalent to:
+        # bash /root/Duressd/tests/physical/verify-wipe.sh /dev/sdX --scenario sdboot-luks
+
+     Add  --baseline /path/to/baseline-dir  for the NVRAM/TPM comparison rows.
+
+  Proof the ESP/boot scrub worked:
+     no-boot-fs   -> ESP vfat signature GONE
+     marker-absent-> /boot marker GONE from raw sectors (byte-scrubbed)
+
+  4) Reboot check: power-cycle with ONLY the wiped disk attached -> must NOT boot.
+

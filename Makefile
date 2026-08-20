@@ -9,6 +9,7 @@
 #   make vm-auto       same, fully headless (no window/typing) — qemu + ISO=
 #   make vm-shell      interactive VM shell in THIS terminal (paste works)
 #   make iso           build a self-testing duressd ISO — needs sudo + archiso
+#   make verify-iso    build a live wipe-VERIFIER ISO (nmtui + repo baked in) — sudo + archiso
 #   make golden        build the bootable LUKS-at-boot golden image — sudo
 #   make golden-test   boot test: duress passphrase → wipe → won't boot — sudo
 #   make vm-golden     golden boot test INSIDE the VM (host untouched) — qemu + ISO=
@@ -31,9 +32,11 @@ SHELL_SOURCES := src/handler src/daemon src/cli install.sh \
                  tests/e2e/build-luks-duress.sh tests/e2e/luks-duress-test.sh \
                  tests/vm/golden-vm.sh tests/vm/golden-inside.sh \
                  tests/physical/self-test.sh tests/physical/baseline.sh \
-                 tests/physical/verify-wipe.sh tests/physical/build-laptop-image.sh
+                 tests/physical/verify-wipe.sh tests/physical/build-laptop-image.sh \
+                 tests/verify-iso/build.sh \
+                 tests/verify-iso/overlay/airootfs/usr/local/bin/duressd-verify
 
-.PHONY: help lint unit test integration e2e vm vm-auto vm-shell iso golden golden-test vm-golden phys-selftest test-all
+.PHONY: help lint unit test integration e2e vm vm-auto vm-shell iso verify-iso golden golden-test vm-golden phys-selftest test-all
 
 help:
 	@sed -n '3,19p' $(MAKEFILE_LIST) | sed 's/^# \{0,1\}//'
@@ -79,6 +82,12 @@ iso:
 	  echo "building the ISO needs root — re-running under sudo"; \
 	  sudo bash tests/iso/build.sh; \
 	else bash tests/iso/build.sh; fi
+
+verify-iso:
+	@if [[ $$EUID -ne 0 ]]; then \
+	  echo "building the verifier ISO needs root — re-running under sudo"; \
+	  sudo bash tests/verify-iso/build.sh; \
+	else bash tests/verify-iso/build.sh; fi
 
 golden:
 	@if [[ $$EUID -ne 0 ]]; then sudo bash tests/e2e/build-luks-duress.sh; \

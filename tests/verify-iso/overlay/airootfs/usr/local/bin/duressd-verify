@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Convenience wrapper for the live verifier ISO: run the read-only wipe verifier
+# against a chosen disk. The repo is baked into /root/Duressd.
+#
+#   duressd-verify /dev/sdX [extra verify-wipe.sh args...]
+#   duressd-verify                       # lists disks, prompts for the target
+#
+# SCENARIO env overrides the report label (default: sdboot-luks).
+set -euo pipefail
+
+REPO=/root/Duressd
+VERIFY="$REPO/tests/physical/verify-wipe.sh"
+[[ -f "$VERIFY" ]] || { echo "verify-wipe.sh not found at $VERIFY" >&2; exit 1; }
+
+echo "Disks on this machine:"
+lsblk -dno NAME,SIZE,MODEL,SERIAL | sed 's/^/  /'
+echo
+
+disk="${1:-}"
+if [[ -n "$disk" ]]; then shift; else
+    read -rp "Disk to verify (e.g. /dev/sda): " disk
+fi
+[[ -b "$disk" ]] || { echo "not a block device: $disk" >&2; exit 1; }
+
+echo ">> verifying $disk (read-only)…"
+exec bash "$VERIFY" "$disk" --scenario "${SCENARIO:-sdboot-luks}" "$@"
