@@ -42,7 +42,10 @@ declare -a ROWS=()
 PASS=0; WARN=0; FAILN=0
 record() {  # record <PASS|WARN|FAIL> <check> <detail>
     ROWS+=("$1"$'\t'"$2"$'\t'"$3")
-    case "$1" in PASS) ((PASS++)) ;; WARN) ((WARN++)) ;; FAIL) ((FAILN++)) ;; esac
+    # NB: assignment form, not ((PASS++)) — post-increment returns the OLD value,
+    # which is 0 on the first PASS, i.e. exit status 1, and `set -e` would abort
+    # the whole verifier before it prints a single row.
+    case "$1" in PASS) PASS=$((PASS+1)) ;; WARN) WARN=$((WARN+1)) ;; FAIL) FAILN=$((FAILN+1)) ;; esac
 }
 
 parts_of() {  # echo partition device nodes of DISK, if any survived

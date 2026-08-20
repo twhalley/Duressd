@@ -30,6 +30,18 @@ teardown() { teardown_stubs; }
     stub_called_with blkdiscard "/dev/sda1"
 }
 
+@test "boot-artifact scrub sizes the overwrite to the WHOLE partition, not a 32 MiB head" {
+    # Regression for a gap a PHYSICAL test caught: a head-only (32 MiB) scrub left
+    # a /boot marker recoverable at ~116 MiB because blkdiscard is non-
+    # deterministic on USB. The rand_write must cover the full partition size.
+    # 128 MiB ESP => 32 × 4 MiB blocks (count=32), not the old fixed count=8.
+    export STUB_SIZE=134217728        # 128 MiB, reported for every partition
+    run wipe_boot_artifacts /dev/sda
+    assert_ok
+    stub_called_with dd "of=/dev/sda1 bs=4M seek=0 count=32"    # full ESP overwrite
+    stub_called_with dd "of=/dev/sda2 bs=4M seek=0 count=32"    # full /boot overwrite
+}
+
 @test "unencrypted /boot partition is wiped" {
     run wipe_boot_artifacts /dev/sda
     assert_ok
