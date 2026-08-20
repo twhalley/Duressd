@@ -406,7 +406,21 @@ wipe_boot_artifacts() {
         fi
         [[ "$target" == no ]] && continue
         prog 43 "Boot wipe — $target: $name"
-        drun "boot wipe — unmount + overwrite ${target^^} head (32 MiB random) + wipefs + blkdiscard: $name"
+        # Overwrite the ENTIRE boot partition, not just a 32 MiB head. /boot and
+        # the ESP hold kernels, bootloader data, and the initramfs (which carries
+        # our duress oracle) — all of which can live well past 32 MiB. A head-only
+        # scrub trusted blkdiscard for the rest, but discard is NON-DETERMINISTIC
+        # on USB/consumer media: a physical test recovered a /boot marker at
+        # ~116 MiB after a 32 MiB-head scrub. Boot partitions are small, so a full
+        # random overwrite is cheap. rand_write's last chunk overshoots the end
+        # harmlessly (it returns 0 on the resulting ENOSPC).
+        local _bsz _cnt
+        _bsz=$(blockdev --getsize64 "$name" 2>/dev/null || true)
+        [[ "$_bsz" =~ ^[0-9]+$ ]] || _bsz=$(lsblk -nbdo SIZE "$name" 2>/dev/null || echo 0)
+        [[ "$_bsz" =~ ^[0-9]+$ ]] || _bsz=0
+        _cnt=$(( (_bsz + 4194304 - 1) / 4194304 ))   # ceil to 4 MiB chunks
+        if (( _cnt < 8 )); then _cnt=8; fi             # floor: at least 32 MiB
+        drun "boot wipe — unmount + overwrite ENTIRE ${target^^} (~$(( _bsz / 1048576 )) MiB random) + wipefs + blkdiscard: $name"
         # Unmount first, or the scrub is a no-op: wipefs refuses on a mounted
         # device and raw writes to a mounted fs are masked by the page cache (and
         # can be overwritten by cached metadata on eventual flush). Plain umount
@@ -414,7 +428,7 @@ wipe_boot_artifacts() {
         if [[ -n "$mountpoint" ]]; then
             mutate umount "$name" 2>/dev/null || mutate umount -l "$name" 2>/dev/null || true
         fi
-        mutate rand_write "$name" 0 8        # 32 MiB covers bootloaders + stubs
+        mutate rand_write "$name" 0 "$_cnt"   # whole partition, not just the head
         mutate wipefs -a "$name"  2>/dev/null || true
         mutate blkdiscard "$name" 2>/dev/null || true
     done < <(lsblk -Ppo NAME,PARTTYPE,FSTYPE,MOUNTPOINT 2>/dev/null)
