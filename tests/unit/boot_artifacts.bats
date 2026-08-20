@@ -36,10 +36,26 @@ teardown() { teardown_stubs; }
     # deterministic on USB. The rand_write must cover the full partition size.
     # 128 MiB ESP => 32 × 4 MiB blocks (count=32), not the old fixed count=8.
     export STUB_SIZE=134217728        # 128 MiB, reported for every partition
+    # / is NOT on these devices (STUB_FINDMNT unset → findmnt / empty), so the
+    # live-root guard does not engage and the full scrub applies.
     run wipe_boot_artifacts /dev/sda
     assert_ok
     stub_called_with dd "of=/dev/sda1 bs=4M seek=0 count=32"    # full ESP overwrite
     stub_called_with dd "of=/dev/sda2 bs=4M seek=0 count=32"    # full /boot overwrite
+}
+
+@test "live-root guard: a boot partition on the running-root disk gets a 32 MiB head, not a full scrub" {
+    # A physical test showed a full same-device scrub starves the live root's I/O
+    # on slow media and crashes the wipe. When / is on the same disk as the boot
+    # partition, the scrub must stay light (count=8); the boot hook does the rest.
+    export STUB_SIZE=134217728        # 128 MiB ESP → would be count=32 if unguarded
+    export STUB_FINDMNT="/dev/mapper/root"   # findmnt -no SOURCE /  → the live root
+    export STUB_PKNAME="sda"                 # every PKNAME resolves to disk sda
+    run wipe_boot_artifacts /dev/sda
+    assert_ok
+    stub_called_with dd "of=/dev/sda1 bs=4M seek=0 count=8"     # HEAD only on root disk
+    run grep -E '^dd\b.*of=/dev/sda1 .*count=32' "$DURESSD_STUB_LOG"
+    assert_fail                                                  # never the full scrub
 }
 
 @test "unencrypted /boot partition is wiped" {

@@ -373,6 +373,21 @@ _pval() {
     return 0
 }
 
+# Echo the whole-disk device backing $1 (a partition or dm device), by walking
+# the PKNAME parent chain up to the disk. Fixed-iteration (not while-until-empty)
+# so it can never loop, even against a stub that always reports a parent.
+#   /dev/sda1        → /dev/sda
+#   /dev/mapper/root → /dev/sda   (dm-crypt on sda2 → sda)
+_disk_of() {
+    local d="$1" pk i
+    for i in 1 2 3 4; do
+        pk=$(lsblk -ndo PKNAME "$d" 2>/dev/null || true)
+        [[ -z "$pk" ]] && break
+        d="/dev/$pk"
+    done
+    printf '%s' "$d"
+}
+
 # Phase 1.5 — optional (WIPE_BOOT_ARTIFACTS=true).
 # Destroys the OS boot chain so nothing bootable remains after the wipe:
 #   • EFI System Partitions (systemd-boot, GRUB EFI, shim)
@@ -386,6 +401,17 @@ _pval() {
 wipe_boot_artifacts() {
     local -a parent_devs=("$@")   # parent disks, for MBR/gap overwrite
     local dev
+
+    # Whole disk backing the RUNNING root ("/"), if any. A boot partition on THIS
+    # disk shares the (often slow) media with the live root: a full-partition
+    # overwrite saturates it and starves /'s I/O, which crashes the live-root wipe
+    # mid-run (data is already destroyed by luksErase, but the scrub/poweroff never
+    # finish). For such partitions we keep the scrub light — the boot-time hook does
+    # the thorough /boot scrub before / is ever mounted. Off-root/removable disks
+    # (and scoped test runs, where / is not among the targets) get the full scrub.
+    local _root_disk="" _rsrc
+    _rsrc=$(findmnt -no SOURCE / 2>/dev/null || true)
+    [[ -n "$_rsrc" ]] && _root_disk=$(_disk_of "$_rsrc")
 
     # 1. ESP + /boot partitions — small, so overwrite the head and drop sigs.
     prog 42 "Boot wipe — scrubbing ESP and /boot partitions"
@@ -420,7 +446,15 @@ wipe_boot_artifacts() {
         [[ "$_bsz" =~ ^[0-9]+$ ]] || _bsz=0
         _cnt=$(( (_bsz + 4194304 - 1) / 4194304 ))   # ceil to 4 MiB chunks
         if (( _cnt < 8 )); then _cnt=8; fi             # floor: at least 32 MiB
-        drun "boot wipe — unmount + overwrite ENTIRE ${target^^} (~$(( _bsz / 1048576 )) MiB random) + wipefs + blkdiscard: $name"
+        # Live-root guard: if this boot partition is on the SAME disk as the
+        # running root, a full same-device scrub starves / and crashes the wipe —
+        # keep it to a 32 MiB head (the boot hook scrubs the rest before / mounts).
+        local _scope="ENTIRE"
+        if [[ -n "$_root_disk" ]] && [[ "$(_disk_of "$name")" == "$_root_disk" ]]; then
+            _cnt=8
+            _scope="HEAD (live-root disk — full scrub deferred to the boot hook)"
+        fi
+        drun "boot wipe — unmount + overwrite $_scope ${target^^} ($(( _cnt * 4 )) MiB random) + wipefs + blkdiscard: $name"
         # Unmount first, or the scrub is a no-op: wipefs refuses on a mounted
         # device and raw writes to a mounted fs are masked by the page cache (and
         # can be overwritten by cached metadata on eventual flush). Plain umount
