@@ -121,7 +121,10 @@ echo "  →  filesystems + LUKS root"
 mkfs.vfat -F32 "$ESP" >/dev/null
 printf '%s' "$LUKS_PASS" | cryptsetup luksFormat --type luks2 --batch-mode --key-file=- "$ROOTP"
 printf '%s' "$LUKS_PASS" | cryptsetup open --key-file=- "$ROOTP" "$MAPNAME"
-mkfs.ext4 -q "/dev/mapper/$MAPNAME"
+# -F: force. A freshly-opened LUKS mapper decrypts its blank area to random bytes
+# that libblkid misreads as a stray filesystem signature, so mkfs would otherwise
+# stop with an interactive "Proceed anyway? (y,N)" prompt.
+mkfs.ext4 -qF "/dev/mapper/$MAPNAME"
 
 mount "/dev/mapper/$MAPNAME" "$MNT"
 mkdir -p "$MNT"/boot
