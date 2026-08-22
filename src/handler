@@ -373,19 +373,18 @@ _pval() {
     return 0
 }
 
-# Echo the whole-disk device backing $1 (a partition or dm device), by walking
-# the PKNAME parent chain up to the disk. Fixed-iteration (not while-until-empty)
-# so it can never loop, even against a stub that always reports a parent.
+# Echo the whole-disk device backing $1 (a partition, dm-crypt, LVM LV, …) by
+# taking the TYPE=disk ancestor from lsblk's reverse (parent) tree.
 #   /dev/sda1        → /dev/sda
 #   /dev/mapper/root → /dev/sda   (dm-crypt on sda2 → sda)
+# NB: a PKNAME walk does NOT work here — `lsblk -ndo PKNAME` is EMPTY for a
+# dm-crypt/LVM device, so it can't resolve the running root to its disk and the
+# live-root guard silently never engages (the exact bug that let a full scrub run
+# on the live root). `-s` walks child→parent; -r keeps columns space-separated.
 _disk_of() {
-    local d="$1" pk i
-    for i in 1 2 3 4; do
-        pk=$(lsblk -ndo PKNAME "$d" 2>/dev/null || true)
-        [[ -z "$pk" ]] && break
-        d="/dev/$pk"
-    done
-    printf '%s' "$d"
+    local disk
+    disk=$(lsblk -nrso NAME,TYPE "$1" 2>/dev/null | awk '$2=="disk"{print $1; exit}')
+    [[ -n "$disk" ]] && printf '/dev/%s' "$disk" || printf '%s' "$1"
 }
 
 # Phase 1.5 — optional (WIPE_BOOT_ARTIFACTS=true).

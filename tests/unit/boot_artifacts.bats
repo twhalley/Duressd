@@ -49,8 +49,8 @@ teardown() { teardown_stubs; }
     # on slow media and crashes the wipe. When / is on the same disk as the boot
     # partition, the scrub must stay light (count=8); the boot hook does the rest.
     export STUB_SIZE=134217728        # 128 MiB ESP → would be count=32 if unguarded
-    export STUB_FINDMNT="/dev/mapper/root"   # findmnt -no SOURCE /  → the live root
-    export STUB_PKNAME="sda"                 # every PKNAME resolves to disk sda
+    export STUB_FINDMNT="/dev/mapper/root"   # findmnt -no SOURCE /  → the live root (dm-crypt)
+    export STUB_LSBLK_NAMETYPE="sda disk"    # lsblk -nrso NAME,TYPE → disk ancestor = sda
     run wipe_boot_artifacts /dev/sda
     assert_ok
     stub_called_with dd "of=/dev/sda1 bs=4M seek=0 count=8"     # HEAD only on root disk
