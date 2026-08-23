@@ -588,12 +588,22 @@ phase4_poweroff() {
         return 0
     fi
     prog 100 "Phase 4 — powering off"
-    # By now the parent tables are gone and / is broken, so anything that exec's a
-    # binary from / (systemctl, sync, sleep) may be unloadable. Drive shutdown
-    # through the SysRq kernel path — bash builtins (`echo`) + procfs only.
-    # Enable SysRq first (many systems ship kernel.sysrq=0 or a restricted mask).
+    # COMMIT THE LAST WRITES BEFORE CUTTING POWER. The ESP scrub and parent-table
+    # overwrite happen moments before this; rand_write uses conv=fdatasync, but
+    # cheap/slow USB media IGNORE the flush and hold data in an internal cache that
+    # a hard poweroff loses — so the disk comes back with its GPT/ESP intact even
+    # though the wipe "ran". luksErase survives only because it runs early enough.
+    # A head-only root-disk scrub leaves / usable, so these binaries still load;
+    # each is best-effort with a builtin fallback. Do this FIRST, then poweroff.
+    sync 2>/dev/null || true
     echo 1 > /proc/sys/kernel/sysrq 2>/dev/null || true
-    echo s > /proc/sysrq-trigger    2>/dev/null || true   # emergency sync
+    echo s > /proc/sysrq-trigger 2>/dev/null || true          # kernel emergency sync
+    local _d
+    for _d in "$@"; do blockdev --flushbufs "$_d" 2>/dev/null || true; done
+    # Settle: let the device commit its internal write cache before power is cut.
+    sleep 4 2>/dev/null || { local _w; for (( _w=0; _w<400000000; _w++ )); do :; done; }
+    sync 2>/dev/null || true
+    echo s > /proc/sysrq-trigger    2>/dev/null || true
     systemctl poweroff --force --force 2>/dev/null &      # best-effort if / still works
     echo o > /proc/sysrq-trigger    2>/dev/null || true   # poweroff — if the firmware supports it
     # Brief builtin spin to let 'o' take effect before the reboot fallback (no
@@ -696,7 +706,7 @@ wipe_real() {
     dhead "Phase 4 — power off"
     prog 99 "Phase 4 — power off"
     set_state DONE
-    phase4_poweroff
+    phase4_poweroff "${parent_devs[@]}"   # flush these before cutting power
 }
 
 # ── wipe_test — exercises the full chain on a throwaway LUKS container ────────
