@@ -55,7 +55,25 @@ teardown() { teardown_stubs; }
     assert_ok
     stub_called_with dd "of=/dev/sda1 bs=4M seek=0 count=8"     # HEAD only on root disk
     run grep -E '^dd\b.*of=/dev/sda1 .*count=32' "$DURESSD_STUB_LOG"
-    assert_fail                                                  # never the full scrub
+    assert_fail                                                  # never the full scrub HERE
+}
+
+@test "finishing scrub: the deferred live-root ESP gets a FULL overwrite last" {
+    export STUB_SIZE=134217728        # 128 MiB
+    export STUB_FINDMNT="/dev/mapper/root"
+    export STUB_LSBLK_NAMETYPE="sda disk"
+    # Call directly (not via `run`) so _DEFERRED_BOOT_SCRUB persists across the two.
+    wipe_boot_artifacts /dev/sda >/dev/null 2>&1
+    [ "${#_DEFERRED_BOOT_SCRUB[@]}" -ge 1 ]                     # sda1 was recorded for deferral
+    finish_boot_scrub >/dev/null 2>&1
+    stub_called_with dd "of=/dev/sda1 bs=4M seek=0 count=32"    # now the FULL overwrite
+}
+
+@test "finishing scrub is a no-op when nothing was deferred (off-root disks)" {
+    _DEFERRED_BOOT_SCRUB=()
+    run finish_boot_scrub
+    assert_ok
+    stub_not_called dd
 }
 
 @test "unencrypted /boot partition is wiped" {

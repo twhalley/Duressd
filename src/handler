@@ -387,6 +387,33 @@ _disk_of() {
     [[ -n "$disk" ]] && printf '/dev/%s' "$disk" || printf '%s' "$1"
 }
 
+# Boot partitions on the running-root disk whose Phase-1.5 scrub was capped to a
+# 32 MiB head (see the live-root guard). finish_boot_scrub() overwrites them in
+# FULL as the very last destructive step. wipe_real resets this per run.
+_DEFERRED_BOOT_SCRUB=()
+
+# Full-overwrite the deferred boot partitions. Runs LAST — after luksErase, the
+# GPT destroy and the TPM clear — so that if this sustained same-disk write finally
+# starves the running root, the essential wipe is already done and nothing further
+# needs /. openssl+dd for each partition are exec'd while / is still healthy and
+# then run from memory, so the overwrite completes even if / stalls; phase4 flushes
+# it to the media before power is cut.
+finish_boot_scrub() {
+    (( ${#_DEFERRED_BOOT_SCRUB[@]} )) || return 0
+    prog 98 "Finishing — full overwrite of boot partition(s) on the root disk"
+    local name bsz cnt
+    for name in "${_DEFERRED_BOOT_SCRUB[@]}"; do
+        _is_block "$name" || continue
+        bsz=$(blockdev --getsize64 "$name" 2>/dev/null || true)
+        [[ "$bsz" =~ ^[0-9]+$ ]] || bsz=$(lsblk -nbdo SIZE "$name" 2>/dev/null || echo 0)
+        [[ "$bsz" =~ ^[0-9]+$ ]] || bsz=0
+        cnt=$(( (bsz + 4194304 - 1) / 4194304 ))
+        (( cnt < 1 )) && cnt=1
+        drun "finishing scrub — overwrite ENTIRE $name (~$(( bsz / 1048576 )) MiB random)"
+        mutate rand_write "$name" 0 "$cnt"
+    done
+}
+
 # Phase 1.5 — optional (WIPE_BOOT_ARTIFACTS=true).
 # Destroys the OS boot chain so nothing bootable remains after the wipe:
 #   • EFI System Partitions (systemd-boot, GRUB EFI, shim)
@@ -446,12 +473,16 @@ wipe_boot_artifacts() {
         _cnt=$(( (_bsz + 4194304 - 1) / 4194304 ))   # ceil to 4 MiB chunks
         if (( _cnt < 8 )); then _cnt=8; fi             # floor: at least 32 MiB
         # Live-root guard: if this boot partition is on the SAME disk as the
-        # running root, a full same-device scrub starves / and crashes the wipe —
-        # keep it to a 32 MiB head (the boot hook scrubs the rest before / mounts).
+        # running root, a full same-device scrub HERE starves / (a sustained write
+        # to /boot competes with /'s I/O on one slow USB) and crashes the wipe
+        # mid-run. So cap this pass to a 32 MiB head and DEFER the full overwrite to
+        # finish_boot_scrub(), which runs LAST — after luksErase, the GPT destroy
+        # and the TPM clear — where a stalled / no longer matters.
         local _scope="ENTIRE"
         if [[ -n "$_root_disk" ]] && [[ "$(_disk_of "$name")" == "$_root_disk" ]]; then
             _cnt=8
-            _scope="HEAD (live-root disk — full scrub deferred to the boot hook)"
+            _scope="HEAD (live-root disk — full scrub deferred to the finishing pass)"
+            _DEFERRED_BOOT_SCRUB+=("$name")
         fi
         drun "boot wipe — unmount + overwrite $_scope ${target^^} ($(( _cnt * 4 )) MiB random) + wipefs + blkdiscard: $name"
         # Unmount first, or the scrub is a no-op: wipefs refuses on a mounted
@@ -619,6 +650,7 @@ phase4_poweroff() {
 # ── wipe_real ─────────────────────────────────────────────────────────────────
 wipe_real() {
     set_state WIPING
+    _DEFERRED_BOOT_SCRUB=()   # reset the deferred full-scrub list for this run
 
     dhead "Discovery — real scan of this system's block devices"
 
@@ -696,11 +728,14 @@ wipe_real() {
         plan_skip "disabled (WIPE_FULL_DEVICE=false)"
     fi
 
-    # LAST destructive step — overwrite the parent-disk tables. This breaks the
-    # running root, so it must come after every phase that needs a live / and
-    # working binaries. After this, only bash builtins + procfs are reliable.
+    # LAST destructive steps — overwrite the parent-disk tables, then finish the
+    # full scrub of any boot partition on the running-root disk that Phase 1.5 only
+    # head-scrubbed. Both break/stall the running root, so they come after every
+    # phase that needs a live / and working binaries. After this, only bash
+    # builtins + procfs are reliable.
     if [[ "${WIPE_BOOT_ARTIFACTS:-false}" == true ]]; then
         wipe_parent_tables "${parent_devs[@]}"
+        finish_boot_scrub   # full /boot overwrite, dead last (see the function)
     fi
 
     dhead "Phase 4 — power off"
