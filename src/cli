@@ -653,14 +653,19 @@ _sshd_password_auth() {
         v="$(sshd -T 2>/dev/null | awk '/^passwordauthentication /{print $2}')"
     fi
     if [[ -z "$v" ]]; then
+        # Config paths overridable so this (the remote-wipe safety guard) is
+        # testable; in production they resolve to the real sshd config.
+        local main_cfg="${DURESSD_SSHD_CONFIG:-/etc/ssh/sshd_config}"
+        local cfg_d="${DURESSD_SSHD_CONFIG_D:-/etc/ssh/sshd_config.d}"
         local f m
-        for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
+        for f in "$main_cfg" "$cfg_d"/*.conf; do
             [[ -r "$f" ]] || continue
             m="$(grep -iE '^[[:space:]]*PasswordAuthentication[[:space:]]' "$f" 2>/dev/null \
                  | tail -1 | awk '{print tolower($2)}')"
             [[ -n "$m" ]] && v="$m"
         done
     fi
+    # Fail SAFE: unknown → assume password auth is ON (the guard then refuses).
     printf '%s' "${v:-yes}"
 }
 

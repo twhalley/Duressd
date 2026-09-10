@@ -280,6 +280,17 @@ cmd_install() {
 }
 
 # ── uninstall ─────────────────────────────────────────────────────────────────
+# Securely destroy the Argon2id duress oracle in <cfgdir>: erase the LUKS keyslots
+# (so the KDF material is gone even if the file is later recovered) then shred the
+# file. Best-effort — a missing tool must not abort uninstall.
+secure_erase_oracle() {
+    local cfgdir="$1" oracle="$1/passphrase.luks"
+    [[ -f "$oracle" ]] || return 0
+    step "Erasing Argon2id keyslot container"
+    cryptsetup luksErase --batch-mode "$oracle" 2>/dev/null || true
+    shred -u "$oracle" 2>/dev/null || rm -f "$oracle"
+}
+
 cmd_uninstall() {
     require_root
 
@@ -304,12 +315,7 @@ cmd_uninstall() {
         warn "Configuration directory $CFGDIR/ still exists."
         read -rp "  Remove $CFGDIR/ (including any stored passphrase hash)? [y/N]: " ans
         if [[ "$ans" =~ ^[Yy]$ ]]; then
-            # Securely erase the Argon2id keyslot container before deleting
-            if [[ -f "$CFGDIR/passphrase.luks" ]]; then
-                step "Erasing Argon2id keyslot container"
-                cryptsetup luksErase --batch-mode "$CFGDIR/passphrase.luks" 2>/dev/null || true
-                shred -u "$CFGDIR/passphrase.luks" 2>/dev/null || true
-            fi
+            secure_erase_oracle "$CFGDIR"
             rm -rf "$CFGDIR"
             good "Configuration removed"
         else
@@ -363,6 +369,9 @@ cmd_status() {
 }
 
 # ── main ──────────────────────────────────────────────────────────────────────
+# DURESSD_LIB_ONLY=1 sources this file for its functions without running the
+# dispatch (used by the unit tests).
+if [[ "${DURESSD_LIB_ONLY:-}" != 1 ]]; then
 case "${1:-install}" in
     install)   cmd_install ;;
     uninstall) cmd_uninstall ;;
@@ -372,3 +381,4 @@ case "${1:-install}" in
         exit 1
         ;;
 esac
+fi
