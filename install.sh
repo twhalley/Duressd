@@ -307,7 +307,7 @@ cmd_install() {
 # (so the KDF material is gone even if the file is later recovered) then shred the
 # file. Best-effort — a missing tool must not abort uninstall.
 secure_erase_oracle() {
-    local cfgdir="$1" oracle="$1/passphrase.luks"
+    local oracle="$1/passphrase.luks"
     [[ -f "$oracle" ]] || return 0
     step "Erasing Argon2id keyslot container"
     cryptsetup luksErase --batch-mode "$oracle" 2>/dev/null || true

@@ -518,11 +518,10 @@ _dev_bytes() {
 # 4 MiB (MBR + primary GPT + legacy GRUB gap) and the last 4 MiB (backup GPT).
 # Cheap and layout-agnostic; used wherever a disk's partition table must die.
 wipe_disk_tables() {
-    local dev="$1" bytes seek_mib
+    local dev="$1" bytes
     mutate rand_write "$dev" 0 1        # HEAD: MBR + primary GPT + boot gap
     bytes=$(_dev_bytes "$dev")
     if (( bytes > 8388608 )); then      # >8 MiB → there is a distinct tail to hit
-        seek_mib=$(( bytes / 1048576 - 4 ))
         # TAIL: last 4 MiB (backup GPT). seek_bytes keeps it exact on non-4MiB
         # disks; /dev/urandom is fine for 4 MiB. Always tolerate failure.
         mutate dd if=/dev/urandom of="$dev" bs=1M oflag=seek_bytes \
