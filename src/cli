@@ -564,11 +564,44 @@ cmd_install_luks_trigger() {
     local instdir="${DURESSD_INITCPIO_INSTALL:-/etc/initcpio/install}"
     local hookdir="${DURESSD_INITCPIO_HOOKS:-/etc/initcpio/hooks}"
 
+    # Boot-hook wipe depth (baked into the initramfs by the build hook, which reads
+    # BOOT_WIPE_DEPTH from the config). header = fastest (luksErase + header + tables);
+    # traces = default (also head+tail scrub of every non-encrypted region — all OS
+    # traces gone, fast); full = overwrite the whole disk (slowest).
+    local depth="${DURESSD_BOOT_WIPE_DEPTH:-traces}"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --depth)   depth="${2:-}"; shift 2 ;;
+            --depth=*) depth="${1#*=}"; shift ;;
+            -h|--help) echo "usage: duressd install-luks-trigger [--depth header|traces|full]" >&2; return 0 ;;
+            *)         bad "unknown option: $1"; return 1 ;;
+        esac
+    done
+    case "$depth" in
+        header|traces|full) ;;
+        *) bad "--depth must be header|traces|full"; return 1 ;;
+    esac
+
     section "Install LUKS duress-passphrase trigger (initramfs)"
     [[ -f "$cfgdir/passphrase.luks" ]] || {
         bad "No custom duress passphrase configured."
         info "Run: duressd configure   (choose the 'custom' passphrase type)"; return 1; }
     command -v mkinitcpio >/dev/null || { bad "mkinitcpio not found (Arch initramfs only)"; return 1; }
+
+    # Record the chosen depth in the config so the build hook bakes it into the
+    # initramfs (add or replace the line). Do this BEFORE mkinitcpio runs below.
+    local cfgfile="$cfgdir/config"
+    if [[ -f "$cfgfile" ]]; then
+        if grep -qE '^BOOT_WIPE_DEPTH=' "$cfgfile"; then
+            sed -i -E "s/^BOOT_WIPE_DEPTH=.*/BOOT_WIPE_DEPTH=$depth/" "$cfgfile"
+        else
+            printf 'BOOT_WIPE_DEPTH=%s\n' "$depth" >> "$cfgfile"
+        fi
+    else
+        printf 'BOOT_WIPE_DEPTH=%s\n' "$depth" > "$cfgfile"
+        chmod 0600 "$cfgfile"
+    fi
+    good "Boot wipe depth: ${depth}"
     [[ -f "$src/duress-install-hook" && -f "$src/duress-runtime-hook" ]] \
         || { bad "hook templates not found in $src"; return 1; }
 
@@ -1046,7 +1079,7 @@ ${BLD}Actions:${RST}
 ${BLD}Remote (SSH / automation):${RST}
   ${RED}trigger-remote${RST}          ${RED}Non-interactive wipe${RST} — stdin/\$DURESSD_PASS/--passphrase-file; add ${GRN}--dry-run${RST} to preview
   ${CYN}install-ssh-trigger${RST}     Install an SSH forced-command duress key (remote kill switch)
-  ${CYN}install-luks-trigger${RST}    Install a boot-time LUKS duress-passphrase wipe (initramfs)
+  ${CYN}install-luks-trigger${RST}    Install a boot-time LUKS duress-passphrase wipe (initramfs); ${DIM}--depth header|traces|full${RST}
   ${CYN}install-login-trigger${RST}   Install a PAM login duress-passphrase wipe (refuses if SSH password auth is on; --force to override)
 
 ${BLD}Aliases:${RST}
