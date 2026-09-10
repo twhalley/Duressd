@@ -87,3 +87,37 @@ teardown() { teardown_stubs; }
     assert_fail
     assert_output_contains "must be header|traces|full"
 }
+
+# ── uninstall ─────────────────────────────────────────────────────────────────
+@test "--uninstall removes 'duress' from HOOKS wherever it sits + deletes the hook files" {
+    # duress placed in the MIDDLE (not next to encrypt) — position-independent removal.
+    printf 'HOOKS=(base udev duress autodetect block encrypt filesystems fsck)\n' \
+        > "$DURESSD_MKINITCPIO_CONF"
+    install -Dm755 /dev/null "$DURESSD_INITCPIO_INSTALL/duress"
+    install -Dm755 /dev/null "$DURESSD_INITCPIO_HOOKS/duress"
+    run cmd_install_luks_trigger --uninstall
+    assert_ok
+    # 'duress' gone, the other hooks intact and in order
+    run grep -E '^HOOKS=\(base udev autodetect block encrypt filesystems fsck\)$' "$DURESSD_MKINITCPIO_CONF"
+    assert_ok
+    [ ! -e "$DURESSD_INITCPIO_INSTALL/duress" ]
+    [ ! -e "$DURESSD_INITCPIO_HOOKS/duress" ]
+}
+
+@test "--uninstall is idempotent (no duress in HOOKS → clean no-op)" {
+    printf 'HOOKS=(base udev block encrypt filesystems fsck)\n' > "$DURESSD_MKINITCPIO_CONF"
+    run cmd_install_luks_trigger --uninstall
+    assert_ok
+    assert_output_contains "nothing to remove"
+    run grep -E '^HOOKS=\(base udev block encrypt filesystems fsck\)$' "$DURESSD_MKINITCPIO_CONF"
+    assert_ok                                   # HOOKS line unchanged
+}
+
+@test "install then --uninstall round-trips the HOOKS line back to the original" {
+    printf 'HOOKS=(base udev autodetect modconf block encrypt filesystems fsck)\n' \
+        > "$DURESSD_MKINITCPIO_CONF"
+    orig="$(cat "$DURESSD_MKINITCPIO_CONF")"
+    cmd_install_luks_trigger            >/dev/null 2>&1   # adds duress before encrypt
+    cmd_install_luks_trigger --uninstall >/dev/null 2>&1  # removes it
+    [ "$(cat "$DURESSD_MKINITCPIO_CONF")" = "$orig" ]
+}

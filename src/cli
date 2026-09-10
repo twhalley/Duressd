@@ -479,7 +479,7 @@ TORRC
 #                        ssh -i key root@host
 # --tor  also expose the sshd as a client-authorized v3 onion service.
 cmd_install_ssh_trigger() {
-    local pubkey="" keydir="${HOME:-/root}/.ssh" embed=false tor=false
+    local pubkey="" keydir="${HOME:-/root}/.ssh" embed=false tor=false action=install
     local authkeys="${DURESSD_SSH_AUTHKEYS:-/root/.ssh/authorized_keys}"
     local passfile="${DURESSD_CFGDIR:-/etc/duressd}/ssh-trigger.pass"
     while [[ $# -gt 0 ]]; do
@@ -488,13 +488,46 @@ cmd_install_ssh_trigger() {
             --authorized-keys)   authkeys="$2"; shift 2 ;;
             --embed-passphrase)  embed=true; shift ;;
             --tor)               tor=true; shift ;;
+            --uninstall)         action=uninstall; shift ;;
             -h|--help)
-                echo "usage: duressd install-ssh-trigger [--pubkey FILE] [--embed-passphrase] [--tor]" >&2
-                echo "  --tor  also expose sshd as a client-authorized v3 onion service" >&2
+                echo "usage: duressd install-ssh-trigger [--pubkey FILE] [--embed-passphrase] [--tor] [--uninstall]" >&2
+                echo "  --tor        also expose sshd as a client-authorized v3 onion service" >&2
+                echo "  --uninstall  remove the forced-command key (+ embedded passphrase, + --tor onion)" >&2
                 return 0 ;;
             *) shift ;;
         esac
     done
+
+    # ── uninstall: strip the forced-command entry, secure-erase the passfile ────
+    if [[ "$action" == uninstall ]]; then
+        section "Remove SSH duress trigger"
+        if [[ -f "$authkeys" ]] && grep -qF 'command="duressd trigger-remote' "$authkeys" 2>/dev/null; then
+            cp -a "$authkeys" "$authkeys.duressd.bak"
+            grep -vF 'command="duressd trigger-remote' "$authkeys" > "$authkeys.tmp" \
+                && mv "$authkeys.tmp" "$authkeys"
+            good "Removed the duress forced-command key from $authkeys (backup: $authkeys.duressd.bak)"
+        else
+            info "No duress forced-command entry in $authkeys — nothing to remove there"
+        fi
+        if [[ -f "$passfile" ]]; then
+            shred -u "$passfile" 2>/dev/null || rm -f "$passfile"
+            good "Securely erased embedded passphrase $passfile"
+        fi
+        if [[ "$tor" == true ]]; then
+            local hsdir="${DURESSD_TOR_HSDIR:-/var/lib/tor/duressd_ssh}"
+            local torrc="${DURESSD_TORRC:-/etc/tor/torrc}"
+            if [[ -f "$torrc" ]] && grep -qs '^# duressd SSH duress onion service' "$torrc"; then
+                cp -a "$torrc" "$torrc.duressd.bak"
+                awk '/^# duressd SSH duress onion service/ { skip=3; next } skip>0 { skip--; next } { print }' \
+                    "$torrc" > "$torrc.tmp" && mv "$torrc.tmp" "$torrc"
+                good "Removed the onion-service block from $torrc (backup: $torrc.duressd.bak)"
+            fi
+            rm -rf "$hsdir"
+            good "Removed onion service directory $hsdir"
+        fi
+        warn "If that was your only authorized key, confirm you can still reach this host."
+        return 0
+    fi
 
     section "Install SSH duress trigger"
 
@@ -568,15 +601,49 @@ cmd_install_luks_trigger() {
     # BOOT_WIPE_DEPTH from the config). header = fastest (luksErase + header + tables);
     # traces = default (also head+tail scrub of every non-encrypted region — all OS
     # traces gone, fast); full = overwrite the whole disk (slowest).
-    local depth="${DURESSD_BOOT_WIPE_DEPTH:-traces}"
+    local depth="${DURESSD_BOOT_WIPE_DEPTH:-traces}" action=install
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --depth)   depth="${2:-}"; shift 2 ;;
-            --depth=*) depth="${1#*=}"; shift ;;
-            -h|--help) echo "usage: duressd install-luks-trigger [--depth header|traces|full]" >&2; return 0 ;;
+            --depth)     depth="${2:-}"; shift 2 ;;
+            --depth=*)   depth="${1#*=}"; shift ;;
+            --uninstall) action=uninstall; shift ;;
+            -h|--help) echo "usage: duressd install-luks-trigger [--depth header|traces|full] [--uninstall]" >&2; return 0 ;;
             *)         bad "unknown option: $1"; return 1 ;;
         esac
     done
+
+    # ── uninstall: cleanly remove the boot hook, whatever position it's in ──────
+    if [[ "$action" == uninstall ]]; then
+        section "Remove LUKS duress-passphrase trigger (initramfs)"
+        command -v mkinitcpio >/dev/null || { bad "mkinitcpio not found (Arch initramfs only)"; return 1; }
+        # Drop the standalone 'duress' token from HOOKS=(...) wherever it sits, so
+        # this works regardless of how the operator ordered their hooks.
+        if [[ -f "$mkconf" ]] && grep -qE '^HOOKS=.*[ (]duress[ )]' "$mkconf"; then
+            cp -a "$mkconf" "$mkconf.duressd.bak"
+            awk '
+                /^HOOKS=/ {
+                    inside=$0; sub(/^HOOKS=\(/,"",inside); sub(/\).*/,"",inside)
+                    n=split(inside,a,/[ \t]+/); out=""
+                    for (i=1;i<=n;i++) if (a[i]!="duress" && a[i]!="") out=(out==""?a[i]:out" "a[i])
+                    print "HOOKS=(" out ")"; next
+                }
+                { print }
+            ' "$mkconf" > "$mkconf.tmp" && mv "$mkconf.tmp" "$mkconf"
+            good "Removed 'duress' from $mkconf HOOKS (backup: $mkconf.duressd.bak)"
+        else
+            info "'duress' not present in $mkconf HOOKS — nothing to remove there"
+        fi
+        rm -f "$instdir/duress" "$hookdir/duress"
+        good "Removed initramfs hook files"
+        if [[ -z "${DURESSD_NO_MKINITCPIO:-}" ]]; then
+            info "Regenerating initramfs (mkinitcpio -P) — the duress hook + baked oracle are now gone…"
+            mkinitcpio -P >/dev/null || { bad "mkinitcpio failed — review $mkconf"; return 1; }
+            good "Initramfs regenerated — the boot-time duress trigger is removed."
+        fi
+        warn "TEST normal unlock on the NEXT reboot."
+        return 0
+    fi
+
     case "$depth" in
         header|traces|full) ;;
         *) bad "--depth must be header|traces|full"; return 1 ;;
@@ -670,13 +737,15 @@ _sshd_password_auth() {
 }
 
 cmd_install_login_trigger() {
-    local force=false
+    local force=false action=install
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --force) force=true; shift ;;
+            --uninstall) action=uninstall; shift ;;
             -h|--help)
-                echo "usage: duressd install-login-trigger [--force]" >&2
-                echo "  --force  install even when SSH password auth is on (accepts remote-wipe risk)" >&2
+                echo "usage: duressd install-login-trigger [--force] [--uninstall]" >&2
+                echo "  --force      install even when SSH password auth is on (accepts remote-wipe risk)" >&2
+                echo "  --uninstall  remove the PAM hook line + script" >&2
                 return 0 ;;
             *) shift ;;
         esac
@@ -686,6 +755,22 @@ cmd_install_login_trigger() {
     local pamfile="${DURESSD_PAM_FILE:-/etc/pam.d/system-auth}"
     local src="${DURESSD_PAM_SRC:-/usr/local/lib/duressd}"
     local script="$libdir/pam-duress"
+
+    # ── uninstall: strip the pam_exec line (wherever it is) + the script ────────
+    if [[ "$action" == uninstall ]]; then
+        section "Remove PAM login duress trigger"
+        if [[ -f "$pamfile" ]] && grep -qF "$script" "$pamfile" 2>/dev/null; then
+            cp -a "$pamfile" "$pamfile.duressd.bak"
+            grep -vF "$script" "$pamfile" > "$pamfile.tmp" && mv "$pamfile.tmp" "$pamfile"
+            good "Removed the duress hook line from $pamfile (backup: $pamfile.duressd.bak)"
+        else
+            info "No duress hook line found in $pamfile — nothing to remove there"
+        fi
+        rm -f "$script"
+        good "Removed PAM hook script $script"
+        warn "Verify normal login still works before logging out."
+        return 0
+    fi
 
     section "Install PAM login duress trigger"
     [[ -f "$cfgdir/passphrase.luks" ]] || {
@@ -1083,9 +1168,9 @@ ${BLD}Actions:${RST}
 
 ${BLD}Remote (SSH / automation):${RST}
   ${RED}trigger-remote${RST}          ${RED}Non-interactive wipe${RST} — stdin/\$DURESSD_PASS/--passphrase-file; add ${GRN}--dry-run${RST} to preview
-  ${CYN}install-ssh-trigger${RST}     Install an SSH forced-command duress key (remote kill switch)
-  ${CYN}install-luks-trigger${RST}    Install a boot-time LUKS duress-passphrase wipe (initramfs); ${DIM}--depth header|traces|full${RST}
-  ${CYN}install-login-trigger${RST}   Install a PAM login duress-passphrase wipe (refuses if SSH password auth is on; --force to override)
+  ${CYN}install-ssh-trigger${RST}     Install an SSH forced-command duress key (remote kill switch); ${DIM}--uninstall to remove${RST}
+  ${CYN}install-luks-trigger${RST}    Install a boot-time LUKS duress-passphrase wipe (initramfs); ${DIM}--depth header|traces|full${RST}${DIM}, --uninstall${RST}
+  ${CYN}install-login-trigger${RST}   Install a PAM login duress-passphrase wipe (refuses if SSH password auth is on; --force to override; --uninstall to remove)
 
 ${BLD}Aliases:${RST}
   dwipe_test   →  duressd test

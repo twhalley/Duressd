@@ -319,6 +319,17 @@ cmd_uninstall() {
 
     echo -e "\n${BLD}Uninstalling duressd wipe service${RST}\n"
 
+    # The trigger installers modify system files (initramfs HOOKS, the PAM auth
+    # stack, authorized_keys) that THIS uninstall does not touch. Remove them with
+    # the CLI FIRST — once the binaries below are gone you can't run these:
+    if command -v duressd >/dev/null 2>&1; then
+        warn "If you installed any triggers, remove them BEFORE continuing (the CLI is about to go):"
+        warn "  duressd install-luks-trigger  --uninstall   # boot-time hook (mkinitcpio HOOKS)"
+        warn "  duressd install-login-trigger --uninstall   # PAM auth stack"
+        warn "  duressd install-ssh-trigger   --uninstall   # authorized_keys (+ --tor)"
+        echo >&2
+    fi
+
     step "Stopping and disabling duressd.service"
     systemctl disable --now duressd.service 2>/dev/null || true
 

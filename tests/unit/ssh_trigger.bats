@@ -121,3 +121,38 @@ expect_b64() { printf '%s' "$1" | base64 -w0; }
     [ "$(stat -c %a "$DURESSD_CFGDIR/ssh-trigger.pass")" = "600" ]
     rm -f "$pub"
 }
+
+# ── uninstall ─────────────────────────────────────────────────────────────────
+@test "install then --uninstall removes the forced-command entry, keeps other keys" {
+    pub="$(mktemp)"; echo "ssh-ed25519 AAAAFAKEKEY duressd-test" > "$pub"
+    ak="$DURESSD_TESTROOT/authorized_keys"
+    install -d "$(dirname "$ak")"
+    echo 'ssh-ed25519 AAAANORMALKEY my-laptop' > "$ak"      # a pre-existing normal key
+    cmd_install_ssh_trigger --pubkey "$pub" --authorized-keys "$ak" >/dev/null 2>&1
+    grep -q 'command="duressd trigger-remote' "$ak"          # sanity: added
+    run cmd_install_ssh_trigger --uninstall --authorized-keys "$ak"
+    assert_ok
+    run grep -c 'duressd trigger-remote' "$ak"
+    assert_output_contains "0"                               # forced-command line gone
+    grep -q 'AAAANORMALKEY' "$ak"                            # the normal key survives
+    rm -f "$pub"
+}
+
+@test "ssh --uninstall securely erases the embedded passphrase file" {
+    ak="$DURESSD_TESTROOT/authorized_keys"; : > "$ak"
+    install -d "$DURESSD_CFGDIR"
+    printf 'topsecret' > "$DURESSD_CFGDIR/ssh-trigger.pass"
+    run cmd_install_ssh_trigger --uninstall --authorized-keys "$ak"
+    assert_ok
+    # secure erase: shred -u on the passfile (the stub records but doesn't unlink)
+    stub_called_with shred "-u $DURESSD_CFGDIR/ssh-trigger.pass"
+}
+
+@test "ssh --uninstall is idempotent (no entry → clean no-op)" {
+    ak="$DURESSD_TESTROOT/authorized_keys"
+    echo 'ssh-ed25519 AAAANORMALKEY only-normal' > "$ak"
+    run cmd_install_ssh_trigger --uninstall --authorized-keys "$ak"
+    assert_ok
+    assert_output_contains "nothing to remove"
+    grep -q 'AAAANORMALKEY' "$ak"
+}
