@@ -52,9 +52,18 @@ run_hook() {
             # live-root to starve and cannot hang (the failure mode that stops the
             # runtime path from scrubbing the boot partition it runs from). Resolve
             # the whole parent disk of the LUKS partition via sysfs.
-            local part pdir disk sectors
-            part="${resolved#/dev/}"
-            disk="$resolved"
+            #
+            # CANONICALISE FIRST: $resolved is often a symlink (/dev/disk/by-uuid/…
+            # when cryptdevice=UUID=…). `${resolved#/dev/}` on that yields
+            # "disk/by-uuid/…", which is NOT a /sys/class/block name — the sysfs
+            # lookup then fails and the disk-level writes would hit the PARTITION
+            # instead of the whole disk (leaving the GPT intact). readlink -f gives
+            # the real node (/dev/vda3) so the parent walk works.
+            local real part pdir disk sectors
+            real=$(readlink -f "$resolved" 2>/dev/null)
+            [ -n "$real" ] || real="$resolved"
+            part="${real#/dev/}"
+            disk="$real"
             if [ -f "/sys/class/block/$part/partition" ]; then
                 pdir=$(readlink -f "/sys/class/block/$part" 2>/dev/null)
                 [ -n "$pdir" ] && disk="/dev/$(basename "$(dirname "$pdir")")"
@@ -67,8 +76,8 @@ run_hook() {
             #   • destroy the partition table (primary GPT/MBR at the front + the
             #     backup GPT at the end) → the disk is unpartitioned and unbootable,
             #     and the ESP/boot filesystem superblocks at the front are gone.
-            cryptsetup luksErase --batch-mode "$resolved" >/dev/null 2>&1
-            dd if=/dev/urandom of="$resolved" bs=1M count=32 conv=fsync 2>/dev/null
+            cryptsetup luksErase --batch-mode "$real" >/dev/null 2>&1
+            dd if=/dev/urandom of="$real" bs=1M count=32 conv=fsync 2>/dev/null
             dd if=/dev/urandom of="$disk" bs=1M count=8 conv=fsync 2>/dev/null
             sectors=$(cat "/sys/class/block/$(basename "$disk")/size" 2>/dev/null || echo 0)
             if [ "$sectors" -gt 4096 ] 2>/dev/null; then
