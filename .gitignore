@@ -9,3 +9,17 @@ tests/e2e/images/
 *.iso
 # VM run transcripts (make vm-auto / vm-golden)
 vm-*.log
+
+# ── sensitive physical-test artifacts (NEVER commit) ──────────────────────────
+# Duress SSH keypair (PRIVATE key), built disk images, LUKS header backups, and
+# assorted scratch produced by the physical-test / verifier-ISO builders.
+*.duress-key
+*.duress-key.pub
+*.raw
+*.raw.*
+/.verify-iso-work/
+/baseline-*/
+REC_RECORD
+duress-oracle.luks
+passphrase.luks
+*.nmconnection
