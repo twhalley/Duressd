@@ -28,6 +28,7 @@ SHELL_SOURCES := src/handler src/daemon src/cli install.sh \
                  tests/vm/inside.sh tests/vm/encrypted-e2e.sh tests/vm/tpm-e2e.sh \
                  tests/vm/ssh-e2e.sh tests/vm/tor-e2e.sh tests/vm/pam-e2e.sh \
                  pam/pam-duress \
+                 initramfs/duress-install-hook initramfs/duress-runtime-hook \
                  tests/iso/build.sh tests/iso/overlay/airootfs/usr/local/bin/duressd-selftest \
                  tests/e2e/build-luks-duress.sh tests/e2e/luks-duress-test.sh \
                  tests/vm/golden-vm.sh tests/vm/golden-inside.sh \

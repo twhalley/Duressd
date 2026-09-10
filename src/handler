@@ -488,8 +488,9 @@ wipe_boot_artifacts() {
     # mid-wipe. Deferring it keeps the system alive until just before poweroff.
 
     # 4. UEFI NVRAM boot entries — only on a real EFI system, never under a
-    #    scoped test run (host NVRAM must never be touched by the harness).
-    if [[ -d /sys/firmware/efi ]] && command -v efibootmgr &>/dev/null \
+    #    scoped test run (host NVRAM must never be touched by the harness). The
+    #    EFI dir is overridable (DURESSD_EFI_DIR) so the delete loop is testable.
+    if [[ -d "${DURESSD_EFI_DIR:-/sys/firmware/efi}" ]] && command -v efibootmgr &>/dev/null \
        && [[ -z "${DURESSD_TARGET_DEVICES:-}" ]]; then
         prog 48 "Boot wipe — clearing UEFI NVRAM boot entries"
         local bootnum

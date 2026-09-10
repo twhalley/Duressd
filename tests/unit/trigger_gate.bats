@@ -53,3 +53,17 @@ teardown() { teardown_stubs; }
     assert_output_contains "starting destructive wipe"
     grep -qE '^cryptsetup'$'\t''.*luksErase' "$DURESSD_STUB_LOG"
 }
+
+@test "run_trigger with a countdown emits the abortable window, then wipes" {
+    export STUB_VERIFY_RC=0
+    export STUB_LSBLK_NAME="/dev/sda2" STUB_LUKS_DEVICES="/dev/sda2"
+    export DURESSD_NO_POWEROFF=1
+    sed -i 's/^WIPE_COUNTDOWN=.*/WIPE_COUNTDOWN=3/' "$DURESSD_CFGDIR/config"  # sleep is stubbed
+    argv=( "$(printf '%s' right-pass | base64 -w0)" )
+    run run_trigger
+    assert_output_contains "Countdown"
+    assert_output_contains "Wiping in 3"
+    assert_output_contains "Wiping in 1"
+    assert_output_contains "starting destructive wipe"   # countdown expired → wipe proceeds
+    grep -qE '^cryptsetup'$'\t''.*luksErase' "$DURESSD_STUB_LOG"
+}

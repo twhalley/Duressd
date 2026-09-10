@@ -10,6 +10,32 @@
 # or anything is off, it returns 0 and lets the normal `encrypt` hook handle the
 # unlock — so a misconfiguration can never make the system unbootable.
 
+# Depth-selected wipe of the NON-encrypted regions, run AFTER the fast decisive
+# part (luksErase + header + partition tables). Args: <disk> <depth> <pstart>
+# <psize> (pstart/psize = the LUKS partition's start+size in 512-byte sectors).
+#   header — nothing more (fast part already made data unrecoverable + unbootable)
+#   full   — overwrite the ENTIRE disk
+#   traces — HEAD [0..LUKS start) + TAIL [LUKS end..disk end); full if geometry unknown
+# Extracted so all three branches are unit-testable (the boot prompt can't be).
+_duress_depth_wipe() {
+    local disk="$1" depth="$2" pstart="$3" psize="$4"
+    case "$depth" in
+        header|fast|quick) : ;;                        # nothing more
+        full|entire|nuke)
+            dd if=/dev/urandom of="$disk" bs=4M conv=fsync 2>/dev/null ;;
+        *)  # traces (default): dynamic HEAD + TAIL
+            if [ "$pstart" -gt 0 ] 2>/dev/null && [ "$psize" -gt 0 ] 2>/dev/null; then
+                # HEAD: [0 .. LUKS start) — GPT + ESP + /boot + anything before.
+                dd if=/dev/urandom of="$disk" bs=1M count=$(( pstart / 2048 + 1 )) conv=fsync 2>/dev/null
+                # TAIL: [LUKS end .. disk end) — trailing gap + backup GPT.
+                dd if=/dev/urandom of="$disk" bs=1M seek=$(( (pstart + psize) / 2048 )) conv=fsync 2>/dev/null
+            else
+                # geometry unknown → full overwrite is the safe superset
+                dd if=/dev/urandom of="$disk" bs=4M conv=fsync 2>/dev/null
+            fi ;;
+    esac
+}
+
 run_hook() {
     [ -f /duress-oracle.luks ] || return 0
     [ -n "$cryptdevice" ]      || return 0
@@ -109,21 +135,7 @@ run_hook() {
             depth="traces"
             [ -f /duress-wipe-depth ] && read -r depth < /duress-wipe-depth 2>/dev/null
             [ -n "$depth" ] || depth="traces"
-            case "$depth" in
-                header|fast|quick) : ;;                        # nothing more
-                full|entire|nuke)
-                    dd if=/dev/urandom of="$disk" bs=4M conv=fsync 2>/dev/null ;;
-                *)  # traces (default): dynamic HEAD + TAIL
-                    if [ "$pstart" -gt 0 ] 2>/dev/null && [ "$psize" -gt 0 ] 2>/dev/null; then
-                        # HEAD: [0 .. LUKS start) — GPT + ESP + /boot + anything before.
-                        dd if=/dev/urandom of="$disk" bs=1M count=$(( pstart / 2048 + 1 )) conv=fsync 2>/dev/null
-                        # TAIL: [LUKS end .. disk end) — trailing gap + backup GPT.
-                        dd if=/dev/urandom of="$disk" bs=1M seek=$(( (pstart + psize) / 2048 )) conv=fsync 2>/dev/null
-                    else
-                        # geometry unknown → full overwrite is the safe superset
-                        dd if=/dev/urandom of="$disk" bs=4M conv=fsync 2>/dev/null
-                    fi ;;
-            esac
+            _duress_depth_wipe "$disk" "$depth" "$pstart" "$psize"
             sync
             sleep 1
             poweroff -f

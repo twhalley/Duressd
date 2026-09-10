@@ -112,6 +112,17 @@ teardown() { teardown_stubs; }
     stub_not_called efibootmgr
 }
 
+@test "UEFI NVRAM: unscoped on an EFI system, every boot entry is deleted" {
+    unset DURESSD_TARGET_DEVICES                       # unscoped = a real run
+    export DURESSD_EFI_DIR="$DURESSD_TESTROOT"          # pretend /sys/firmware/efi exists
+    export STUB_EFIBOOTMGR=$'BootCurrent: 0001\nBoot0000* Linux Boot Manager\nBoot0001* Arch\nBoot0007* USB'
+    run wipe_boot_artifacts /dev/sda
+    assert_ok
+    stub_called_with efibootmgr "-b 0000 -B"
+    stub_called_with efibootmgr "-b 0001 -B"
+    stub_called_with efibootmgr "-b 0007 -B"
+}
+
 @test "wipe_real runs Phase 1.5 when WIPE_BOOT_ARTIFACTS=true" {
     export STUB_LSBLK_NAME="/dev/sda3"
     export STUB_LUKS_DEVICES="/dev/sda3"
