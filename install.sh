@@ -32,12 +32,14 @@ if [[ -z "$_dir" ]] || [[ ! -d "${_dir}/src" ]]; then
     exec bash "$_src/install.sh" "${1:-install}"
 fi
 
-LIBDIR=/usr/local/lib/duressd
-BINDIR=/usr/local/bin
-UNITDIR=/etc/systemd/system
-CFGDIR=/etc/duressd
-ALIASES=/etc/profile.d/duressd.sh
-FISH_ALIASES=/etc/fish/conf.d/duressd.fish
+# Paths are overridable via env so the unit tests can install into a temp root.
+# In production these are unset → the real system paths apply.
+LIBDIR="${LIBDIR:-/usr/local/lib/duressd}"
+BINDIR="${BINDIR:-/usr/local/bin}"
+UNITDIR="${UNITDIR:-/etc/systemd/system}"
+CFGDIR="${CFGDIR:-/etc/duressd}"
+ALIASES="${ALIASES:-/etc/profile.d/duressd.sh}"
+FISH_ALIASES="${FISH_ALIASES:-/etc/fish/conf.d/duressd.fish}"
 SRC="${_dir}/src"
 SYSTEMD_SRC="${_dir}/systemd"
 
@@ -55,7 +57,23 @@ warn()  { echo -e "${YLW}  ⚠  $*${RST}"; }
 bad()   { echo -e "${RED}  ✘  $*${RST}" >&2; }
 
 require_root() {
+    [[ -n "${DURESSD_SKIP_PRIVCHECK:-}" ]] && return 0   # test seam
     [[ $EUID -eq 0 ]] || { bad "Must be run as root."; exit 1; }
+}
+
+# The daemon is a systemd service. Refuse cleanly on a system without systemd —
+# BEFORE we copy anything — rather than failing half-way through `systemctl`.
+# The systemd runtime dir is the canonical "is systemd the init" signal
+# (overridable for tests via DURESSD_SYSTEMD_DIR).
+require_systemd() {
+    local sd="${DURESSD_SYSTEMD_DIR:-/run/systemd/system}"
+    if ! command -v systemctl >/dev/null 2>&1 || [[ ! -d "$sd" ]]; then
+        bad "duressd's daemon requires systemd — systemctl / a running systemd was not found."
+        warn "This host does not appear to run systemd. The runtime triggers work on"
+        warn "any init, but the packaged service (and this installer) are systemd-only."
+        warn "Install on a systemd host, or wire src/handler up to your init manually."
+        exit 1
+    fi
 }
 
 # Map a binary name to its package name for a given distro family.
@@ -224,6 +242,7 @@ check_deps() {
 # ── install ───────────────────────────────────────────────────────────────────
 cmd_install() {
     require_root
+    require_systemd            # abort cleanly on a non-systemd host BEFORE any changes
 
     echo -e "\n${BLD}Installing duressd wipe service${RST}\n"
 
@@ -236,7 +255,7 @@ cmd_install() {
     install -m 0755 "$SRC/handler" "$LIBDIR/handler"
 
     step "Installing CLI to $BINDIR/duressd"
-    install -m 0755 "$SRC/cli" "$BINDIR/duressd"
+    install -Dm0755 "$SRC/cli" "$BINDIR/duressd"
 
     if [[ -d "${_dir}/initramfs" ]]; then
         step "Installing initramfs hook templates to $LIBDIR/initramfs/"
@@ -250,7 +269,7 @@ cmd_install() {
     fi
 
     step "Installing shell aliases to $ALIASES"
-    install -m 0644 "$SRC/aliases.sh" "$ALIASES"
+    install -Dm0644 "$SRC/aliases.sh" "$ALIASES"
 
     if command -v fish &>/dev/null; then
         step "Installing fish aliases to $FISH_ALIASES"
@@ -259,10 +278,14 @@ cmd_install() {
     fi
 
     step "Installing systemd unit"
-    install -m 0644 "$SYSTEMD_SRC/duressd.service" "$UNITDIR/duressd.service"
+    install -Dm0644 "$SYSTEMD_SRC/duressd.service" "$UNITDIR/duressd.service"
 
     step "Creating config directory $CFGDIR/"
-    install -d -m 0700 -o root -g root "$CFGDIR"
+    if [[ $EUID -eq 0 ]]; then
+        install -d -m 0700 -o root -g root "$CFGDIR"
+    else
+        install -d -m 0700 "$CFGDIR"          # test/non-root: skip the root chown
+    fi
 
     step "Enabling and starting duressd.service"
     systemctl daemon-reload

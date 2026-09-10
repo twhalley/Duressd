@@ -8,7 +8,7 @@ STUBS_SRC="$REPO_ROOT/tests/stubs/generic-stub"
 # All binaries the handler/CLI may invoke, backed by the generic stub.
 STUB_COMMANDS=(cryptsetup lsblk wipefs dmsetup blkdiscard findmnt openssl dd
                mdadm efibootmgr systemctl shred umount sync blockdev partprobe sfdisk
-               tpm2_clear nvme swapoff tor torsocks mkinitcpio sshd sleep)
+               tpm2_clear nvme swapoff tor torsocks mkinitcpio sshd sleep socat)
 
 # setup_stubs — build a temp bindir of symlinks to the generic stub, prepend it
 # to PATH, point the paths/state at a private temp dir, and start a call log.

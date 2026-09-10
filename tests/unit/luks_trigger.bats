@@ -27,6 +27,13 @@ teardown() { teardown_stubs; }
     assert_output_contains "No custom duress passphrase"
 }
 
+@test "install-luks-trigger refuses cleanly on a non-mkinitcpio system (wrong distro)" {
+    rm -f "$STUB_BIN/mkinitcpio"                # simulate a system without mkinitcpio
+    PATH="$STUB_BIN" run cmd_install_luks_trigger
+    assert_fail
+    assert_output_contains "mkinitcpio not found"
+}
+
 @test "install-luks-trigger installs both hooks and inserts 'duress' before 'encrypt'" {
     run cmd_install_luks_trigger
     assert_ok

@@ -53,3 +53,52 @@ teardown() { teardown_stubs; }
     [ "$(_pkg_for cryptsetup gentoo)" = sys-fs/cryptsetup ]
     [ "$(_pkg_for dd gentoo)"         = sys-apps/coreutils ]
 }
+
+# ── require_systemd: refuse cleanly on the WRONG system ──────────────────────
+@test "require_systemd errors when systemd is not the init (no /run/systemd/system)" {
+    export DURESSD_SYSTEMD_DIR="$DURESSD_TESTROOT/no-systemd"     # does not exist
+    run require_systemd
+    assert_fail
+    assert_output_contains "requires systemd"
+}
+
+@test "require_systemd passes when systemd is present" {
+    export DURESSD_SYSTEMD_DIR="$DURESSD_TESTROOT/systemd"; install -d "$DURESSD_SYSTEMD_DIR"
+    run require_systemd                                            # systemctl is stubbed
+    assert_ok
+}
+
+# ── check_deps: error on a missing required tool, with a package hint ─────────
+@test "check_deps errors (with a package name) when a required tool is missing" {
+    rm -f "$STUB_BIN/socat"                                       # drop one required tool
+    PATH="$STUB_BIN" run check_deps                                # builtins only; no sub-bash
+    assert_fail
+    assert_output_contains "Missing required tools"
+    assert_output_contains "socat"
+}
+
+# ── cmd_install: full flow into a temp root ──────────────────────────────────
+@test "cmd_install ABORTS on a non-systemd host BEFORE copying anything" {
+    export DURESSD_SKIP_PRIVCHECK=1
+    export DURESSD_SYSTEMD_DIR="$DURESSD_TESTROOT/no-systemd"      # not systemd
+    export BINDIR="$DURESSD_TESTROOT/bin"
+    run cmd_install
+    assert_fail
+    assert_output_contains "requires systemd"
+    [ ! -e "$BINDIR/duressd" ]                                     # nothing installed
+}
+
+@test "cmd_install installs all components with correct modes and enables the service" {
+    export DURESSD_SKIP_PRIVCHECK=1
+    export DURESSD_SYSTEMD_DIR="$DURESSD_TESTROOT/sd"; install -d "$DURESSD_SYSTEMD_DIR"
+    export LIBDIR="$DURESSD_TESTROOT/lib/duressd" BINDIR="$DURESSD_TESTROOT/bin" \
+           UNITDIR="$DURESSD_TESTROOT/unit" CFGDIR="$DURESSD_TESTROOT/cfg" \
+           ALIASES="$DURESSD_TESTROOT/aliases.sh" FISH_ALIASES="$DURESSD_TESTROOT/fish.fish"
+    run cmd_install
+    assert_ok
+    [ -x "$LIBDIR/daemon" ] && [ -x "$LIBDIR/handler" ] && [ -x "$BINDIR/duressd" ]
+    [ -f "$UNITDIR/duressd.service" ]
+    [ -x "$LIBDIR/initramfs/duress-runtime-hook" ]     # boot-hook templates shipped
+    [ "$(stat -c %a "$CFGDIR")" = 700 ]                # config dir root-only
+    stub_called_with systemctl "enable --now duressd.service"
+}
