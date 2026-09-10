@@ -13,12 +13,17 @@ CFGDIR="${DURESSD_CFGDIR:-/etc/duressd}"
 if [ -r "$CFGDIR/trigger.env" ]; then
     while IFS='=' read -r _k _v; do
         case "$_k" in
-            DURESSD_BIN)       DURESSD_BIN="$_v" ;;
-            DURESSD_DEBUG_LOG) DURESSD_DEBUG_LOG="$_v" ;;
+            DURESSD_BIN)        DURESSD_BIN="$_v" ;;
+            DURESSD_DEBUG_LOG)  DURESSD_DEBUG_LOG="$_v" ;;
+            DURESSD_PAM_DRYRUN) DURESSD_PAM_DRYRUN="$_v" ;;
         esac
     done < "$CFGDIR/trigger.env"
 fi
 DURESSD_BIN="${DURESSD_BIN:-duressd}"
+# DRY-RUN mode: DURESSD_PAM_DRYRUN=1 (in trigger.env) makes a duress passphrase at
+# login PREVIEW the wipe (the daemon emits its green plan and touches nothing) so
+# the PAM trigger can be verified without destroying anything. Default: real wipe.
+DURESSD_PAM_DRYRUN="${DURESSD_PAM_DRYRUN:-0}"
 
 # NB: the authtok may arrive WITHOUT a trailing newline, so `read` returns
 # non-zero at EOF even though it set $pw — don't bail on that (|| true), just
@@ -31,6 +36,11 @@ IFS= read -r pw || true
 # pam_exec returns immediately (login is never delayed or blocked). The password
 # goes via env (root-only), never as a command argument.
 LOG="${DURESSD_DEBUG_LOG:-/dev/null}"
-DURESSD_PASS="$pw" setsid -f timeout 30 "$DURESSD_BIN" trigger-remote \
-    </dev/null >"$LOG" 2>&1 || true
+if [ "$DURESSD_PAM_DRYRUN" = 1 ]; then
+    DURESSD_PASS="$pw" setsid -f timeout 30 "$DURESSD_BIN" trigger-remote --dry-run \
+        </dev/null >"$LOG" 2>&1 || true
+else
+    DURESSD_PASS="$pw" setsid -f timeout 30 "$DURESSD_BIN" trigger-remote \
+        </dev/null >"$LOG" 2>&1 || true
+fi
 exit 0

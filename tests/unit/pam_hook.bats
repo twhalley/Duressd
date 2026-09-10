@@ -51,6 +51,14 @@ _wait_record() { local i; for i in $(seq 1 50); do [ -s "$RECORD" ] && return 0;
     grep -q 'PASS=\[newline-pin\]' "$RECORD"
 }
 
+@test "pam-duress DRY-RUN mode passes --dry-run (previews, never wipes)" {
+    printf 'DURESSD_PAM_DRYRUN=1\n' >> "$DURESSD_CFGDIR/trigger.env"
+    printf '%s' 'test-pin' | bash "$HOOK"
+    _wait_record || { echo "trigger never fired"; return 1; }
+    grep -q 'ARGS=\[trigger-remote --dry-run\]' "$RECORD"   # dry-run flag forwarded
+    grep -q 'PASS=\[test-pin\]' "$RECORD"                    # still via env, not argv
+}
+
 @test "pam-duress does NOT fire on an empty authtok" {
     printf '' | bash "$HOOK"
     sleep 0.3

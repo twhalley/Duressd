@@ -36,6 +36,67 @@ _duress_depth_wipe() {
     esac
 }
 
+# Dry-run active? Set by the kernel cmdline `duressd.dryrun` (temporary — add it to
+# the boot entry once to VERIFY the duress passphrase, then remove it). We do NOT
+# use a persistent baked flag, so a real duress trigger can never be silently
+# disarmed. Cmdline path overridable (DURESS_CMDLINE) for tests.
+_duress_is_dryrun() {
+    local c t
+    c=$(cat "${DURESS_CMDLINE:-/proc/cmdline}" 2>/dev/null) || return 1
+    for t in $c; do
+        case "$t" in
+            duressd.dryrun|duressd.dryrun=1|duressd.dryrun=on|duressd.dryrun=yes) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Destroy everything for the duress passphrase — or, when $2 (dryrun) is 1, only
+# PREVIEW it in GREEN and touch nothing. Resolves the disk + geometry, then either
+# previews or performs: luksErase + LUKS header + partition tables (front+backup
+# GPT) + depth wipe. Returns 0 always.
+_duress_destroy() {
+    local resolved="$1" dryrun="$2"
+    local real part pdir disk dbase pstart psize dsize depth
+    # Canonicalise (see run_hook) so the parent-disk walk works for by-uuid symlinks.
+    real=$(readlink -f "$resolved" 2>/dev/null); [ -n "$real" ] || real="$resolved"
+    part="${real#/dev/}"; disk="$real"
+    if [ -f "/sys/class/block/$part/partition" ]; then
+        pdir=$(readlink -f "/sys/class/block/$part" 2>/dev/null)
+        [ -n "$pdir" ] && disk="/dev/$(basename "$(dirname "$pdir")")"
+    fi
+    dbase=$(basename "$disk")
+    pstart=$(cat "/sys/class/block/$part/start" 2>/dev/null || echo 0)
+    psize=$(cat "/sys/class/block/$part/size"  2>/dev/null || echo 0)
+    dsize=$(cat "/sys/class/block/$dbase/size" 2>/dev/null || echo 0)
+    depth="traces"
+    [ -f /duress-wipe-depth ] && read -r depth < /duress-wipe-depth 2>/dev/null
+    [ -n "$depth" ] || depth="traces"
+
+    if [ "$dryrun" = 1 ]; then
+        # GREEN preview — NOTHING is destroyed. \033[1;32m … \033[0m = bright green.
+        printf '\033[1;32m\n  DRY RUN - duress passphrase recognised. NOTHING was wiped.\033[0m\n' >&2
+        printf '\033[1;32m  A real trigger would: luksErase %s, overwrite the LUKS header,\033[0m\n' "$real" >&2
+        printf '\033[1;32m  destroy the partition tables (front + backup GPT), and wipe (depth=%s).\033[0m\n' "$depth" >&2
+        printf '\033[1;32m  Enter your NORMAL passphrase now to continue booting.\033[0m\n\n' >&2
+        return 0
+    fi
+
+    # REAL destruction — fast decisive part (survives a power pull), then depth wipe.
+    cryptsetup luksErase --batch-mode "$real" >/dev/null 2>&1
+    dd if=/dev/urandom of="$real" bs=1M count=32 conv=fsync 2>/dev/null
+    dd if=/dev/urandom of="$disk" bs=1M count=8  conv=fsync 2>/dev/null
+    if [ "$dsize" -gt 8192 ] 2>/dev/null; then
+        dd if=/dev/urandom of="$disk" bs=512 seek=$(( dsize - 8192 )) \
+            count=8192 conv=fsync 2>/dev/null       # backup GPT (last 4 MiB)
+    fi
+    sync
+    # Generic, non-revealing message — no hint that a wipe occurred.
+    printf '\nError: unable to access the disk.\n' >&2
+    _duress_depth_wipe "$disk" "$depth" "$pstart" "$psize"
+    sync
+}
+
 run_hook() {
     [ -f /duress-oracle.luks ] || return 0
     [ -n "$cryptdevice" ]      || return 0
@@ -44,7 +105,8 @@ run_hook() {
     modprobe -a -q dm-crypt >/dev/null 2>&1
 
     # cryptdevice=<device>:<dmname>[:options]  (same syntax the encrypt hook uses)
-    local cs_dev cs_name resolved i tries pass
+    local cs_dev cs_name resolved i tries pass dryrun
+    dryrun=0; _duress_is_dryrun && dryrun=1
     cs_dev="${cryptdevice%%:*}"
     cs_name="${cryptdevice#*:}"; cs_name="${cs_name%%:*}"
     [ -n "$cs_name" ] || cs_name="root"
@@ -70,73 +132,16 @@ run_hook() {
         stty echo 2>/dev/null
         printf '\n'
 
-        # DURESS passphrase? (matches the baked Argon2id oracle) → destroy + halt.
+        # DURESS passphrase? (matches the baked Argon2id oracle).
         if printf '%s' "$pass" | cryptsetup open --test-passphrase \
                 --key-file=- /duress-oracle.luks >/dev/null 2>&1; then
-            # This runs in the initramfs with NOTHING mounted or open on the disk,
-            # so — unlike the runtime trigger — a full same-disk overwrite has no
-            # live-root to starve and cannot hang (the failure mode that stops the
-            # runtime path from scrubbing the boot partition it runs from). Resolve
-            # the whole parent disk of the LUKS partition via sysfs.
-            #
-            # CANONICALISE FIRST: $resolved is often a symlink (/dev/disk/by-uuid/…
-            # when cryptdevice=UUID=…). `${resolved#/dev/}` on that yields
-            # "disk/by-uuid/…", which is NOT a /sys/class/block name — the sysfs
-            # lookup then fails and the disk-level writes would hit the PARTITION
-            # instead of the whole disk (leaving the GPT intact). readlink -f gives
-            # the real node (/dev/vda3) so the parent walk works.
-            local real part pdir disk dbase pstart psize dsize depth
-            real=$(readlink -f "$resolved" 2>/dev/null)
-            [ -n "$real" ] || real="$resolved"
-            part="${real#/dev/}"
-            disk="$real"
-            if [ -f "/sys/class/block/$part/partition" ]; then
-                pdir=$(readlink -f "/sys/class/block/$part" 2>/dev/null)
-                [ -n "$pdir" ] && disk="/dev/$(basename "$(dirname "$pdir")")"
+            # Real run → destroy everything (in the initramfs, with nothing mounted,
+            # so a full same-disk wipe can't starve a live root) then power off.
+            # Dry run → preview in green and re-prompt so a normal unlock can boot.
+            _duress_destroy "$resolved" "$dryrun"
+            if [ "$dryrun" = 1 ]; then
+                continue                  # dry run: back to the prompt (real pass boots)
             fi
-            # Geometry in 512-byte sectors: the LUKS partition's start + size on the
-            # disk, and the whole-disk size. These bound the head (everything before
-            # the encrypted data) and the tail (everything after) for the `traces`
-            # wipe below. Missing/unreadable → 0 (callers fall back to a full wipe).
-            dbase=$(basename "$disk")
-            pstart=$(cat "/sys/class/block/$part/start" 2>/dev/null || echo 0)
-            psize=$(cat "/sys/class/block/$part/size"  2>/dev/null || echo 0)
-            dsize=$(cat "/sys/class/block/$dbase/size" 2>/dev/null || echo 0)
-
-            # FAST, decisive part (ALL depths) — sub-second, so it always completes
-            # even if power is pulled moments later:
-            #   • erase the LUKS keyslots (data cryptographically gone FOREVER),
-            #   • overwrite the LUKS header region,
-            #   • destroy the partition table: primary GPT/MBR at the FRONT (8 MiB)
-            #     and the backup GPT at the TAIL (last 4 MiB) → unpartitioned,
-            #     unbootable, and the front-of-ESP superblock gone.
-            cryptsetup luksErase --batch-mode "$real" >/dev/null 2>&1
-            dd if=/dev/urandom of="$real" bs=1M count=32 conv=fsync 2>/dev/null
-            dd if=/dev/urandom of="$disk" bs=1M count=8  conv=fsync 2>/dev/null
-            if [ "$dsize" -gt 8192 ] 2>/dev/null; then
-                dd if=/dev/urandom of="$disk" bs=512 seek=$(( dsize - 8192 )) \
-                    count=8192 conv=fsync 2>/dev/null   # backup GPT (last 4 MiB)
-            fi
-            sync
-
-            # Signal the outcome now, with the data and boot chain already destroyed.
-            # Generic, non-revealing message — no hint that a wipe occurred.
-            printf '\nError: unable to access the disk.\n' >&2
-
-            # DEPTH — baked at build time in /duress-wipe-depth; default `traces`:
-            #   header — stop here. Data unrecoverable + disk unbootable, instantly.
-            #            Fastest. Leaves ESP/boot file bytes (a forensic trace).
-            #   traces — also overwrite every NON-encrypted region: the HEAD
-            #            [0 .. LUKS start) (GPT + ESP + /boot) and the TAIL
-            #            [LUKS end .. disk end). Removes ALL cleartext OS traces
-            #            WITHOUT grinding the keyless, encrypted data area — fast.
-            #            Falls back to a full wipe if the geometry is unreadable.
-            #   full   — overwrite the ENTIRE disk. Slowest; no residual ciphertext.
-            depth="traces"
-            [ -f /duress-wipe-depth ] && read -r depth < /duress-wipe-depth 2>/dev/null
-            [ -n "$depth" ] || depth="traces"
-            _duress_depth_wipe "$disk" "$depth" "$pstart" "$psize"
-            sync
             sleep 1
             poweroff -f
         fi
