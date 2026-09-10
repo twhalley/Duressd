@@ -102,3 +102,43 @@ teardown() { teardown_stubs; }
     [ "$(stat -c %a "$CFGDIR")" = 700 ]                # config dir root-only
     stub_called_with systemctl "enable --now duressd.service"
 }
+
+@test "cmd_uninstall auto-reverses installed triggers before deleting the CLI" {
+    # Regression (audit MEDIUM): uninstall used to only WARN, orphaning the PAM/
+    # HOOKS/authorized_keys changes once the CLI was gone. It must now run the three
+    # trigger --uninstall paths automatically, while the CLI still exists.
+    export DURESSD_SKIP_PRIVCHECK=1
+    export LIBDIR="$DURESSD_TESTROOT/lib/duressd" BINDIR="$DURESSD_TESTROOT/bin" \
+           UNITDIR="$DURESSD_TESTROOT/unit" CFGDIR="$DURESSD_TESTROOT/nocfg" \
+           ALIASES="$DURESSD_TESTROOT/aliases.sh" FISH_ALIASES="$DURESSD_TESTROOT/fish.fish"
+    install -d "$BINDIR" "$LIBDIR" "$UNITDIR"
+    local rec="$DURESSD_TESTROOT/trig.log"; : > "$rec"
+    cat > "$BINDIR/duressd" <<REC
+#!/bin/bash
+printf '%s\n' "\$*" >> "$rec"
+REC
+    chmod +x "$BINDIR/duressd"
+    run cmd_uninstall
+    assert_ok
+    grep -q 'install-luks-trigger --uninstall'  "$rec"
+    grep -q 'install-login-trigger --uninstall' "$rec"
+    grep -q 'install-ssh-trigger --uninstall'   "$rec"
+    [ ! -e "$BINDIR/duressd" ]                   # CLI removed afterwards
+}
+
+@test "cmd_uninstall honours DURESSD_KEEP_TRIGGERS=1 (skips auto-reversal)" {
+    export DURESSD_SKIP_PRIVCHECK=1 DURESSD_KEEP_TRIGGERS=1
+    export LIBDIR="$DURESSD_TESTROOT/lib/duressd" BINDIR="$DURESSD_TESTROOT/bin" \
+           UNITDIR="$DURESSD_TESTROOT/unit" CFGDIR="$DURESSD_TESTROOT/nocfg" \
+           ALIASES="$DURESSD_TESTROOT/aliases.sh" FISH_ALIASES="$DURESSD_TESTROOT/fish.fish"
+    install -d "$BINDIR" "$LIBDIR" "$UNITDIR"
+    local rec="$DURESSD_TESTROOT/trig.log"; : > "$rec"
+    cat > "$BINDIR/duressd" <<REC
+#!/bin/bash
+printf '%s\n' "\$*" >> "$rec"
+REC
+    chmod +x "$BINDIR/duressd"
+    run cmd_uninstall
+    assert_ok
+    [ ! -s "$rec" ]                              # no trigger reversal invoked
+}

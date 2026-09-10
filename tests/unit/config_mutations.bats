@@ -67,3 +67,55 @@ teardown() { teardown_stubs; }
     stub_called_with cryptsetup luksErase     # oracle keyslot erased
     [ ! -f "$DURESSD_CFGDIR/config" ]          # config removed
 }
+
+# ── cmd_configure re-authorization (must not silently re-key an existing setup) ─
+@test "configure re-auth: refuses to overwrite an existing config with NO current passphrase" {
+    argv=( "$(b64 '')" "$(b64 custom)" "$(b64 newduresspass)" false false 0 false false )
+    run cmd_configure
+    assert_fail
+    assert_output_contains "requires the current passphrase"
+    run grep -E 'luksFormat' "$DURESSD_STUB_LOG"
+    assert_fail                                # no new oracle created
+}
+
+@test "configure re-auth: refuses when the current passphrase is WRONG" {
+    export STUB_VERIFY_RC=1
+    argv=( "$(b64 '')" "$(b64 custom)" "$(b64 newduresspass)" false false 0 false false "$(b64 wrongcur)" )
+    run cmd_configure
+    assert_fail
+    assert_output_contains "Current passphrase incorrect"
+    run grep -E 'luksFormat' "$DURESSD_STUB_LOG"
+    assert_fail
+}
+
+@test "configure re-auth: overwrites when the current passphrase is CORRECT" {
+    export STUB_VERIFY_RC=0
+    argv=( "$(b64 '')" "$(b64 custom)" "$(b64 newduresspass)" false false 0 false false "$(b64 rightcur)" )
+    run cmd_configure
+    assert_ok
+    stub_called_with cryptsetup luksFormat     # new oracle created after re-auth
+}
+
+@test "configure: first-time setup (no existing config) needs no current passphrase" {
+    rm -f "$DURESSD_CFGDIR/config" "$DURESSD_CFGDIR/passphrase.luks"
+    export STUB_VERIFY_RC=0
+    argv=( "$(b64 '')" "$(b64 custom)" "$(b64 newduresspass)" false false 0 false false )
+    run cmd_configure
+    assert_ok
+    stub_called_with cryptsetup luksFormat
+}
+
+@test "configure: rejects an invalid password_type (also blocks heredoc injection)" {
+    argv=( "$(b64 '')" "$(b64 'custom
+WIPE_FULL_DEVICE=true')" "$(b64 x)" false false 0 false false )
+    run cmd_configure
+    assert_fail
+    assert_output_contains "Invalid password type"
+}
+
+@test "configure: rejects a non-numeric countdown (blocks arithmetic-eval hazard)" {
+    argv=( "$(b64 '')" "$(b64 custom)" "$(b64 newduresspass)" false false 'a[x]' false false )
+    run cmd_configure
+    assert_fail
+    assert_output_contains "Invalid countdown"
+}

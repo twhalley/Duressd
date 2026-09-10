@@ -16,6 +16,7 @@ setup() {
     export STUB_LSBLK_NAME="/dev/sda3"
     export STUB_LUKS_DEVICES="/dev/sda3"
     export STUB_PKNAME="sda"
+    export STUB_LSBLK_NAMETYPE="sda disk"   # _disk_of walks /dev/sda3 → /dev/sda
     export STUB_SIZE=10485760   # 10 MiB
     # A Qubes-style GPT for the boot-artifact preview (lsblk -P key="value" form).
     export STUB_LSBLK_BOOTSCAN="NAME=\"/dev/sda1\" PARTTYPE=\"${ESP_GUID}\" FSTYPE=\"vfat\" MOUNTPOINT=\"/boot/efi\"

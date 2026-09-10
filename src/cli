@@ -67,6 +67,12 @@ banner_header() {
 render_progress() {
     local color="$1" pct="$2" msg="$3"
     local width=35 filled empty bar=""
+    # Coerce pct to a clean integer 0-100 before arithmetic: the value comes off
+    # the socket, and a non-numeric payload (only possible from a hostile daemon,
+    # e.g. via a redirected DURESSD_SOCKET) would otherwise reach the arithmetic
+    # evaluation below — harmless on modern bash, but validated defensively.
+    [[ "$pct" =~ ^[0-9]+$ ]] || pct=0
+    (( pct > 100 )) && pct=100
     filled=$(( pct * width / 100 ))
     empty=$(( width - filled ))
     local i
@@ -159,6 +165,25 @@ warn()    { echo -e "${YLW}  ⚠  $*${RST}" >&2; }
 good()    { echo -e "${GRN}  ✔  $*${RST}" >&2; }
 bad()     { echo -e "${RED}  ✘  $*${RST}" >&2; }
 
+# Warn loudly if the PAM login trigger is in DRY-RUN mode (disarmed): a lingering
+# DURESSD_PAM_DRYRUN=1 in trigger.env makes every duress passphrase typed at login
+# only PREVIEW the wipe and destroy NOTHING — a silent disarm that a "verify" would
+# not reveal. Surfaced in status/health so it can't be forgotten after testing.
+# Parsed (never sourced), like every other trigger.env reader.
+_warn_pam_dryrun() {
+    local envf="${DURESSD_CFGDIR:-/etc/duressd}/trigger.env" k rest v=""
+    [[ -r "$envf" ]] || return 0
+    while IFS='=' read -r k rest; do
+        [[ "$k" == DURESSD_PAM_DRYRUN ]] && v="$rest"
+    done < "$envf"
+    if [[ "$v" == 1 ]]; then
+        echo >&2
+        warn "PAM login trigger is in DRY-RUN (DISARMED): a duress passphrase at login only"
+        warn "PREVIEWS the wipe — it destroys NOTHING. Remove DURESSD_PAM_DRYRUN=1 from"
+        warn "$envf to re-arm the real login trigger."
+    fi
+}
+
 # ── status ────────────────────────────────────────────────────────────────────
 cmd_status() {
     section "Daemon status"
@@ -196,6 +221,7 @@ cmd_status() {
     printf '  %-30s %s\n' "Wipe full device(s):"   "${wfd:-false}" >&2
     printf '  %-30s %s\n' "Countdown (s):"         "${wcd:-0}" >&2
     echo >&2
+    _warn_pam_dryrun
 }
 
 # ── configure ─────────────────────────────────────────────────────────────────
@@ -285,6 +311,22 @@ cmd_configure() {
         good "A ${wipe_countdown}s countdown will run before each wipe — disconnect to abort"
     fi
 
+    # If a config already exists, the daemon requires the CURRENT passphrase to
+    # re-key (so CONFIGURE can't silently overwrite the oracle — it would otherwise
+    # bypass change-passphrase's old-passphrase check). Detect via STATUS (stderr
+    # rendering suppressed; the OK payload on stdout carries configured=true/false)
+    # and collect the current passphrase, passed as the optional trailing argument.
+    local cur_arg=() st
+    st=$(send_cmd "$CYN" STATUS 2>/dev/null || true)
+    if [[ "$st" == *"configured=true"* ]]; then
+        echo >&2
+        warn "Already configured — reconfiguring re-keys the duress oracle."
+        info "The CURRENT passphrase is required to authorize this change."
+        local cur_pass
+        cur_pass=$(read_pass "Current duress passphrase: ")
+        cur_arg=( "$(b64 "$cur_pass")" )
+    fi
+
     echo >&2
     info "Sending configuration to daemon (Argon2id hash may take ~3 s)…"
     send_cmd "$CYN" CONFIGURE \
@@ -295,7 +337,8 @@ cmd_configure() {
         "$wipe_full_device" \
         "$wipe_countdown" \
         "$wipe_boot_artifacts" \
-        "$wipe_hardware_keys"
+        "$wipe_hardware_keys" \
+        ${cur_arg[@]+"${cur_arg[@]}"}
 }
 
 # ── unconfigure ───────────────────────────────────────────────────────────────
@@ -399,6 +442,23 @@ cmd_trigger_remote() {
     fi
 }
 
+# Resolve an ABSOLUTE path to the duressd binary for embedding in an SSH forced
+# command. sshd runs a forced command via the login shell with $_PATH_STDPATH
+# (/usr/bin:/bin:/usr/sbin:/sbin), which EXCLUDES /usr/local/bin — duressd's
+# default install prefix — so a bare "duressd" would be "command not found" and
+# the remote kill switch would SILENTLY no-op (the same trap pam-duress avoids).
+# Overridable via DURESSD_SELF_BIN for tests.
+_duressd_bin() {
+    if [[ -n "${DURESSD_SELF_BIN:-}" ]]; then printf '%s' "$DURESSD_SELF_BIN"; return; fi
+    local c
+    c=$(command -v duressd 2>/dev/null || true)
+    [[ "$c" == /* ]] && { printf '%s' "$c"; return; }
+    for c in /usr/local/bin/duressd /usr/bin/duressd /bin/duressd; do
+        [[ -x "$c" ]] && { printf '%s' "$c"; return; }
+    done
+    printf 'duressd'   # last resort — better a bare name than nothing
+}
+
 # ── SSH-over-Tor: v3 onion service + client authorization ─────────────────────
 # Exposes the local sshd as a CLIENT-AUTHORIZED v3 onion service, so the duress
 # kill switch is reachable over Tor with no exposed ports and two independent
@@ -435,15 +495,22 @@ TORRC
 
     # 2. client-authorization keypair (x25519 → Tor base32). Public half authorizes
     #    the client on the service; private half is the operator's connect secret.
-    local ck priv pub
-    ck="$(mktemp)"
-    openssl genpkey -algorithm x25519 -out "$ck" 2>/dev/null \
-        || { bad "x25519 keygen failed"; rm -f "$ck"; return 1; }
-    priv=$(openssl pkey -in "$ck" -outform DER        2>/dev/null | tail -c 32 | base32 | tr -d '=')
-    pub=$( openssl pkey -in "$ck" -pubout -outform DER 2>/dev/null | tail -c 32 | base32 | tr -d '=')
-    rm -f "$ck"
-    printf 'descriptor:x25519:%s\n' "$pub" > "$hsdir/authorized_clients/duress.auth"
-    chmod 0600 "$hsdir/authorized_clients/duress.auth"
+    #    IDEMPOTENT: regenerating would silently INVALIDATE a previously distributed
+    #    operator key and break a deployed kill switch — so reuse an existing one.
+    local ck priv="" pub reused=false
+    if [[ -s "$hsdir/authorized_clients/duress.auth" ]]; then
+        reused=true
+        warn "Existing client-auth key found — reusing it (keep using your saved private key)."
+    else
+        ck="$(mktemp)"
+        openssl genpkey -algorithm x25519 -out "$ck" 2>/dev/null \
+            || { bad "x25519 keygen failed"; rm -f "$ck"; return 1; }
+        priv=$(openssl pkey -in "$ck" -outform DER        2>/dev/null | tail -c 32 | base32 | tr -d '=')
+        pub=$( openssl pkey -in "$ck" -pubout -outform DER 2>/dev/null | tail -c 32 | base32 | tr -d '=')
+        rm -f "$ck"
+        printf 'descriptor:x25519:%s\n' "$pub" > "$hsdir/authorized_clients/duress.auth"
+        chmod 0600 "$hsdir/authorized_clients/duress.auth"
+    fi
     [[ -n "$toruser" ]] && chown -R "$toruser:$toruser" "$hsdir" 2>/dev/null || true
 
     # 3. bring the service up (unless a caller/test manages tor) and read the
@@ -461,9 +528,13 @@ TORRC
     fi
 
     # 4. persist + print the operator-side client-auth secret and trigger command.
+    #    Only (re)write the private key when we just generated one — a reused key's
+    #    private half already lives off-machine with the operator.
     install -d -m 0700 "$cfgdir"
-    printf '%s:descriptor:x25519:%s\n' "${onion%.onion}" "$priv" > "$cfgdir/tor-client-auth.private"
-    chmod 0600 "$cfgdir/tor-client-auth.private"
+    if [[ "$reused" != true ]]; then
+        printf '%s:descriptor:x25519:%s\n' "${onion%.onion}" "$priv" > "$cfgdir/tor-client-auth.private"
+        chmod 0600 "$cfgdir/tor-client-auth.private"
+    fi
 
     if [[ -n "$onion" ]]; then good "Onion address: $onion"
     else warn "tor hasn't generated the address yet — start tor, then read $hsdir/hostname"; fi
@@ -487,7 +558,7 @@ TORRC
 #                        ssh -i key root@host
 # --tor  also expose the sshd as a client-authorized v3 onion service.
 cmd_install_ssh_trigger() {
-    local pubkey="" keydir="${HOME:-/root}/.ssh" embed=false tor=false action=install
+    local pubkey="" keydir="${HOME:-/root}/.ssh" embed=false tor=false action=install force=false
     local authkeys="${DURESSD_SSH_AUTHKEYS:-/root/.ssh/authorized_keys}"
     local passfile="${DURESSD_CFGDIR:-/etc/duressd}/ssh-trigger.pass"
     while [[ $# -gt 0 ]]; do
@@ -496,10 +567,12 @@ cmd_install_ssh_trigger() {
             --authorized-keys)   authkeys="$2"; shift 2 ;;
             --embed-passphrase)  embed=true; shift ;;
             --tor)               tor=true; shift ;;
+            --force)             force=true; shift ;;
             --uninstall)         action=uninstall; shift ;;
             -h|--help)
-                echo "usage: duressd install-ssh-trigger [--pubkey FILE] [--embed-passphrase] [--tor] [--uninstall]" >&2
+                echo "usage: duressd install-ssh-trigger [--pubkey FILE] [--embed-passphrase] [--tor] [--force] [--uninstall]" >&2
                 echo "  --tor        also expose sshd as a client-authorized v3 onion service" >&2
+                echo "  --force      set up --tor even when SSH password auth / root password login is on" >&2
                 echo "  --uninstall  remove the forced-command key (+ embedded passphrase, + --tor onion)" >&2
                 return 0 ;;
             *) shift ;;
@@ -509,10 +582,14 @@ cmd_install_ssh_trigger() {
     # ── uninstall: strip the forced-command entry, secure-erase the passfile ────
     if [[ "$action" == uninstall ]]; then
         section "Remove SSH duress trigger"
-        if [[ -f "$authkeys" ]] && grep -qF 'command="duressd trigger-remote' "$authkeys" 2>/dev/null; then
+        if [[ -f "$authkeys" ]] && grep -qF 'duressd trigger-remote' "$authkeys" 2>/dev/null; then
             cp -a "$authkeys" "$authkeys.duressd.bak"
-            grep -vF 'command="duressd trigger-remote' "$authkeys" > "$authkeys.tmp" \
-                && mv "$authkeys.tmp" "$authkeys"
+            # Match both a bare "duressd" and an absolute path (…/duressd) forced cmd.
+            # NB: grep -v returns 1 when it removes the LAST line (empty output) —
+            # that is success here, so `|| true` then mv (don't gate mv on grep's rc,
+            # which would leave the entry in place when it was the only key).
+            grep -vF 'duressd trigger-remote' "$authkeys" > "$authkeys.tmp" || true
+            mv "$authkeys.tmp" "$authkeys"
             good "Removed the duress forced-command key from $authkeys (backup: $authkeys.duressd.bak)"
         else
             info "No duress forced-command entry in $authkeys — nothing to remove there"
@@ -552,8 +629,16 @@ cmd_install_ssh_trigger() {
     fi
     [[ -f "$pubkey" ]] || { bad "public key not found: $pubkey"; return 1; }
 
-    # Build the forced command.
-    local forced="duressd trigger-remote"
+    # Reject a multi-key pubkey file: only the FIRST key gets the restricted
+    # forced-command prefix below, so any additional key line would be appended to
+    # authorized_keys as an UNRESTRICTED, shell-capable root key.
+    local _nkeys
+    _nkeys=$(grep -cvE '^[[:space:]]*(#|$)' "$pubkey" 2>/dev/null || echo 0)
+    [[ "$_nkeys" == 1 ]] || { bad "$pubkey must contain exactly one public key (found $_nkeys)"; return 1; }
+
+    # Build the forced command — ABSOLUTE duressd path (see _duressd_bin).
+    local forced
+    forced="$(_duressd_bin) trigger-remote"
     if [[ "$embed" == true ]]; then
         local p1 p2
         p1=$(read_pass "Duress passphrase to embed: "); echo >&2
@@ -561,18 +646,24 @@ cmd_install_ssh_trigger() {
         [[ "$p1" == "$p2" ]] || { bad "passphrases do not match"; return 1; }
         install -d -m 0700 "$(dirname "$passfile")"
         printf '%s' "$p1" > "$passfile"; chmod 0600 "$passfile"
-        forced="duressd trigger-remote --passphrase-file $passfile"
+        forced="$(_duressd_bin) trigger-remote --passphrase-file $passfile"
         warn "Passphrase stored at $passfile (root 0600) — key alone now triggers a wipe."
     fi
 
-    # restrict = no pty/agent/port/x11/user-rc (OpenSSH 7.2+).
+    # restrict = no pty/agent/port/x11/user-rc (OpenSSH 7.2+). Use the single key
+    # line (comments/blanks stripped) so nothing extra rides into the entry.
     local keymaterial line
-    keymaterial="$(cat "$pubkey")"
+    keymaterial="$(grep -vE '^[[:space:]]*(#|$)' "$pubkey" | head -1)"
     line="command=\"$forced\",restrict $keymaterial"
     install -d -m 0700 "$(dirname "$authkeys")"
-    printf '%s\n' "$line" >> "$authkeys"
+    # Idempotent: don't append a duplicate forced-command line on re-run.
+    if grep -qF "command=\"$forced\"" "$authkeys" 2>/dev/null; then
+        info "Forced-command entry already present in $authkeys — not duplicated"
+    else
+        printf '%s\n' "$line" >> "$authkeys"
+        good "Forced-command entry added to $authkeys"
+    fi
     chmod 0600 "$authkeys"
-    good "Forced-command entry added to $authkeys"
 
     echo >&2
     info "Trigger the wipe remotely with:"
@@ -589,6 +680,17 @@ cmd_install_ssh_trigger() {
 
     if [[ "$tor" == true ]]; then
         echo >&2
+        # The onion forwards the WHOLE sshd — every authorized key AND, if enabled,
+        # password / root-password login — anonymously over Tor (gated only by the
+        # client-auth key). Refuse to expand that surface when password auth is on
+        # unless the operator forces it.
+        if [[ "$(_sshd_password_auth)" == yes ]]; then
+            bad "SSH PasswordAuthentication is ON — an onion would make password login remotely reachable over Tor."
+            info "Set 'PasswordAuthentication no' (ideally 'PermitRootLogin prohibit-password'), or re-run with --force to accept the risk."
+            [[ "$force" == true ]] || return 1
+            warn "PROCEEDING with --force: the FULL sshd (incl. password login) is reachable over the onion."
+        fi
+        warn "The onion exposes your ENTIRE sshd (all authorized keys), not only the duress key."
         _setup_tor_onion
     fi
 }
@@ -950,6 +1052,7 @@ cmd_health() {
         fail) bad  "One or more checks failed — see above" ;;
         *)    warn "No response from daemon" ;;
     esac
+    _warn_pam_dryrun
     echo >&2
     return $rc
 }

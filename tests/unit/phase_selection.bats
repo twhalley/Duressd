@@ -11,6 +11,7 @@ setup() {
     export STUB_LSBLK_NAME="/dev/sda2"
     export STUB_LUKS_DEVICES="/dev/sda2"
     export STUB_PKNAME="sda"
+    export STUB_LSBLK_NAMETYPE="sda disk"   # _disk_of walks /dev/sda2 → /dev/sda
     export STUB_SIZE=10485760   # 10 MiB → a single overwrite chunk
 }
 teardown() { teardown_stubs; }

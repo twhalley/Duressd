@@ -14,8 +14,9 @@ setup() {
     BAKED_DEPTH="<unset>"
     add_module()    { :; }
     add_binary()    { :; }
-    add_runscript() { :; }
+    add_runscript() { printf 'RUNSCRIPT\n'; }
     error()         { printf 'ERROR: %s\n' "$*"; }
+    warning()       { printf 'WARNING: %s\n' "$*"; }
     add_file() { [ "$2" = "/duress-wipe-depth" ] && read -r BAKED_DEPTH < "$1"; return 0; }
     # shellcheck disable=SC1090
     source "$REPO_ROOT/initramfs/duress-install-hook"
@@ -52,9 +53,14 @@ teardown() { rm -rf "$CFG"; }
     [ "$BAKED_DEPTH" = "traces" ]
 }
 
-@test "build() fails cleanly when the oracle is missing" {
+@test "build() FAIL-SAFES (warns, never errors/aborts) when the oracle is missing" {
+    # Regression (audit): a missing oracle must NOT abort initramfs generation
+    # (that would block kernel updates / leave no initramfs). It warns, returns 0,
+    # and does NOT bake a half-armed hook (no add_runscript).
     rm -f "$CFG/passphrase.luks"
     run build
-    assert_fail
+    assert_ok                                 # does not abort mkinitcpio
     assert_output_contains "not found"
+    refute_output_contains "ERROR"            # a warning, not an error
+    refute_output_contains "RUNSCRIPT"        # hook not baked without an oracle
 }

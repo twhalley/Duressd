@@ -169,11 +169,18 @@ check_deps() {
 
     # ── distro detection ──────────────────────────────────────────────────────
     local id="" id_like="" family="" pm=""
-    if [[ -f /etc/os-release ]]; then
-        # shellcheck source=/dev/null
-        source /etc/os-release
-        id="${ID:-}"
-        id_like="${ID_LIKE:-}"
+    if [[ -r /etc/os-release ]]; then
+        # PARSE, never `source`: sourcing os-release would execute any code in it as
+        # root — inconsistent with the project's parse-don't-source discipline
+        # (handler/pam/build-hook all parse KEY=value). Strip surrounding quotes.
+        local _k _v
+        while IFS='=' read -r _k _v; do
+            _v="${_v%\"}"; _v="${_v#\"}"
+            case "$_k" in
+                ID)      id="$_v" ;;
+                ID_LIKE) id_like="$_v" ;;
+            esac
+        done < /etc/os-release
     fi
 
     # Resolve to a family, checking ID then ID_LIKE (space-separated list)
@@ -320,14 +327,21 @@ cmd_uninstall() {
     echo -e "\n${BLD}Uninstalling duressd wipe service${RST}\n"
 
     # The trigger installers modify system files (initramfs HOOKS, the PAM auth
-    # stack, authorized_keys) that THIS uninstall does not touch. Remove them with
-    # the CLI FIRST — once the binaries below are gone you can't run these:
-    if command -v duressd >/dev/null 2>&1; then
-        warn "If you installed any triggers, remove them BEFORE continuing (the CLI is about to go):"
-        warn "  duressd install-luks-trigger  --uninstall   # boot-time hook (mkinitcpio HOOKS)"
-        warn "  duressd install-login-trigger --uninstall   # PAM auth stack"
-        warn "  duressd install-ssh-trigger   --uninstall   # authorized_keys (+ --tor)"
-        echo >&2
+    # stack, authorized_keys) that removing the binaries alone would ORPHAN — and
+    # once the CLI below is gone those reversals can't be run. So reverse them
+    # AUTOMATICALLY first, while the CLI still exists (each is a clean no-op if that
+    # trigger was never installed). Skip with DURESSD_KEEP_TRIGGERS=1.
+    local duressd_bin="$BINDIR/duressd"
+    [[ -x "$duressd_bin" ]] || duressd_bin="$(command -v duressd 2>/dev/null || true)"
+    if [[ -n "$duressd_bin" && -x "$duressd_bin" && "${DURESSD_KEEP_TRIGGERS:-}" != 1 ]]; then
+        step "Reversing any installed triggers (boot hook, PAM login, SSH)"
+        "$duressd_bin" install-luks-trigger  --uninstall 2>/dev/null || true
+        "$duressd_bin" install-login-trigger --uninstall 2>/dev/null || true
+        "$duressd_bin" install-ssh-trigger   --uninstall 2>/dev/null || true
+        good "Trigger reversals attempted (no-op for any that weren't installed)"
+    else
+        warn "CLI not found — if you installed any triggers, reverse them manually:"
+        warn "  duressd install-{luks,login,ssh}-trigger --uninstall   (before removing binaries)"
     fi
 
     step "Stopping and disabling duressd.service"

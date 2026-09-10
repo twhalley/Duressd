@@ -63,7 +63,11 @@ install -d "$(dirname "$BATS_DST")"
 if [[ -d "$REPO/tests/vendor/bats-core" ]]; then
     cp -a "$REPO/tests/vendor/bats-core" "$BATS_DST"
 else
-    git clone --depth 1 https://github.com/bats-core/bats-core.git "$BATS_DST"
+    # Pin to a release tag (not the moving default branch) so the test ISO can't
+    # silently pick up upstream changes / a compromised HEAD. Override with
+    # DURESSD_BATS_REF; vendor tests/vendor/bats-core to skip the fetch entirely.
+    git clone --depth 1 --branch "${DURESSD_BATS_REF:-v1.11.1}" \
+        https://github.com/bats-core/bats-core.git "$BATS_DST"
     rm -rf "$BATS_DST/.git"
 fi
 install -d "$PROFILE/airootfs/usr/local/bin"

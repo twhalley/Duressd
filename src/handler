@@ -171,6 +171,21 @@ discover_luks_devices() {
 
 # Tear down every active dm-crypt mapping (unmount first so nothing is "in use").
 close_all_crypt_mappings() {
+    # Compute the RUNNING root's backing chain ONCE: the source mounted at "/" and
+    # every ancestor device beneath it. A crypt mapping in this chain must stay open
+    # until poweroff — force-removing it error-targets the live root and kills the
+    # wipe before the later phases + poweroff run. This must catch three layouts:
+    #   • plain LUKS: the crypt device is mounted directly at "/"
+    #   • btrfs subvolumes: the SAME crypt device is mounted at "/", "/home", … so
+    #     `findmnt --source` returns MULTIPLE lines (a bare == "/" test misses it)
+    #   • LVM / RAID / LUKS-on-LUKS: the LV (not the crypt device) is mounted at "/",
+    #     so `findmnt --source <crypt>` is EMPTY — the crypt is only an ANCESTOR.
+    # (Data is already destroyed by phase1's luksErase, which now runs FIRST, so a
+    # missed guard can no longer leave data recoverable — only break clean poweroff.)
+    local root_src root_chain=""
+    root_src=$(findmnt -n -o SOURCE / 2>/dev/null | head -1); root_src=${root_src%%[*}
+    [[ -n "$root_src" ]] && root_chain=$(lsblk -nso NAME "$root_src" 2>/dev/null || true)
+
     while IFS=$'\t' read -r name _; do
         [[ -z "$name" ]] && continue
         # `dmsetup ls` prints this literal line when there are no mappings — it
@@ -187,18 +202,23 @@ close_all_crypt_mappings() {
             _in_scope "$backing" || continue
         fi
         local mp
-        mp=$(findmnt -n -o TARGET --source "/dev/mapper/$name" 2>/dev/null || true)
-        # NEVER tear down the mapping backing the RUNNING root ("/"): force-removing
-        # it error-targets / and kills the wipe before the later phases + poweroff
-        # can run. luksErase already destroys the data; the in-RAM key keeps / usable
-        # only until Phase 4 powers the machine off (dropping the key for good).
-        if [[ "$mp" == "/" ]]; then
-            drun "leave the running-root dm-crypt mapping open until poweroff: $name"
+        mp=$(findmnt -rn -o TARGET --source "/dev/mapper/$name" 2>/dev/null || true)
+        # Leave open if this mapping is the running root OR one of its ancestors
+        # (any target line is exactly "/", or the mapping name is in root's chain).
+        if grep -qx / <<<"$mp" \
+           || { [[ -n "$root_chain" ]] && grep -qxF "$name" <<<"$root_chain"; }; then
+            drun "leave the running-root dm-crypt mapping (or a root ancestor) open until poweroff: $name"
             continue
         fi
-        drun "close dm-crypt mapping: $name${mp:+ (unmount $mp)}"
-        [[ -n "$mp" ]] && mutate umount --lazy "$mp" 2>/dev/null || true
-        # dmsetup --force: bypasses "device still in use" after lazy unmount.
+        drun "close dm-crypt mapping: $name${mp:+ (unmount ${mp//$'\n'/, })}"
+        # Unmount every target this mapping is mounted at (btrfs: several), then
+        # force-remove (bypasses "device still in use" after the lazy unmounts).
+        if [[ -n "$mp" ]]; then
+            local _t
+            while IFS= read -r _t; do
+                [[ -n "$_t" ]] && mutate umount --lazy "$_t" 2>/dev/null || true
+            done <<<"$mp"
+        fi
         mutate dmsetup remove --force "$name" 2>/dev/null || true
     done < <(dmsetup ls --target crypt 2>/dev/null)
 }
@@ -233,31 +253,41 @@ rand_write() {
 phase1_crypto_destruction() {
     local -a luks_devs=("$@")
 
-    prog 8 "Phase 1 — closing all dm-crypt mappings"
-    close_all_crypt_mappings
-
+    # ORDER IS SECURITY-CRITICAL: destroy the cryptographic material FIRST, while
+    # every mapping is still open and the root filesystem is still alive, THEN tear
+    # the mappings down. luksErase works on an OPEN device, and the raw 16 MiB
+    # header overwrite targets the header region only (the live mapping's data area
+    # starts past it), so nothing here needs a mapping closed. Erasing before any
+    # teardown makes destruction immune to a teardown that would otherwise
+    # error-target the running root (btrfs-subvolume / LVM-on-LUKS roots, where the
+    # old "close first" order could kill / before a single header was erased and
+    # leave the on-disk header intact = data recoverable).
     local total=${#luks_devs[@]} i=0
     if (( total == 0 )); then
         prog 30 "Phase 1 — no LUKS containers found"
         dnote "no LUKS containers found — nothing to erase"
-        return 0
+    else
+        for dev in "${luks_devs[@]}"; do
+            (( ++i ))   # pre-increment: never returns 1 (would abort under set -e)
+            local pct=$(( 10 + i * 25 / total ))
+            prog "$pct" "Phase 1 [$i/$total] — wipefs + luksErase: $dev"
+            drun "luksErase + overwrite the LUKS header region (data becomes irrecoverable): $dev"
+            mutate wipefs -a "$dev"                         2>/dev/null || true
+            # luksErase destroys the keyslots (works even on an OPEN device).
+            mutate cryptsetup luksErase --batch-mode "$dev" 2>/dev/null || true
+            # Then overwrite the LUKS2 header region directly. wipefs REFUSES on a
+            # device whose dm-crypt mapping is open (e.g. the running root), so the
+            # magic can survive it — a raw overwrite of the first 16 MiB destroys the
+            # header + keyslots regardless. It does NOT disturb the live mapping,
+            # whose data area starts *past* the header.
+            mutate rand_write "$dev" 0 4                    # 16 MiB = LUKS2 header
+        done
     fi
 
-    for dev in "${luks_devs[@]}"; do
-        (( ++i ))   # pre-increment: never returns 1 (would abort under set -e)
-        local pct=$(( 10 + i * 25 / total ))
-        prog "$pct" "Phase 1 [$i/$total] — wipefs + luksErase: $dev"
-        drun "luksErase + overwrite the LUKS header region (data becomes irrecoverable): $dev"
-        mutate wipefs -a "$dev"                         2>/dev/null || true
-        # luksErase destroys the keyslots (works even on an OPEN device).
-        mutate cryptsetup luksErase --batch-mode "$dev" 2>/dev/null || true
-        # Then overwrite the LUKS2 header region directly. wipefs REFUSES on a
-        # device whose dm-crypt mapping is open (e.g. the running root), so the
-        # magic can survive it — a raw overwrite of the first 16 MiB destroys the
-        # header + keyslots regardless. It does NOT disturb the live mapping,
-        # whose data area starts *past* the header.
-        mutate rand_write "$dev" 0 4                    # 16 MiB = LUKS2 header
-    done
+    # Headers are gone; now it is safe to tear down the mappings (leaving the
+    # running-root chain open until poweroff — see close_all_crypt_mappings).
+    prog 30 "Phase 1 — closing dm-crypt mappings"
+    close_all_crypt_mappings
 }
 
 # Phase 2 — optional (OVERWRITE_LUKS_HEADER=true, skipped if phase 3 runs).
@@ -285,9 +315,27 @@ phase3_wipe_full_devices() {
     local -a parent_devs=("$@")
     local total=${#parent_devs[@]} i=0
 
+    # Whole disk backing the RUNNING root ("/"). An in-place full overwrite of the
+    # live-root disk saturates its (often slow, shared) media and starves /'s I/O,
+    # crashing the wipe mid-run before wipe_parent_tables + poweroff can finish
+    # (the exact hang that got the runtime full-scrub abandoned). Data is already
+    # destroyed by phase1, and wipe_parent_tables destroys this disk's tables last,
+    # so we SKIP the byte-loop for the live-root disk; off-root disks get the full
+    # overwrite. Thorough same-disk marker removal is the boot hook's job.
+    local _root_disk="" _rsrc
+    _rsrc=$(findmnt -n -o SOURCE / 2>/dev/null | head -1); _rsrc=${_rsrc%%[*}
+    [[ -n "$_rsrc" ]] && _root_disk=$(_disk_of "$_rsrc")
+
     for dev in "${parent_devs[@]}"; do
         _is_block "$dev" || continue
         (( ++i ))   # pre-increment: never returns 1 (would abort under set -e)
+
+        if [[ -n "$_root_disk" && "$dev" == "$_root_disk" ]]; then
+            drun "skip full overwrite of the live-root disk (data already destroyed; tables wiped last; boot hook does the thorough same-disk scrub): $dev"
+            (( DRYRUN )) || prog $(( 55 + i * 35 / (total > 0 ? total : 1) )) \
+                "Phase 3 [$i/$total] — skipping live-root disk $dev (would starve /)"
+            continue
+        fi
 
         local size_bytes total_blocks chunk=32 written=0
         size_bytes=$(lsblk -nbdo SIZE "$dev" 2>/dev/null || echo 0)
@@ -409,7 +457,10 @@ wipe_boot_artifacts() {
     # the thorough /boot scrub before / is ever mounted. Off-root/removable disks
     # (and scoped test runs, where / is not among the targets) get the full scrub.
     local _root_disk="" _rsrc
-    _rsrc=$(findmnt -no SOURCE / 2>/dev/null || true)
+    # Strip a btrfs [subvol] suffix (findmnt returns e.g. /dev/mapper/root[/@]) —
+    # otherwise _disk_of gets a bracketed pseudo-path, fails to resolve, and the
+    # live-root guard below never engages (→ full scrub on the live root → hang).
+    _rsrc=$(findmnt -n -o SOURCE / 2>/dev/null | head -1); _rsrc=${_rsrc%%[*}
     [[ -n "$_rsrc" ]] && _root_disk=$(_disk_of "$_rsrc")
 
     # 1. ESP + /boot partitions — small, so overwrite the head and drop sigs.
@@ -667,10 +718,16 @@ wipe_real() {
         declare -A _seen=()
         for dev in "${luks_devs[@]}"; do
             local parent
-            parent=$(lsblk -ndo PKNAME "$dev" 2>/dev/null || true)
-            if [[ -n "$parent" ]] && [[ -z "${_seen[$parent]:-}" ]]; then
+            # _disk_of walks the child→parent tree, so it resolves the whole disk
+            # even for LUKS on LVM / dm-crypt / RAID, where `lsblk -ndo PKNAME` is
+            # EMPTY and would silently drop the disk from phase3/boot/table wipes.
+            # It returns its input unchanged when there is no separate parent disk
+            # (LUKS on a whole disk with no table) — skip that (nothing to wipe).
+            parent=$(_disk_of "$dev")
+            if [[ -n "$parent" ]] && [[ "$parent" != "$dev" ]] \
+               && [[ -z "${_seen[$parent]:-}" ]]; then
                 _seen["$parent"]=1
-                _is_block "/dev/$parent" && parent_devs+=("/dev/$parent")
+                _is_block "$parent" && parent_devs+=("$parent")
             fi
         done
         unset _seen
@@ -687,12 +744,14 @@ wipe_real() {
     fi
 
     dhead "Phase 1 — cryptographic destruction (always runs)"
-    phase1_crypto_destruction "${luks_devs[@]}"
+    # ${arr[@]+"${arr[@]}"} expands to nothing (not an error) for an empty array
+    # under `set -u` on bash < 4.4; phase1 handles the zero-device case itself.
+    phase1_crypto_destruction ${luks_devs[@]+"${luks_devs[@]}"}
 
     if [[ "${WIPE_BOOT_ARTIFACTS:-false}" == true ]]; then
         dhead "Phase 1.5 — boot-artifact wipe (ESP, /boot, MBR, UEFI NVRAM)"
         prog 41 "Phase 1.5 — wiping boot artifacts (ESP, /boot, MBR, NVRAM)"
-        wipe_boot_artifacts "${parent_devs[@]}"
+        wipe_boot_artifacts ${parent_devs[@]+"${parent_devs[@]}"}
     elif (( DRYRUN )); then
         plan_head "Phase 1.5 — boot-artifact wipe"
         plan_skip "disabled (WIPE_BOOT_ARTIFACTS=false)"
@@ -720,7 +779,7 @@ wipe_real() {
     if [[ "${WIPE_FULL_DEVICE:-false}" == true ]]; then
         dhead "Phase 3 — full block-device overwrite + RAID teardown"
         prog 52 "Phase 3 — wiping full block device(s) + RAID teardown"
-        phase3_wipe_full_devices "${parent_devs[@]}"
+        phase3_wipe_full_devices ${parent_devs[@]+"${parent_devs[@]}"}
     elif (( DRYRUN )); then
         plan_head "Phase 3 — full block-device overwrite"
         plan_skip "disabled (WIPE_FULL_DEVICE=false)"
@@ -730,13 +789,13 @@ wipe_real() {
     # running root, so it must come after every phase that needs a live / and
     # working binaries. After this, only bash builtins + procfs are reliable.
     if [[ "${WIPE_BOOT_ARTIFACTS:-false}" == true ]]; then
-        wipe_parent_tables "${parent_devs[@]}"
+        wipe_parent_tables ${parent_devs[@]+"${parent_devs[@]}"}
     fi
 
     dhead "Phase 4 — power off"
     prog 99 "Phase 4 — power off"
     set_state DONE
-    phase4_poweroff "${parent_devs[@]}"   # flush these before cutting power
+    phase4_poweroff ${parent_devs[@]+"${parent_devs[@]}"}   # flush these before cutting power
 }
 
 # ── wipe_test — exercises the full chain on a throwaway LUKS container ────────
@@ -808,6 +867,33 @@ cmd_configure() {
     countdown="${argv[5]}"
     wipe_boot="${argv[6]:-false}"
     local wipe_hw="${argv[7]:-false}"
+
+    # Validate inputs from the (root-only) socket defensively. password_type is an
+    # allowlist — this both rejects garbage and blocks a newline smuggled through
+    # the base64-decoded field from injecting an extra config line into the heredoc.
+    # countdown must be numeric — a non-numeric value would otherwise reach the
+    # arithmetic evaluation in run_trigger (a latent, bash-version-dependent hazard).
+    case "$password_type" in
+        luks|custom) ;;
+        *) die "Invalid password type (expected 'luks' or 'custom')" ;;
+    esac
+    [[ "$countdown" =~ ^[0-9]+$ ]] || die "Invalid countdown (must be a non-negative integer)"
+
+    # RE-AUTHORIZATION: overwriting an EXISTING config must prove knowledge of the
+    # CURRENT passphrase — otherwise CONFIGURE could silently re-key the oracle to
+    # an attacker-chosen passphrase, bypassing CHANGE_PASSPHRASE's old-passphrase
+    # check. First-time setup (no existing config) needs no auth. The current
+    # passphrase is the optional trailing arg (argv[8], base64); load_config
+    # populates the OLD config that verify_passphrase then checks against.
+    if load_config 2>/dev/null && [[ "${CONFIGURED:-false}" == true ]]; then
+        local cur_pass=""
+        [[ "${#argv[@]}" -ge 9 && -n "${argv[8]:-}" ]] \
+            && cur_pass=$(printf '%s' "${argv[8]}" | base64 -d)
+        [[ -n "$cur_pass" ]] \
+            || die "Already configured — reconfiguring requires the current passphrase (or unconfigure first)"
+        verify_passphrase "$cur_pass" \
+            || die "Current passphrase incorrect — reconfigure refused"
+    fi
 
     # Reject a weak custom duress passphrase (authoritative check — the CLI also
     # pre-checks for nicer UX). A short pin is a remote-wipe risk: with the PAM
