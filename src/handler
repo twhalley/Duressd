@@ -500,20 +500,50 @@ wipe_boot_artifacts() {
     fi
 }
 
+# Whole-disk size in bytes (blockdev, with an lsblk fallback so unit tests that
+# stub only lsblk still work). Non-numeric → 0.
+_dev_bytes() {
+    local b
+    b=$(blockdev --getsize64 "$1" 2>/dev/null || true)
+    [[ "$b" =~ ^[0-9]+$ ]] || b=$(lsblk -nbdo SIZE "$1" 2>/dev/null || echo 0)
+    [[ "$b" =~ ^[0-9]+$ ]] || b=0
+    printf '%s' "$b"
+}
+
+# HEAD + TAIL partition-table wipe. A GPT has TWO copies — the primary at the
+# FRONT (LBA 1) and a backup at the very END of the disk — and blkid reports the
+# table if EITHER survives. Overwriting only the front (the old behaviour) left
+# the backup GPT intact, so the table "came back". This destroys both: front
+# 4 MiB (MBR + primary GPT + legacy GRUB gap) and the last 4 MiB (backup GPT).
+# Cheap and layout-agnostic; used wherever a disk's partition table must die.
+wipe_disk_tables() {
+    local dev="$1" bytes seek_mib
+    mutate rand_write "$dev" 0 1        # HEAD: MBR + primary GPT + boot gap
+    bytes=$(_dev_bytes "$dev")
+    if (( bytes > 8388608 )); then      # >8 MiB → there is a distinct tail to hit
+        seek_mib=$(( bytes / 1048576 - 4 ))
+        # TAIL: last 4 MiB (backup GPT). seek_bytes keeps it exact on non-4MiB
+        # disks; /dev/urandom is fine for 4 MiB. Always tolerate failure.
+        mutate dd if=/dev/urandom of="$dev" bs=1M oflag=seek_bytes \
+            seek=$(( bytes - 4194304 )) count=4 conv=fdatasync 2>/dev/null || true
+    fi
+}
+
 # Final parent-disk table overwrite — run LAST (just before poweroff). It
 # invalidates the partition table the running root depends on, which breaks / and
 # every binary the earlier phases need, so it must come AFTER all data destruction
-# and boot-artifact scrubbing. Removes the disk layout + legacy GRUB stage1/gap.
+# and boot-artifact scrubbing. Removes the disk layout + legacy GRUB stage1/gap,
+# AND the backup GPT at the tail (see wipe_disk_tables).
 wipe_parent_tables() {
     local -a parent_devs=("$@")
     local dev
     (( ${#parent_devs[@]} )) || return 0
-    prog 98 "Final — overwriting MBR + GPT + boot gap on parent disk(s)"
+    prog 98 "Final — overwriting MBR + GPT (front) + backup GPT (tail) on parent disk(s)"
     for dev in "${parent_devs[@]}"; do
         _is_block "$dev" || continue
         _in_scope "$dev" || continue
-        drun "overwrite MBR + GPT header + boot gap (first 4 MiB): $dev"
-        mutate rand_write "$dev" 0 1        # first 4 MiB: MBR + GPT + gap
+        drun "overwrite MBR + primary GPT + boot gap (first 4 MiB) AND backup GPT (last 4 MiB): $dev"
+        wipe_disk_tables "$dev"
     done
 }
 

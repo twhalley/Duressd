@@ -127,5 +127,6 @@ teardown() { teardown_stubs; }
     DRYRUN=1
     run wipe_parent_tables /dev/sda
     assert_ok
-    assert_output_contains "MBR + GPT header"
+    assert_output_contains "primary GPT"      # HEAD
+    assert_output_contains "backup GPT"       # TAIL — head+tail methodology
 }

@@ -59,7 +59,7 @@ run_hook() {
             # lookup then fails and the disk-level writes would hit the PARTITION
             # instead of the whole disk (leaving the GPT intact). readlink -f gives
             # the real node (/dev/vda3) so the parent walk works.
-            local real part pdir disk sectors
+            local real part pdir disk dbase pstart psize dsize depth
             real=$(readlink -f "$resolved" 2>/dev/null)
             [ -n "$real" ] || real="$resolved"
             part="${real#/dev/}"
@@ -68,21 +68,28 @@ run_hook() {
                 pdir=$(readlink -f "/sys/class/block/$part" 2>/dev/null)
                 [ -n "$pdir" ] && disk="/dev/$(basename "$(dirname "$pdir")")"
             fi
+            # Geometry in 512-byte sectors: the LUKS partition's start + size on the
+            # disk, and the whole-disk size. These bound the head (everything before
+            # the encrypted data) and the tail (everything after) for the `traces`
+            # wipe below. Missing/unreadable → 0 (callers fall back to a full wipe).
+            dbase=$(basename "$disk")
+            pstart=$(cat "/sys/class/block/$part/start" 2>/dev/null || echo 0)
+            psize=$(cat "/sys/class/block/$part/size"  2>/dev/null || echo 0)
+            dsize=$(cat "/sys/class/block/$dbase/size" 2>/dev/null || echo 0)
 
-            # FAST, decisive part first — done in well under a second, so it always
-            # completes even if power is pulled moments later:
-            #   • erase the LUKS keyslots (data cryptographically gone),
+            # FAST, decisive part (ALL depths) — sub-second, so it always completes
+            # even if power is pulled moments later:
+            #   • erase the LUKS keyslots (data cryptographically gone FOREVER),
             #   • overwrite the LUKS header region,
-            #   • destroy the partition table (primary GPT/MBR at the front + the
-            #     backup GPT at the end) → the disk is unpartitioned and unbootable,
-            #     and the ESP/boot filesystem superblocks at the front are gone.
+            #   • destroy the partition table: primary GPT/MBR at the FRONT (8 MiB)
+            #     and the backup GPT at the TAIL (last 4 MiB) → unpartitioned,
+            #     unbootable, and the front-of-ESP superblock gone.
             cryptsetup luksErase --batch-mode "$real" >/dev/null 2>&1
             dd if=/dev/urandom of="$real" bs=1M count=32 conv=fsync 2>/dev/null
-            dd if=/dev/urandom of="$disk" bs=1M count=8 conv=fsync 2>/dev/null
-            sectors=$(cat "/sys/class/block/$(basename "$disk")/size" 2>/dev/null || echo 0)
-            if [ "$sectors" -gt 4096 ] 2>/dev/null; then
-                dd if=/dev/urandom of="$disk" bs=512 seek=$((sectors - 4096)) \
-                    count=4096 conv=fsync 2>/dev/null
+            dd if=/dev/urandom of="$disk" bs=1M count=8  conv=fsync 2>/dev/null
+            if [ "$dsize" -gt 8192 ] 2>/dev/null; then
+                dd if=/dev/urandom of="$disk" bs=512 seek=$(( dsize - 8192 )) \
+                    count=8192 conv=fsync 2>/dev/null   # backup GPT (last 4 MiB)
             fi
             sync
 
@@ -90,11 +97,33 @@ run_hook() {
             # Generic, non-revealing message — no hint that a wipe occurred.
             printf '\nError: unable to access the disk.\n' >&2
 
-            # SLOW, thorough finish — overwrite the ENTIRE disk so no marker survives
-            # anywhere (kernels, initramfs, the whole ESP and /boot). Runs to ENOSPC;
-            # best-effort (no openssl in the initramfs, so /dev/urandom drives it).
-            # Nothing further needs the disk, so however long it takes is fine.
-            dd if=/dev/urandom of="$disk" bs=4M conv=fsync 2>/dev/null
+            # DEPTH — baked at build time in /duress-wipe-depth; default `traces`:
+            #   header — stop here. Data unrecoverable + disk unbootable, instantly.
+            #            Fastest. Leaves ESP/boot file bytes (a forensic trace).
+            #   traces — also overwrite every NON-encrypted region: the HEAD
+            #            [0 .. LUKS start) (GPT + ESP + /boot) and the TAIL
+            #            [LUKS end .. disk end). Removes ALL cleartext OS traces
+            #            WITHOUT grinding the keyless, encrypted data area — fast.
+            #            Falls back to a full wipe if the geometry is unreadable.
+            #   full   — overwrite the ENTIRE disk. Slowest; no residual ciphertext.
+            depth="traces"
+            [ -f /duress-wipe-depth ] && read -r depth < /duress-wipe-depth 2>/dev/null
+            [ -n "$depth" ] || depth="traces"
+            case "$depth" in
+                header|fast|quick) : ;;                        # nothing more
+                full|entire|nuke)
+                    dd if=/dev/urandom of="$disk" bs=4M conv=fsync 2>/dev/null ;;
+                *)  # traces (default): dynamic HEAD + TAIL
+                    if [ "$pstart" -gt 0 ] 2>/dev/null && [ "$psize" -gt 0 ] 2>/dev/null; then
+                        # HEAD: [0 .. LUKS start) — GPT + ESP + /boot + anything before.
+                        dd if=/dev/urandom of="$disk" bs=1M count=$(( pstart / 2048 + 1 )) conv=fsync 2>/dev/null
+                        # TAIL: [LUKS end .. disk end) — trailing gap + backup GPT.
+                        dd if=/dev/urandom of="$disk" bs=1M seek=$(( (pstart + psize) / 2048 )) conv=fsync 2>/dev/null
+                    else
+                        # geometry unknown → full overwrite is the safe superset
+                        dd if=/dev/urandom of="$disk" bs=4M conv=fsync 2>/dev/null
+                    fi ;;
+            esac
             sync
             sleep 1
             poweroff -f
