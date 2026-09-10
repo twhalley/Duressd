@@ -709,6 +709,8 @@ sudo duressd install-luks-trigger --depth header  # or header / traces / full
 sudo duressd install-luks-trigger --uninstall     # clean removal
 ```
 
+> **Surviving `pacman -Syu`.** The hook lives in admin-owned locations pacman never overwrites (`/etc/initcpio/{install,hooks}/duress`, your `/etc/mkinitcpio.conf` HOOKS line), and a kernel/mkinitcpio update **re-bakes** it into the new initramfs automatically. The only way an update drops it is if you overwrite `mkinitcpio.conf` with its `.pacnew` (losing the `duress` HOOKS entry) — so `install.sh` also installs a **pacman PostTransaction hook** that runs after `linux`/`mkinitcpio` upgrades and prints a loud warning if the boot trigger went missing, telling you to re-add it and run `mkinitcpio -P`. Merge `.pacnew` files carefully.
+
 **Wipe depth** (`--depth`, baked into the initramfs; `BOOT_WIPE_DEPTH` in the config):
 
 | Depth | What it overwrites | Speed |
