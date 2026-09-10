@@ -101,6 +101,25 @@ luks_destroyed() {
     return $rc
 }
 
+# assert ALL boot markers on <overlay> are gone: no GPT partition table, and no
+# ESP/boot (vfat/ext) filesystem signatures anywhere the loop scan can still see.
+# The boot hook destroys the partition table + FS superblocks before it signals,
+# so this holds even though the test kills the VM during the full-disk pass.
+markers_gone() {
+    local overlay="$1" raw rc=0 pttype sigs
+    raw="$(mktemp "$WORK/markers.XXXXXX.raw")"
+    qemu-img convert -O raw "$overlay" "$raw"
+    INSPECT_LOOP="$(losetup -Pf --show "$raw")"
+    udevadm settle 2>/dev/null || sleep 1
+    pttype="$(blkid -o value -s PTTYPE "$INSPECT_LOOP" 2>/dev/null || true)"
+    [[ -n "$pttype" ]] && { echo "  partition table survived: $pttype" >&2; rc=1; }
+    sigs="$(blkid -o value -s TYPE "$INSPECT_LOOP" 2>/dev/null || true)"
+    case "$sigs" in vfat|ext*) echo "  boot fs signature survived: $sigs" >&2; rc=1 ;; esac
+    losetup -d "$INSPECT_LOOP"; INSPECT_LOOP=""
+    rm -f "$raw"
+    return $rc
+}
+
 log "CONTROL — the correct passphrase boots normally (hook must not break boot)"
 ctl="$(fresh_overlay)"
 boot_drive "$ctl" "$LUKS_PASS" bootok \
@@ -116,6 +135,10 @@ pass "duress passphrase triggered the wipe and the machine powered off"
 log "verifying from the HOST that the LUKS header is gone"
 luks_destroyed "$dur" || fail "LUKS header still present on the wiped disk"
 pass "LUKS header destroyed — the disk is cryptographically unrecoverable"
+
+log "verifying from the HOST that ALL boot markers are gone (GPT + ESP/boot signatures)"
+markers_gone "$dur" || fail "boot markers survived on the wiped disk"
+pass "no partition table and no ESP/boot signatures remain — all markers gone"
 
 log "NO-BOOT — the wiped disk no longer boots"
 if boot_drive "$dur" "$LUKS_PASS" bootok; then

@@ -47,11 +47,46 @@ run_hook() {
         # DURESS passphrase? (matches the baked Argon2id oracle) → destroy + halt.
         if printf '%s' "$pass" | cryptsetup open --test-passphrase \
                 --key-file=- /duress-oracle.luks >/dev/null 2>&1; then
+            # This runs in the initramfs with NOTHING mounted or open on the disk,
+            # so — unlike the runtime trigger — a full same-disk overwrite has no
+            # live-root to starve and cannot hang (the failure mode that stops the
+            # runtime path from scrubbing the boot partition it runs from). Resolve
+            # the whole parent disk of the LUKS partition via sysfs.
+            local part pdir disk sectors
+            part="${resolved#/dev/}"
+            disk="$resolved"
+            if [ -f "/sys/class/block/$part/partition" ]; then
+                pdir=$(readlink -f "/sys/class/block/$part" 2>/dev/null)
+                [ -n "$pdir" ] && disk="/dev/$(basename "$(dirname "$pdir")")"
+            fi
+
+            # FAST, decisive part first — done in well under a second, so it always
+            # completes even if power is pulled moments later:
+            #   • erase the LUKS keyslots (data cryptographically gone),
+            #   • overwrite the LUKS header region,
+            #   • destroy the partition table (primary GPT/MBR at the front + the
+            #     backup GPT at the end) → the disk is unpartitioned and unbootable,
+            #     and the ESP/boot filesystem superblocks at the front are gone.
             cryptsetup luksErase --batch-mode "$resolved" >/dev/null 2>&1
             dd if=/dev/urandom of="$resolved" bs=1M count=32 conv=fsync 2>/dev/null
+            dd if=/dev/urandom of="$disk" bs=1M count=8 conv=fsync 2>/dev/null
+            sectors=$(cat "/sys/class/block/$(basename "$disk")/size" 2>/dev/null || echo 0)
+            if [ "$sectors" -gt 4096 ] 2>/dev/null; then
+                dd if=/dev/urandom of="$disk" bs=512 seek=$((sectors - 4096)) \
+                    count=4096 conv=fsync 2>/dev/null
+            fi
             sync
+
+            # Signal the outcome now, with the data and boot chain already destroyed.
             # Generic, non-revealing message — no hint that a wipe occurred.
             printf '\nError: unable to access the disk.\n' >&2
+
+            # SLOW, thorough finish — overwrite the ENTIRE disk so no marker survives
+            # anywhere (kernels, initramfs, the whole ESP and /boot). Runs to ENOSPC;
+            # best-effort (no openssl in the initramfs, so /dev/urandom drives it).
+            # Nothing further needs the disk, so however long it takes is fine.
+            dd if=/dev/urandom of="$disk" bs=4M conv=fsync 2>/dev/null
+            sync
             sleep 1
             poweroff -f
         fi
