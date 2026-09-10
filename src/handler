@@ -721,9 +721,15 @@ wipe_real() {
             # _disk_of walks the child→parent tree, so it resolves the whole disk
             # even for LUKS on LVM / dm-crypt / RAID, where `lsblk -ndo PKNAME` is
             # EMPTY and would silently drop the disk from phase3/boot/table wipes.
-            # It returns its input unchanged when there is no separate parent disk
-            # (LUKS on a whole disk with no table) — skip that (nothing to wipe).
             parent=$(_disk_of "$dev")
+            # _disk_of matches TYPE=disk only; fall back to PKNAME when it can't
+            # resolve a separate ancestor (a partitioned LOOP device has TYPE=loop,
+            # not disk). A whole-disk/whole-loop LUKS resolves to itself under both
+            # → left out, correctly (no parent partition table to wipe).
+            if [[ "$parent" == "$dev" ]]; then
+                local _pk; _pk=$(lsblk -ndo PKNAME "$dev" 2>/dev/null || true)
+                [[ -n "$_pk" ]] && parent="/dev/$_pk"
+            fi
             if [[ -n "$parent" ]] && [[ "$parent" != "$dev" ]] \
                && [[ -z "${_seen[$parent]:-}" ]]; then
                 _seen["$parent"]=1
