@@ -7,6 +7,14 @@ set -euo pipefail
 SOCKET=${DURESSD_SOCKET:-/run/duressd/control.sock}
 SERVICE=duressd
 
+# socat's default fin-wait is 0.5s: once we send our one command line and its
+# stdin hits EOF, socat force-closes the socket 0.5s later — cutting the daemon's
+# reply mid-stream. Fast commands (STATUS) finish inside that window, but a dry
+# run does full disk discovery BEFORE its first PLAN line (>0.5s), and a real
+# trigger streams a countdown, so both lost their output. Give socat a generous
+# linger; it still exits promptly the instant the daemon closes the connection.
+SOCAT_LINGER=${DURESSD_SOCAT_LINGER:-30}
+
 # ── colours ───────────────────────────────────────────────────────────────────
 if [[ -t 2 ]]; then
     RED=$'\033[1;31m'   YLW=$'\033[1;33m'   GRN=$'\033[1;32m'
@@ -119,7 +127,7 @@ send_cmd() {
                 rc=1
                 ;;
         esac
-    done < <(printf '%s\n' "$line" | socat - "UNIX-CONNECT:${SOCKET}" 2>/dev/null)
+    done < <(printf '%s\n' "$line" | socat -t "$SOCAT_LINGER" - "UNIX-CONNECT:${SOCKET}" 2>/dev/null)
 
     return $rc
 }
@@ -807,8 +815,15 @@ cmd_install_login_trigger() {
         warn "Use a STRONG duress passphrase — a weak pin is a network-reachable self-destruct."
     fi
 
-    install -Dm755 "$src/pam-duress" "$script"
-    good "Installed PAM hook: $script"
+    # In the standard install.sh layout DURESSD_PAM_SRC and DURESSD_LIBDIR are the
+    # same dir, so src/pam-duress IS $script — `install` would error "same file".
+    # Only copy when they actually differ.
+    if [[ "$src/pam-duress" -ef "$script" ]]; then
+        info "PAM hook script already in place: $script"
+    else
+        install -Dm755 "$src/pam-duress" "$script"
+    fi
+    good "PAM hook script: $script"
 
     local line="auth optional pam_exec.so expose_authtok quiet $script"
     if grep -qF "$script" "$pamfile" 2>/dev/null; then
@@ -926,7 +941,7 @@ cmd_health() {
                 ;;
             PROGRESS) ;;
         esac
-    done < <(printf 'HEALTH\n' | socat - "UNIX-CONNECT:${SOCKET}" 2>/dev/null)
+    done < <(printf 'HEALTH\n' | socat -t "$SOCAT_LINGER" - "UNIX-CONNECT:${SOCKET}" 2>/dev/null)
 
     echo >&2
     case "$overall" in

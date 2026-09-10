@@ -59,6 +59,24 @@ _wait_record() { local i; for i in $(seq 1 50); do [ -s "$RECORD" ] && return 0;
     grep -q 'PASS=\[test-pin\]' "$RECORD"                    # still via env, not argv
 }
 
+@test "pam-duress resolves an ABSOLUTE duressd path (PAM's PATH excludes /usr/local/bin)" {
+    # Regression: at a real login pam_exec runs with a minimal PATH that does not
+    # include /usr/local/bin, so a bare "duressd" is not found and the trigger
+    # never fires. Prove the hook finds duressd by absolute path with NO
+    # DURESSD_BIN override and with the bare name unreachable via PATH.
+    : > "$DURESSD_CFGDIR/trigger.env"        # no DURESSD_BIN pin this time
+    fakebin="$PAMTEST/usr/local/bin"; mkdir -p "$fakebin"
+    cp "$PAMTEST/rec" "$fakebin/duressd"     # duressd reachable ONLY by absolute path
+    # PATH mirrors PAM's real minimal env (has bash, EXCLUDES /usr/local/bin), so a
+    # bare "duressd" lookup would fail — only the absolute-path search can succeed.
+    run env -u DURESSD_BIN PATH="/usr/bin:/bin" \
+        DURESSD_BIN_CANDIDATES="$fakebin/duressd" \
+        bash -c 'printf "%s" abs-pin | bash "'"$HOOK"'"'
+    [ "$status" -eq 0 ]
+    _wait_record || { echo "trigger never fired via absolute path"; return 1; }
+    grep -q 'PASS=\[abs-pin\]' "$RECORD"
+}
+
 @test "pam-duress does NOT fire on an empty authtok" {
     printf '' | bash "$HOOK"
     sleep 0.3

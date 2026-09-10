@@ -34,7 +34,7 @@ die()   { printf 'ERROR\t%s\n' "$*"; exit 1; }
 # ── dry-run preview plumbing ──────────────────────────────────────────────────
 # PLAN lines carry a kind (head|item|skip|note) the CLI renders in green so the
 # operator always sees this is a safe, non-destructive rehearsal.
-plan()      { printf 'PLAN\t%s\t%s\n' "$1" "$2"; }
+plan()      { printf 'PLAN\t%s\t%s\n' "$1" "$2" 2>/dev/null || return 0; }
 plan_head() { plan head "$1"; }
 plan_item() { plan item "$1"; }
 plan_skip() { plan skip "$1"; }
