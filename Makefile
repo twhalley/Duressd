@@ -23,7 +23,7 @@ SHELL      := /bin/bash
 SHELLCHECK ?= shellcheck
 BATS       ?= bats
 
-SHELL_SOURCES := src/handler src/daemon src/cli install.sh \
+SHELL_SOURCES := src/handler src/daemon src/cli src/duressd-update-guard install.sh \
                  tests/stubs/generic-stub tests/vm/auto.sh tests/vm/shell.sh \
                  tests/vm/inside.sh tests/vm/encrypted-e2e.sh tests/vm/tpm-e2e.sh \
                  tests/vm/ssh-e2e.sh tests/vm/tor-e2e.sh tests/vm/pam-e2e.sh \

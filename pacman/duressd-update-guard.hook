@@ -1,0 +1,18 @@
+# Installed by duressd to /etc/pacman.d/hooks/. After any linux-kernel or
+# mkinitcpio upgrade (the ones that regenerate the initramfs / ship a
+# mkinitcpio.conf .pacnew), verify the boot-time duress trigger is still armed and
+# warn loudly if a .pacnew merge dropped it. PostTransaction + a guard that always
+# exits 0, so it never fails or delays a pacman transaction.
+[Trigger]
+Operation = Upgrade
+Type = Package
+Target = linux
+Target = linux-lts
+Target = linux-zen
+Target = linux-hardened
+Target = mkinitcpio
+
+[Action]
+Description = duressd: checking the boot duress trigger survived the update...
+When = PostTransaction
+Exec = /usr/local/lib/duressd/duressd-update-guard

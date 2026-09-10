@@ -275,6 +275,19 @@ cmd_install() {
         install -Dm755 "${_dir}/pam/pam-duress" "$LIBDIR/pam-duress"
     fi
 
+    # Update-survival guard: a pacman PostTransaction hook that warns if a
+    # linux/mkinitcpio upgrade (via a mishandled .pacnew) silently drops the boot
+    # duress trigger. Installed only on pacman hosts; harmless if no trigger is set.
+    if [[ -f "${_dir}/src/duressd-update-guard" ]]; then
+        install -Dm0755 "${_dir}/src/duressd-update-guard" "$LIBDIR/duressd-update-guard"
+        local pac_hooks="${PACMAN_HOOKS_DIR:-/etc/pacman.d/hooks}"
+        if [[ -d "$(dirname "$pac_hooks")" && -f "${_dir}/pacman/duressd-update-guard.hook" ]]; then
+            step "Installing pacman update-survival hook to $pac_hooks/"
+            install -Dm0644 "${_dir}/pacman/duressd-update-guard.hook" \
+                "$pac_hooks/duressd-update-guard.hook"
+        fi
+    fi
+
     step "Installing shell aliases to $ALIASES"
     install -Dm0644 "$SRC/aliases.sh" "$ALIASES"
 
@@ -354,6 +367,7 @@ cmd_uninstall() {
     step "Removing binaries"
     rm -rf "$LIBDIR"
     rm -f  "$BINDIR/duressd"
+    rm -f  "${PACMAN_HOOKS_DIR:-/etc/pacman.d/hooks}/duressd-update-guard.hook"
 
     step "Removing shell aliases"
     rm -f "$ALIASES"
