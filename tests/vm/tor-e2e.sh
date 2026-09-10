@@ -68,6 +68,9 @@ hr "configuring the onion service + client auth (real install-ssh-trigger --tor)
 ssh-keygen -t ed25519 -N '' -C duress -f "$WORK/duresskey" >/dev/null
 export DURESSD_TOR_HSDIR="$WORK/hs" DURESSD_TORRC="$WORK/torrc" \
        DURESSD_SSH_PORT="$SSHPORT" DURESSD_TOR_USER="" DURESSD_NO_TOR_RESTART=1
+# --tor now refuses when SSH password auth is on; simulate a key-only host. Pin the
+# forced-command binary to the bare name so the socket-redirect sed below matches.
+export DURESSD_SSHD_PASSWORD_AUTH=no DURESSD_SELF_BIN=duressd
 bash src/cli install-ssh-trigger --pubkey "$WORK/duresskey.pub" \
     --authorized-keys "$WORK/authorized_keys" --tor >/dev/null 2>&1 \
     || fail "install-ssh-trigger --tor failed"

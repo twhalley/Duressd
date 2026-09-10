@@ -88,6 +88,8 @@ wget -qO- https://raw.githubusercontent.com/twhalley/Duressd/main/install.sh | s
 
 When run this way `install.sh` detects that the `src/` tree is absent, downloads the full archive from GitHub automatically, and proceeds with the normal install. No separate bootstrap script needed.
 
+> ⚠️ **`curl … | sudo bash` runs unverified code as root** and defaults to the moving `main` branch — there is no signature/checksum check. For a security tool, prefer **clone-review-run** (below), or at least pin a **reviewed tag** rather than `main`: `curl -sSL …/<TAG>/install.sh | DURESSD_REF=<TAG> sudo bash` (the bootstrap downloads the archive for `$DURESSD_REF`).
+
 ### Manual install
 
 ```bash
@@ -100,7 +102,7 @@ sudo ./install.sh install
 
 ```
 sudo ./install.sh install     # install everything
-sudo ./install.sh uninstall   # remove everything (prompts before wiping config)
+sudo ./install.sh uninstall   # auto-reverses the boot/PAM/SSH triggers first, then removes everything (prompts before wiping config)
 sudo ./install.sh status      # check all components are present and running
 ```
 
@@ -210,7 +212,7 @@ duressd verify
 
 ### `duressd configure`
 
-Interactive wizard. Sets up the duress passphrase, wipe depth, and countdown. Safe to re-run — it overwrites the existing config.
+Interactive wizard. Sets up the duress passphrase, wipe depth, and countdown. Safe to re-run — but on an **already-configured** system it first prompts for the **current** duress passphrase to authorize the change, so `configure` can't be used to silently re-key the oracle (that authorization is why re-keying goes through here or `change-passphrase`).
 
 ```
 Your LUKS passphrase: ••••••••
@@ -347,8 +349,15 @@ takes `--pubkey`) and appends a `restrict`ed forced-command entry:
 
 ```bash
 sudo duressd install-ssh-trigger
-#   command="duressd trigger-remote",restrict ssh-ed25519 AAAA… duressd-duress
+#   command="/usr/local/bin/duressd trigger-remote",restrict ssh-ed25519 AAAA… duressd-duress
 ```
+
+The forced command embeds the **absolute** path to `duressd` on purpose: sshd runs
+forced commands with a minimal `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`) that
+excludes `/usr/local/bin`, so a bare `duressd` would be "command not found" and the
+kill switch would silently do nothing. A multi-key `--pubkey` file is rejected (only
+the first line would get the `restrict` prefix), and re-running never duplicates the
+entry.
 
 Then trigger the wipe from anywhere you can reach the host — the passphrase
 travels over the encrypted SSH channel and is never stored on the machine:
@@ -368,6 +377,11 @@ obtains that private key can wipe the machine.
 Add **`--dry-run`** to `trigger-remote` to rehearse the remote path without
 touching anything — the daemon streams a green preview of exactly what a real
 remote trigger would destroy (see `duressd dry-run` above).
+
+**Remove it:** `duressd install-ssh-trigger --uninstall` strips the forced-command
+entry from `authorized_keys` (keeping your other keys), secure-erases any embedded
+passphrase, and with `--tor` also removes the onion-service block from `torrc` and
+the hidden-service directory. Idempotent; keeps a `.duressd.bak`.
 
 ---
 
@@ -396,9 +410,11 @@ SSH app. Two ways to reach the machine:
      wipe automatically — you don't get a shell.
 
    If you used the default (passphrase) mode instead of `--embed-passphrase`,
-   send the duress passphrase on stdin. In Termux:
+   send the duress passphrase on stdin. Read it from an environment variable or a
+   file so the literal never lands in your shell history. In Termux:
    ```bash
-   printf '%s' 'YOUR-DURESS-PASS' | ssh -i duressd_duress -T root@HOST
+   read -rs DURESS_PASS                                   # typed, not echoed, not in history
+   printf '%s' "$DURESS_PASS" | ssh -i duressd_duress -T root@HOST
    ```
 
 > Protect the phone-side key with the app's biometric/keystore lock. Anyone who
@@ -410,6 +426,15 @@ SSH app. Two ways to reach the machine:
 This exposes sshd as a **client-authorized v3 onion service**: the machine needs
 no public IP or open port, and only someone holding the onion client-auth key
 can even see the service (a second auth layer in front of the SSH key).
+
+> ⚠️ **The onion forwards your ENTIRE sshd**, not just the duress key — every entry
+> in `authorized_keys`, and password/root login if those are enabled, become
+> reachable over Tor (gated only by the client-auth key). For this reason
+> `install-ssh-trigger --tor` **refuses** when `PasswordAuthentication yes` is
+> detected (`--force` to override). Set `PasswordAuthentication no` and ideally
+> `PermitRootLogin prohibit-password` before exposing sshd this way. The client-auth
+> keypair is generated **once and reused** on re-runs, so a redeploy won't silently
+> invalidate a key you already distributed.
 
 1. **On the machine:**
    ```bash
@@ -439,12 +464,41 @@ phone with nothing destroyed.
 
 ### `duressd install-login-trigger`  ·  PAM login duress passphrase
 
-Installs a PAM hook (`auth optional pam_exec.so`) so that entering your **duress passphrase at any login prompt** fires the wipe. Because it's `optional`, it never blocks or changes a normal login.
+Installs a PAM hook (`auth optional pam_exec.so … expose_authtok`) so that entering your **duress passphrase at a login prompt** fires the wipe. It is inserted **after `pam_unix`** (so the password is available to the hook) and is `optional`, so it never blocks or changes a normal login.
+
+**Which login prompts does it cover?** By default it installs into the **shared `/etc/pam.d/system-auth`** stack, so it fires anywhere that stack is used:
+
+| Login path | Covered? | Notes |
+|---|---|---|
+| Console / `getty` login | ✅ | |
+| **SDDM / GDM / LightDM** (graphical login) | ✅ *(Arch default)* | e.g. `sddm` → `include system-login` → `include system-auth` |
+| **KDE / GNOME lock screen** | ✅ *(usually)* | the screen locker's PAM file includes `system-auth` on Arch |
+| `sudo` | ✅ | typing the duress passphrase to a `sudo` prompt also fires it |
+| SSH with password auth | ✅ | **this is the footgun below** |
+
+This breadth is deliberate for a duress trigger, but be aware: **the duress passphrase also wipes when typed at the lock screen or a `sudo` prompt.** If your display manager uses a standalone stack instead of `system-auth`, target it directly: `DURESSD_PAM_FILE=/etc/pam.d/sddm duressd install-login-trigger`.
+
+**Verify it on your display manager WITHOUT wiping** (uses the built-in dry-run):
+```bash
+printf 'DURESSD_PAM_DRYRUN=1\nDURESSD_DEBUG_LOG=/tmp/duress.log\n' | sudo tee -a /etc/duressd/trigger.env
+# → log out, type the DURESS passphrase at the SDDM prompt, log back in with the real one
+sudo cat /tmp/duress.log      # shows the GREEN dry-run preview — NOTHING was wiped
+sudo sed -i '/DURESSD_PAM_DRYRUN\|DURESSD_DEBUG_LOG/d' /etc/duressd/trigger.env   # re-arm the real wipe
+```
+If the log fires, that login path is wired correctly and the real trigger will work there.
+
+> ⚠️ **Re-arm after testing — `DURESSD_PAM_DRYRUN=1` is a silent disarm.** While it is set, a duress passphrase typed at *any* login only **previews** and wipes **nothing** — a "verify" still appears to work, so it is easy to forget. `duressd status` and `duressd health` now print a loud **"PAM login trigger is in DRY-RUN (DISARMED)"** warning whenever it is set. Remove the two lines (as shown above) to re-arm the real trigger.
+
+**Recovery if login ever breaks:** the hook is `auth optional`, so a missing or broken hook script cannot by itself block login. If a bad edit ever does lock you out, boot a rescue/USB or a single-user shell and restore the backup: `cp /etc/pam.d/system-auth.duressd.bak /etc/pam.d/system-auth`.
+
+> **Fedora / RHEL (authselect) caveat.** Where `/etc/pam.d/system-auth` is an **authselect-managed symlink**, a manual edit can be silently reverted by the next `authselect apply-changes` (a routine update step) — disarming the trigger without warning. After install, confirm the `pam_exec` line survives an `authselect apply-changes`; if it doesn't, add the hook via an authselect **custom profile** instead of editing `system-auth` directly.
+
+**Remove it:** `duressd install-login-trigger --uninstall` (strips the `pam_exec` line wherever it sits, leaves `pam_unix` intact, removes the hook script; idempotent, keeps a `.duressd.bak`).
 
 > ⚠️ **Remote-wipe footgun — the guard exists for a reason.** The hook runs on **every** auth attempt, including **failed** ones, and sshd uses PAM. So if **SSH `PasswordAuthentication` is enabled**, an SSH login that submits the duress passphrase **fires the wipe even though the login fails** — anyone who can reach port 22 and guess/know the pin could **remote-wipe the machine**.
 >
-> For this reason `install-login-trigger` **refuses** when `PasswordAuthentication yes` is detected (`sshd -T`). Do one of:
-> - **Key-only SSH (recommended):** `PasswordAuthentication no` in `sshd_config` → `systemctl reload sshd`. The trigger then only fires at the *physical console*.
+> For this reason `install-login-trigger` **refuses** when `PasswordAuthentication yes` is detected (`sshd -T`, then `sshd_config`/`.d`). Do one of:
+> - **Key-only SSH (recommended):** `PasswordAuthentication no` in `sshd_config` → `systemctl reload sshd`. The trigger then only fires at the *physical console* / display manager.
 > - **Accept the risk with `--force`** — only with a **strong** duress passphrase, never a short pin. A weak pin + password SSH is a network-reachable self-destruct.
 >
 > The **key-based** kill switch (`install-ssh-trigger`) is different: it's gated by possession of a dedicated SSH key, so a weak passphrase alone can't trigger it remotely.
@@ -584,8 +638,10 @@ The double `--force` bypasses systemd's graceful shutdown sequence, which would 
 | Who can trigger a wipe? | Anyone who knows the duress passphrase — no sudo, no polkit |
 | Passphrase storage | `custom` type: Argon2id LUKS2 keyslot in `/etc/duressd/passphrase.luks` (root `0600`). `luks` type: no stored secret — verified live against your LUKS volume |
 | Wire security | Unix socket `0600` in `/run/duressd/` (`0700`). Only root can connect |
-| Passphrase in memory | Passed as `--key-file=-` to cryptsetup stdin; never written to disk or the config file |
+| Passphrase in memory | Passed as `--key-file=-` to cryptsetup stdin; never in argv/process list, never logged. **Exception:** `install-ssh-trigger --embed-passphrase` deliberately stores it in **cleartext** at `/etc/duressd/ssh-trigger.pass` (root `0600`, protected only by FDE + file mode) so the key alone can trigger |
 | Config file | `/etc/duressd/config` — root `0600`. Contains only boolean flags and the verify-device path, never the passphrase |
+| Re-keying the oracle | `configure` on an existing setup and `change-passphrase` both require the **current** passphrase; `CONFIGURE` can't silently overwrite the oracle |
+| PAM login trigger armed? | `DURESSD_PAM_DRYRUN=1` in `trigger.env` **disarms** the login trigger (preview-only); `status`/`health` warn loudly when it is set |
 | SIGPIPE / client disconnect | `trap '' SIGPIPE` in handler ensures a client crash never leaves the daemon in an inconsistent state. During countdown, `printf || exit 0` aborts a wipe if the client disconnects |
 
 ---
@@ -633,13 +689,41 @@ It is possible to fire a wipe when the duress passphrase is typed at the **full-
 
 LUKS2 supports up to 32 keyslots. The trick is to:
 
-1. Add the duress passphrase as a real LUKS keyslot on your encrypted volume with `cryptsetup luksAddKey`.
-2. Install a custom **initramfs hook** that runs *before* the standard `cryptroot` script.
-3. The hook tests the typed passphrase against the duress keyslot using `cryptsetup open --test-passphrase`.
-4. If it matches → the hook destroys every LUKS header on the system, scrubs the passphrase from memory, and calls `echo o > /proc/sysrq-trigger` to halt — the filesystem is never mounted.
-5. If it doesn't match → the hook exits cleanly and `cryptroot` proceeds as normal.
+1. A separate Argon2id **oracle** (`/duress-oracle.luks`) holding the duress passphrase is baked into the initramfs at install time (it is *not* a keyslot on your data — see the Security note).
+2. A custom **initramfs hook** runs *before* the standard `encrypt`/`cryptroot` script.
+3. The hook tests the typed passphrase against the oracle with `cryptsetup open --test-passphrase`.
+4. **If it matches → it destroys the disk and powers off**, before the filesystem is ever mounted. Because nothing is mounted yet, there is no live-root to starve, so it can wipe thoroughly and cleanly:
+   - `luksErase` the LUKS keyslots (**data cryptographically unrecoverable, instantly**) + overwrite the LUKS header,
+   - destroy the partition table — **primary GPT at the front *and* the backup GPT at the tail** → unpartitioned, unbootable,
+   - then, per the configured **wipe depth** (below), scrub the OS traces,
+   - `sync` and power off.
+5. If it doesn't match → the hook exits cleanly and `encrypt` proceeds as normal (fail-safe: any misconfiguration also falls through to normal unlock).
 
 No cryptsetup source changes are needed. The hook uses cryptsetup as shipped.
+
+### Install, wipe depth, dry-run, remove (Arch / mkinitcpio)
+
+```bash
+sudo duressd install-luks-trigger                 # install (default depth: traces)
+sudo duressd install-luks-trigger --depth header  # or header / traces / full
+sudo duressd install-luks-trigger --uninstall     # clean removal
+```
+
+**Wipe depth** (`--depth`, baked into the initramfs; `BOOT_WIPE_DEPTH` in the config):
+
+| Depth | What it overwrites | Speed |
+|---|---|---|
+| `header` | `luksErase` + LUKS header + partition tables (front + backup GPT) | seconds |
+| **`traces`** *(default)* | the above **+ every non-encrypted region** — the head `[0 … LUKS start)` (GPT + ESP + `/boot`) and the tail `[LUKS end … disk end)`, sized from the partition geometry. Removes **all** cleartext OS traces **without** grinding the keyless encrypted data area | fast |
+| `full` | the entire disk, byte for byte | slow (minutes → hours) |
+
+All three make the data unrecoverable instantly (that's `luksErase`); depth only controls how much *residual trace* is scrubbed. `traces` is the sweet spot; `full` is for zero residual ciphertext.
+
+**Dry-run — verify the duress passphrase is recognised WITHOUT wiping.** Add `duressd.dryrun` to the kernel command line (edit the boot entry with `e` at the systemd-boot menu, or keep a dedicated entry). Then typing the duress passphrase shows a **green** *"DRY RUN — duress passphrase recognised. NOTHING was wiped"* and re-prompts, so your normal passphrase still boots. It's cmdline-only on purpose — there is **no persistent dry-run flag**, so a real trigger can never be silently disarmed.
+
+> Caveat: "can never be silently disarmed" holds only when the kernel command line is part of a **signed boot chain** (a signed UKI under Secure Boot — see below). On an unsigned/editable bootloader, an adversary who can edit the cmdline could add `duressd.dryrun` to neuter the boot trigger — though such an adversary can already replace the whole initramfs, so this grants no new capability.
+
+**Uninstall** removes the `duress` token from `mkinitcpio.conf` `HOOKS` (wherever it sits — round-trips the line to its original), deletes the hook files, and regenerates the initramfs so the baked oracle is gone.
 
 ### Implementation sketch
 
@@ -679,7 +763,11 @@ The real residual risk is different: the duress passphrase must remain **secret 
 **Two limitations you must plan around — the boot oracle is *not* a secret and *not* hidden:**
 
 - **Offline brute-force.** The boot-time oracle (`/duress-oracle.luks`) is baked into the initramfs (`/boot/initramfs-linux.img`), which lives on the **unencrypted, world-readable `/boot`**. An adversary with disk access can copy it and brute-force the duress passphrase **offline**. Argon2id makes each guess expensive but does not make a weak passphrase safe. **Treat the boot-hook duress passphrase like a real key: high-entropy (a long random phrase), not a short human PIN.** The ≥ 8-char floor is a footgun guard, *not* a security level for the boot hook. (The runtime-side oracle `/etc/duressd/passphrase.luks` is mode `0600` and only exposed to a *running* root, so it is not offline-readable the same way — the initramfs copy is the exposed one.)
-- **No deniability.** The hook and the oracle file are visible to anyone who inspects the initramfs. The boot trigger is a **wipe mechanism, not a hidden feature** — do not rely on an adversary *not knowing* a duress capability exists. If plausible deniability matters, the boot hook does not provide it.
+- **No deniability.** The hook and the oracle file are visible to anyone who inspects the initramfs. The boot trigger is a **wipe mechanism, not a hidden feature** — do not rely on an adversary *not knowing* a duress capability exists. If plausible deniability matters, the boot hook does not provide it. The runtime install is likewise overt (a `duressd` binary, a `duressd.service` unit, `/etc/duressd/`, shell aliases) — none of it is concealed.
+- **Root disk: the boot hook is the thorough eraser, not the runtime trigger.** A runtime trigger (`duressd trigger`, SSH/PAM) reliably **destroys the data** on the root disk (`luksErase`) and removes its partition table, but it **cannot fully scrub the root disk's own `/boot`** (kernels + the initramfs oracle) — a full same-disk overwrite while `/` is live starves I/O and hangs on slow/shared media. So on the **root disk**, a daemon/PAM/SSH trigger may leave `/boot` remnants (including the oracle) past the first 32 MiB; the **boot-hook trigger** (which runs before `/` is mounted) is the mechanism that removes all `/boot` traces. Prefer the boot hook as the primary root-disk trigger. (Non-root/removable disks are fully scrubbed by the runtime trigger.)
+- **UEFI NVRAM: cleared by the runtime path, not the boot hook.** NVRAM boot entries live in firmware, not on disk. The runtime boot-artifact phase deletes them (`efibootmgr`); the initramfs boot hook does **not**, so after a boot-hook wipe, dangling (possibly revealing) NVRAM entries can remain — most firmware prunes entries that point at a wiped ESP on the next boot.
+- **`traces` depth leaves the encrypted region intact.** The default head+tail (`traces`) wipe removes every cleartext OS structure but leaves the encrypted middle as **keyless high-entropy data** — unreadable, but an examiner can still tell that *an encrypted volume of size X existed and was crypto-erased*. That is a deniability limit, not a confidentiality one; use **`--depth full`** to also erase that evidence.
+- **Flash media (SSD/USB) physical remnants.** Wear-leveling and over-provisioning mean a logical overwrite — even `full` depth — can't reach retired/spare NAND cells. This is why `luksErase` (the crypto-erase) is the *guarantee*: any surviving remnant is keyless ciphertext. For belt-and-suspenders on the OS-trace bytes, use firmware ATA Secure Erase / NVMe Format.
 
 ### Secure Boot
 

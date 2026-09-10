@@ -71,6 +71,9 @@ pass "scratch LUKS disk + scoped daemon ready (target: $LOOP, poweroff suppresse
 
 hr "installing the duressd SSH forced-command key (real install-ssh-trigger)"
 ssh-keygen -t ed25519 -N '' -C duress -f "$WORK/duresskey" >/dev/null
+# DURESSD_SELF_BIN pins the forced-command binary to the bare name so the grep +
+# socket-redirect sed below match (the real absolute-path resolution is unit-tested).
+DURESSD_SELF_BIN=duressd \
 bash src/cli install-ssh-trigger --pubkey "$WORK/duresskey.pub" \
     --authorized-keys "$WORK/authorized_keys" >/dev/null 2>&1 \
     || fail "install-ssh-trigger failed"

@@ -71,6 +71,11 @@ case "$name" in
   findmnt)    printf '%s\n' "${STUB_FINDMNT:-}"; exit 0 ;;
   efibootmgr) printf '%s\n' "${STUB_EFIBOOTMGR:-}"; exit 0 ;;
 
+  sshd)
+    # `sshd -T` dumps the effective config; STUB_SSHD_T supplies the line(s).
+    _has -T && printf '%s\n' "${STUB_SSHD_T:-}"
+    exit 0 ;;
+
   systemctl)
     [[ "${args[0]:-}" == is-active ]] && exit "${STUB_SYSTEMCTL_ISACTIVE_RC:-0}"
     exit 0 ;;

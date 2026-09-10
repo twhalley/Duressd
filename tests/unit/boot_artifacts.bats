@@ -83,14 +83,44 @@ teardown() { teardown_stubs; }
     # wipe_parent_tables(), which wipe_real runs LAST, just before poweroff.
     run wipe_parent_tables /dev/sda
     assert_ok
-    # rand_write on the bare parent disk => a dd seek=0 to /dev/sda
+    # rand_write on the bare parent disk => a dd seek=0 to /dev/sda (the HEAD)
     stub_called_with dd "of=/dev/sda "
+}
+
+@test "wipe_parent_tables destroys the BACKUP GPT at the tail, not just the front" {
+    # A GPT has a primary (front) AND a backup (tail) header; blkid reports the
+    # table if either survives. Overwriting only the front left the backup intact.
+    # 128 MiB disk → tail seek = 128 MiB − 4 MiB = 130023424 bytes.
+    export STUB_SIZE=134217728
+    run wipe_parent_tables /dev/sda
+    assert_ok
+    stub_called_with dd "seek=0 count=1"                  # HEAD (rand_write, 4 MiB)
+    stub_called_with dd "oflag=seek_bytes seek=130023424" # TAIL (backup GPT, last 4 MiB)
+}
+
+@test "wipe_parent_tables skips the tail on a tiny (<8 MiB) device (no distinct backup GPT)" {
+    export STUB_SIZE=4194304    # 4 MiB
+    run wipe_parent_tables /dev/sda
+    assert_ok
+    run grep -E '^dd\b.*oflag=seek_bytes' "$DURESSD_STUB_LOG"
+    assert_fail                 # no tail write attempted
 }
 
 @test "UEFI NVRAM is never touched under a scoped (test) run" {
     run wipe_boot_artifacts /dev/sda
     assert_ok
     stub_not_called efibootmgr
+}
+
+@test "UEFI NVRAM: unscoped on an EFI system, every boot entry is deleted" {
+    unset DURESSD_TARGET_DEVICES                       # unscoped = a real run
+    export DURESSD_EFI_DIR="$DURESSD_TESTROOT"          # pretend /sys/firmware/efi exists
+    export STUB_EFIBOOTMGR=$'BootCurrent: 0001\nBoot0000* Linux Boot Manager\nBoot0001* Arch\nBoot0007* USB'
+    run wipe_boot_artifacts /dev/sda
+    assert_ok
+    stub_called_with efibootmgr "-b 0000 -B"
+    stub_called_with efibootmgr "-b 0001 -B"
+    stub_called_with efibootmgr "-b 0007 -B"
 }
 
 @test "wipe_real runs Phase 1.5 when WIPE_BOOT_ARTIFACTS=true" {

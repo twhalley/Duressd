@@ -32,12 +32,14 @@ if [[ -z "$_dir" ]] || [[ ! -d "${_dir}/src" ]]; then
     exec bash "$_src/install.sh" "${1:-install}"
 fi
 
-LIBDIR=/usr/local/lib/duressd
-BINDIR=/usr/local/bin
-UNITDIR=/etc/systemd/system
-CFGDIR=/etc/duressd
-ALIASES=/etc/profile.d/duressd.sh
-FISH_ALIASES=/etc/fish/conf.d/duressd.fish
+# Paths are overridable via env so the unit tests can install into a temp root.
+# In production these are unset → the real system paths apply.
+LIBDIR="${LIBDIR:-/usr/local/lib/duressd}"
+BINDIR="${BINDIR:-/usr/local/bin}"
+UNITDIR="${UNITDIR:-/etc/systemd/system}"
+CFGDIR="${CFGDIR:-/etc/duressd}"
+ALIASES="${ALIASES:-/etc/profile.d/duressd.sh}"
+FISH_ALIASES="${FISH_ALIASES:-/etc/fish/conf.d/duressd.fish}"
 SRC="${_dir}/src"
 SYSTEMD_SRC="${_dir}/systemd"
 
@@ -55,7 +57,23 @@ warn()  { echo -e "${YLW}  ⚠  $*${RST}"; }
 bad()   { echo -e "${RED}  ✘  $*${RST}" >&2; }
 
 require_root() {
+    [[ -n "${DURESSD_SKIP_PRIVCHECK:-}" ]] && return 0   # test seam
     [[ $EUID -eq 0 ]] || { bad "Must be run as root."; exit 1; }
+}
+
+# The daemon is a systemd service. Refuse cleanly on a system without systemd —
+# BEFORE we copy anything — rather than failing half-way through `systemctl`.
+# The systemd runtime dir is the canonical "is systemd the init" signal
+# (overridable for tests via DURESSD_SYSTEMD_DIR).
+require_systemd() {
+    local sd="${DURESSD_SYSTEMD_DIR:-/run/systemd/system}"
+    if ! command -v systemctl >/dev/null 2>&1 || [[ ! -d "$sd" ]]; then
+        bad "duressd's daemon requires systemd — systemctl / a running systemd was not found."
+        warn "This host does not appear to run systemd. The runtime triggers work on"
+        warn "any init, but the packaged service (and this installer) are systemd-only."
+        warn "Install on a systemd host, or wire src/handler up to your init manually."
+        exit 1
+    fi
 }
 
 # Map a binary name to its package name for a given distro family.
@@ -151,11 +169,18 @@ check_deps() {
 
     # ── distro detection ──────────────────────────────────────────────────────
     local id="" id_like="" family="" pm=""
-    if [[ -f /etc/os-release ]]; then
-        # shellcheck source=/dev/null
-        source /etc/os-release
-        id="${ID:-}"
-        id_like="${ID_LIKE:-}"
+    if [[ -r /etc/os-release ]]; then
+        # PARSE, never `source`: sourcing os-release would execute any code in it as
+        # root — inconsistent with the project's parse-don't-source discipline
+        # (handler/pam/build-hook all parse KEY=value). Strip surrounding quotes.
+        local _k _v
+        while IFS='=' read -r _k _v; do
+            _v="${_v%\"}"; _v="${_v#\"}"
+            case "$_k" in
+                ID)      id="$_v" ;;
+                ID_LIKE) id_like="$_v" ;;
+            esac
+        done < /etc/os-release
     fi
 
     # Resolve to a family, checking ID then ID_LIKE (space-separated list)
@@ -224,6 +249,7 @@ check_deps() {
 # ── install ───────────────────────────────────────────────────────────────────
 cmd_install() {
     require_root
+    require_systemd            # abort cleanly on a non-systemd host BEFORE any changes
 
     echo -e "\n${BLD}Installing duressd wipe service${RST}\n"
 
@@ -236,7 +262,7 @@ cmd_install() {
     install -m 0755 "$SRC/handler" "$LIBDIR/handler"
 
     step "Installing CLI to $BINDIR/duressd"
-    install -m 0755 "$SRC/cli" "$BINDIR/duressd"
+    install -Dm0755 "$SRC/cli" "$BINDIR/duressd"
 
     if [[ -d "${_dir}/initramfs" ]]; then
         step "Installing initramfs hook templates to $LIBDIR/initramfs/"
@@ -250,7 +276,7 @@ cmd_install() {
     fi
 
     step "Installing shell aliases to $ALIASES"
-    install -m 0644 "$SRC/aliases.sh" "$ALIASES"
+    install -Dm0644 "$SRC/aliases.sh" "$ALIASES"
 
     if command -v fish &>/dev/null; then
         step "Installing fish aliases to $FISH_ALIASES"
@@ -259,10 +285,14 @@ cmd_install() {
     fi
 
     step "Installing systemd unit"
-    install -m 0644 "$SYSTEMD_SRC/duressd.service" "$UNITDIR/duressd.service"
+    install -Dm0644 "$SYSTEMD_SRC/duressd.service" "$UNITDIR/duressd.service"
 
     step "Creating config directory $CFGDIR/"
-    install -d -m 0700 -o root -g root "$CFGDIR"
+    if [[ $EUID -eq 0 ]]; then
+        install -d -m 0700 -o root -g root "$CFGDIR"
+    else
+        install -d -m 0700 "$CFGDIR"          # test/non-root: skip the root chown
+    fi
 
     step "Enabling and starting duressd.service"
     systemctl daemon-reload
@@ -280,10 +310,39 @@ cmd_install() {
 }
 
 # ── uninstall ─────────────────────────────────────────────────────────────────
+# Securely destroy the Argon2id duress oracle in <cfgdir>: erase the LUKS keyslots
+# (so the KDF material is gone even if the file is later recovered) then shred the
+# file. Best-effort — a missing tool must not abort uninstall.
+secure_erase_oracle() {
+    local oracle="$1/passphrase.luks"
+    [[ -f "$oracle" ]] || return 0
+    step "Erasing Argon2id keyslot container"
+    cryptsetup luksErase --batch-mode "$oracle" 2>/dev/null || true
+    shred -u "$oracle" 2>/dev/null || rm -f "$oracle"
+}
+
 cmd_uninstall() {
     require_root
 
     echo -e "\n${BLD}Uninstalling duressd wipe service${RST}\n"
+
+    # The trigger installers modify system files (initramfs HOOKS, the PAM auth
+    # stack, authorized_keys) that removing the binaries alone would ORPHAN — and
+    # once the CLI below is gone those reversals can't be run. So reverse them
+    # AUTOMATICALLY first, while the CLI still exists (each is a clean no-op if that
+    # trigger was never installed). Skip with DURESSD_KEEP_TRIGGERS=1.
+    local duressd_bin="$BINDIR/duressd"
+    [[ -x "$duressd_bin" ]] || duressd_bin="$(command -v duressd 2>/dev/null || true)"
+    if [[ -n "$duressd_bin" && -x "$duressd_bin" && "${DURESSD_KEEP_TRIGGERS:-}" != 1 ]]; then
+        step "Reversing any installed triggers (boot hook, PAM login, SSH)"
+        "$duressd_bin" install-luks-trigger  --uninstall 2>/dev/null || true
+        "$duressd_bin" install-login-trigger --uninstall 2>/dev/null || true
+        "$duressd_bin" install-ssh-trigger   --uninstall 2>/dev/null || true
+        good "Trigger reversals attempted (no-op for any that weren't installed)"
+    else
+        warn "CLI not found — if you installed any triggers, reverse them manually:"
+        warn "  duressd install-{luks,login,ssh}-trigger --uninstall   (before removing binaries)"
+    fi
 
     step "Stopping and disabling duressd.service"
     systemctl disable --now duressd.service 2>/dev/null || true
@@ -304,12 +363,7 @@ cmd_uninstall() {
         warn "Configuration directory $CFGDIR/ still exists."
         read -rp "  Remove $CFGDIR/ (including any stored passphrase hash)? [y/N]: " ans
         if [[ "$ans" =~ ^[Yy]$ ]]; then
-            # Securely erase the Argon2id keyslot container before deleting
-            if [[ -f "$CFGDIR/passphrase.luks" ]]; then
-                step "Erasing Argon2id keyslot container"
-                cryptsetup luksErase --batch-mode "$CFGDIR/passphrase.luks" 2>/dev/null || true
-                shred -u "$CFGDIR/passphrase.luks" 2>/dev/null || true
-            fi
+            secure_erase_oracle "$CFGDIR"
             rm -rf "$CFGDIR"
             good "Configuration removed"
         else
@@ -363,6 +417,9 @@ cmd_status() {
 }
 
 # ── main ──────────────────────────────────────────────────────────────────────
+# DURESSD_LIB_ONLY=1 sources this file for its functions without running the
+# dispatch (used by the unit tests).
+if [[ "${DURESSD_LIB_ONLY:-}" != 1 ]]; then
 case "${1:-install}" in
     install)   cmd_install ;;
     uninstall) cmd_uninstall ;;
@@ -372,3 +429,4 @@ case "${1:-install}" in
         exit 1
         ;;
 esac
+fi

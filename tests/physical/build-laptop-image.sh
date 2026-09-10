@@ -64,6 +64,15 @@ OUT="${OUT:-$PWD/duressd-laptop.raw}"
 AUTO_UNLOCK="${AUTO_UNLOCK:-0}"
 WIPE_HW="${WIPE_HARDWARE_KEYS:-true}"
 COUNTDOWN="${WIPE_COUNTDOWN:-0}"
+# Boot-hook wipe depth:
+#   header — fastest: luksErase + LUKS header + partition tables (front + backup
+#            GPT). Data instantly unrecoverable + disk unbootable; ESP/boot bytes remain.
+#   traces — default: header + HEAD+TAIL scrub of every non-encrypted region
+#            (GPT/ESP/boot + trailing/backup GPT). All cleartext OS traces gone,
+#            WITHOUT grinding the keyless encrypted data area — fast.
+#   full   — overwrite the entire disk. Slowest; no residual ciphertext.
+BOOT_WIPE_DEPTH="${BOOT_WIPE_DEPTH:-traces}"
+case "$BOOT_WIPE_DEPTH" in header|traces|full) ;; *) echo "BOOT_WIPE_DEPTH must be header|traces|full" >&2; exit 1 ;; esac
 KEYOUT="${OUT}.duress-key"
 
 # Unique dm-crypt mapping name for THIS build, so we never collide with — or
@@ -155,8 +164,19 @@ echo "  →  installing duressd into the image"
 install -Dm755 "$REPO_ROOT/src/handler" "$MNT"/usr/local/lib/duressd/handler
 install -Dm755 "$REPO_ROOT/src/daemon"  "$MNT"/usr/local/lib/duressd/daemon
 install -Dm755 "$REPO_ROOT/src/cli"     "$MNT"/usr/local/bin/duressd
+# PAM login duress hook — shipped so `duressd install-login-trigger` works out of
+# the box (it copies pam-duress from LIBDIR into place). Without this the physical
+# image can't exercise the login/SDDM/lock-screen duress path.
+install -Dm755 "$REPO_ROOT/pam/pam-duress" "$MNT"/usr/local/lib/duressd/pam-duress
 install -Dm644 "$REPO_ROOT/systemd/duressd.service" "$MNT"/etc/systemd/system/duressd.service
 install -Dm644 "$REPO_ROOT/src/aliases.sh"   "$MNT"/etc/profile.d/duressd.sh
+# LUKS-at-boot duress hook: the initramfs BUILD hook (bakes the oracle) + the
+# RUNTIME hook (intercepts the boot passphrase → wipes everything before / mounts).
+# Only takes effect when boot is prompt-based (AUTO_UNLOCK=0, the default); with an
+# embedded keyfile there is no prompt to intercept, so the HOOKS line below leaves
+# `duress` out in that case.
+install -Dm644 "$REPO_ROOT/initramfs/duress-install-hook" "$MNT"/etc/initcpio/install/duress
+install -Dm755 "$REPO_ROOT/initramfs/duress-runtime-hook"  "$MNT"/etc/initcpio/hooks/duress
 
 # Generate the duress SSH keypair on the host so we can hand you the private key.
 echo "  →  generating duress SSH key → $KEYOUT"
@@ -172,16 +192,25 @@ echo "  →  chroot: system config, users, bootloader, duressd config"
 # from the environment inside the chroot (arch-chroot inherits exported vars),
 # so passwords containing $, backticks, etc. can neither break the script nor
 # be injected into it.
-export USERNAME HOSTNAME USER_PASS DURESS_PASS ROOT_UUID CRYPTKEY WIPE_HW COUNTDOWN
+export USERNAME HOSTNAME USER_PASS DURESS_PASS ROOT_UUID CRYPTKEY WIPE_HW COUNTDOWN BOOT_WIPE_DEPTH
 arch-chroot "$MNT" /bin/bash -euo pipefail <<'CHROOT'
 ln -sf /usr/share/zoneinfo/UTC /etc/localtime; hwclock --systohc 2>/dev/null || true
 echo 'en_US.UTF-8 UTF-8' > /etc/locale.gen; locale-gen
 echo 'LANG=en_US.UTF-8' > /etc/locale.conf
 echo "$HOSTNAME" > /etc/hostname
 
-# initramfs with the encrypt hook (+ keyboard/keymap so you can type the passphrase)
-sed -i 's/^HOOKS=.*/HOOKS=(base udev autodetect modconf kms keyboard keymap consolefont block encrypt filesystems fsck)/' /etc/mkinitcpio.conf
-mkinitcpio -P
+# initramfs HOOKS (+ keyboard/keymap so you can type the passphrase). Insert the
+# `duress` hook BEFORE `encrypt` so it intercepts the boot passphrase — but only
+# for prompt-based unlock; an embedded keyfile ($CRYPTKEY set) auto-unlocks with no
+# prompt, so `duress` is omitted there to keep headless boot working.
+if [ -n "$CRYPTKEY" ]; then
+    sed -i 's/^HOOKS=.*/HOOKS=(base udev autodetect modconf kms keyboard keymap consolefont block encrypt filesystems fsck)/' /etc/mkinitcpio.conf
+else
+    sed -i 's/^HOOKS=.*/HOOKS=(base udev autodetect modconf kms keyboard keymap consolefont block duress encrypt filesystems fsck)/' /etc/mkinitcpio.conf
+fi
+# NB: mkinitcpio is deferred to AFTER the duress oracle (/etc/duressd/passphrase.luks)
+# is created below — the `duress` build hook bakes that oracle into the initramfs,
+# so it must exist first.
 
 # standard sudo user + root password; enable wheel sudo
 useradd -m -G wheel -s /bin/bash "$USERNAME"
@@ -191,6 +220,39 @@ sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
 
 # services: network, ssh, duressd
 systemctl enable NetworkManager sshd duressd.service
+
+# Optional: bake a WiFi auto-connect profile so the image comes online on every
+# boot (no manual nmtui). Supplied via the build environment (WIFI_SSID/WIFI_PASS)
+# — NEVER hard-code them here; the PSK lands only in the image's root-only
+# connection file, not in this script or git.
+if [[ -n "${WIFI_SSID:-}" && -n "${WIFI_PASS:-}" ]]; then
+    install -d -m700 /etc/NetworkManager/system-connections
+    # Optional static IP: set WIFI_IP (e.g. 192.168.0.210) + WIFI_GW (default .1)
+    # so every boot lands on the same address; otherwise DHCP.
+    if [[ -n "${WIFI_IP:-}" ]]; then
+        ipv4="method=manual"$'\n'"address1=${WIFI_IP}/24,${WIFI_GW:-192.168.0.1}"$'\n'"dns=${WIFI_GW:-192.168.0.1};"
+    else
+        ipv4="method=auto"
+    fi
+    cat > "/etc/NetworkManager/system-connections/${WIFI_SSID}.nmconnection" <<NMCONN
+[connection]
+id=${WIFI_SSID}
+type=wifi
+autoconnect=true
+[wifi]
+mode=infrastructure
+ssid=${WIFI_SSID}
+[wifi-security]
+key-mgmt=wpa-psk
+psk=${WIFI_PASS}
+[ipv4]
+${ipv4}
+[ipv6]
+method=auto
+NMCONN
+    chmod 600 "/etc/NetworkManager/system-connections/${WIFI_SSID}.nmconnection"
+    echo "  →  baked WiFi auto-connect for SSID '${WIFI_SSID}'${WIFI_IP:+ (static ${WIFI_IP})}"
+fi
 # sshd: allow the user's password login; root only for the forced-command duress key
 sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
 sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin forced-commands-only/' /etc/ssh/sshd_config
@@ -199,13 +261,22 @@ sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin forced-commands-only/' /etc/ssh/
 bootctl --esp-path=/boot install --no-variables
 cat > /boot/loader/loader.conf <<LOADER
 default arch.conf
-timeout 3
+timeout 5
 LOADER
 cat > /boot/loader/entries/arch.conf <<ENTRY
 title Arch (duressd test)
 linux /vmlinuz-linux
 initrd /initramfs-linux.img
 options cryptdevice=UUID=${ROOT_UUID}:root root=/dev/mapper/root rw $CRYPTKEY
+ENTRY
+# A second entry with duressd.dryrun so the boot-hook DRY RUN can be demonstrated
+# at the menu (no manual cmdline editing): the duress passphrase previews in green
+# and boots normally; the default entry above does the real wipe.
+cat > /boot/loader/entries/arch-dryrun.conf <<ENTRY
+title Arch (duressd DRY-RUN - duress passphrase previews, wipes NOTHING)
+linux /vmlinuz-linux
+initrd /initramfs-linux.img
+options cryptdevice=UUID=${ROOT_UUID}:root root=/dev/mapper/root rw $CRYPTKEY duressd.dryrun
 ENTRY
 
 # pre-configure duressd (custom passphrase, boot-artifact wipe on)
@@ -214,6 +285,7 @@ dd if=/dev/zero of=/etc/duressd/passphrase.luks bs=1M count=24 status=none
 chmod 0600 /etc/duressd/passphrase.luks
 printf '%s' "$DURESS_PASS" | cryptsetup luksFormat --type luks2 --batch-mode \
     --pbkdf argon2id --key-file=- /etc/duressd/passphrase.luks
+
 cat > /etc/duressd/config <<CFG
 CONFIGURED=true
 PASSWORD_TYPE=custom
@@ -223,8 +295,14 @@ WIPE_FULL_DEVICE=false
 WIPE_BOOT_ARTIFACTS=true
 WIPE_HARDWARE_KEYS=$WIPE_HW
 WIPE_COUNTDOWN=$COUNTDOWN
+BOOT_WIPE_DEPTH=$BOOT_WIPE_DEPTH
 CFG
 chmod 0600 /etc/duressd/config
+
+# Build the initramfs LAST — the oracle AND the config (which the `duress` build
+# hook reads for BOOT_WIPE_DEPTH) both exist now, so the hook bakes them both in.
+# (HOOKS was set earlier; mkinitcpio was deferred to here on purpose.)
+mkinitcpio -P
 CHROOT
 
 # Kill any keyring daemons pacstrap left holding the mount, sync, then unmount

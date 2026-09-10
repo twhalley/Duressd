@@ -6,6 +6,10 @@ load '../lib/common'
 setup() {
     setup_stubs
     load_cli
+    # Pin the forced-command binary so assertions are deterministic regardless of
+    # whether a real duressd is installed on the test host (the SSH forced command
+    # now embeds an ABSOLUTE path; _duressd_bin honours this override).
+    export DURESSD_SELF_BIN=duressd
     # Capture what the CLI would send over the socket instead of hitting socat.
     SENT="$(mktemp)"
     send_cmd() { printf 'SENT\t%s\n' "$*" >> "$SENT"; }
@@ -119,5 +123,92 @@ expect_b64() { printf '%s' "$1" | base64 -w0; }
     printf '%s\n%s\n' "embedpass" "embedpass" \
         | cmd_install_ssh_trigger --embed-passphrase --pubkey "$pub" --authorized-keys "$ak"
     [ "$(stat -c %a "$DURESSD_CFGDIR/ssh-trigger.pass")" = "600" ]
+    rm -f "$pub"
+}
+
+# ── uninstall ─────────────────────────────────────────────────────────────────
+@test "install then --uninstall removes the forced-command entry, keeps other keys" {
+    pub="$(mktemp)"; echo "ssh-ed25519 AAAAFAKEKEY duressd-test" > "$pub"
+    ak="$DURESSD_TESTROOT/authorized_keys"
+    install -d "$(dirname "$ak")"
+    echo 'ssh-ed25519 AAAANORMALKEY my-laptop' > "$ak"      # a pre-existing normal key
+    cmd_install_ssh_trigger --pubkey "$pub" --authorized-keys "$ak" >/dev/null 2>&1
+    grep -q 'command="duressd trigger-remote' "$ak"          # sanity: added
+    run cmd_install_ssh_trigger --uninstall --authorized-keys "$ak"
+    assert_ok
+    run grep -c 'duressd trigger-remote' "$ak"
+    assert_output_contains "0"                               # forced-command line gone
+    grep -q 'AAAANORMALKEY' "$ak"                            # the normal key survives
+    rm -f "$pub"
+}
+
+@test "ssh --uninstall securely erases the embedded passphrase file" {
+    ak="$DURESSD_TESTROOT/authorized_keys"; : > "$ak"
+    install -d "$DURESSD_CFGDIR"
+    printf 'topsecret' > "$DURESSD_CFGDIR/ssh-trigger.pass"
+    run cmd_install_ssh_trigger --uninstall --authorized-keys "$ak"
+    assert_ok
+    # secure erase: shred -u on the passfile (the stub records but doesn't unlink)
+    stub_called_with shred "-u $DURESSD_CFGDIR/ssh-trigger.pass"
+}
+
+@test "ssh --uninstall is idempotent (no entry → clean no-op)" {
+    ak="$DURESSD_TESTROOT/authorized_keys"
+    echo 'ssh-ed25519 AAAANORMALKEY only-normal' > "$ak"
+    run cmd_install_ssh_trigger --uninstall --authorized-keys "$ak"
+    assert_ok
+    assert_output_contains "nothing to remove"
+    grep -q 'AAAANORMALKEY' "$ak"
+}
+
+# ── regressions from the security audit ───────────────────────────────────────
+@test "forced command embeds an ABSOLUTE duressd path (sshd's minimal PATH)" {
+    # Regression: sshd runs forced commands with a PATH excluding /usr/local/bin,
+    # so a bare "duressd" is not found and the kill switch silently no-ops.
+    export DURESSD_SELF_BIN=/usr/local/bin/duressd
+    pub="$(mktemp)"; echo "ssh-ed25519 AAAAABS duressd-test" > "$pub"
+    ak="$DURESSD_TESTROOT/authorized_keys"
+    run cmd_install_ssh_trigger --pubkey "$pub" --authorized-keys "$ak"
+    assert_ok
+    run cat "$ak"
+    assert_output_contains 'command="/usr/local/bin/duressd trigger-remote",restrict'
+    # uninstall still matches the absolute-path form
+    run cmd_install_ssh_trigger --uninstall --authorized-keys "$ak"
+    assert_ok
+    run grep -c 'trigger-remote' "$ak"
+    assert_output_contains "0"
+    rm -f "$pub"
+}
+
+@test "install-ssh-trigger REJECTS a multi-key --pubkey file (no unrestricted key leak)" {
+    pub="$(mktemp)"
+    printf '%s\n%s\n' 'ssh-ed25519 AAAAKEYONE first' 'ssh-ed25519 AAAAKEYTWO second-UNRESTRICTED' > "$pub"
+    ak="$DURESSD_TESTROOT/authorized_keys"
+    run cmd_install_ssh_trigger --pubkey "$pub" --authorized-keys "$ak"
+    assert_fail
+    assert_output_contains "exactly one public key"
+    [ ! -s "$ak" ] || ! grep -q 'second-UNRESTRICTED' "$ak"   # the raw 2nd key never landed
+    rm -f "$pub"
+}
+
+@test "install-ssh-trigger is idempotent: re-run does NOT duplicate the forced-command line" {
+    pub="$(mktemp)"; echo "ssh-ed25519 AAAAIDEM duressd-test" > "$pub"
+    ak="$DURESSD_TESTROOT/authorized_keys"
+    cmd_install_ssh_trigger --pubkey "$pub" --authorized-keys "$ak" >/dev/null 2>&1
+    cmd_install_ssh_trigger --pubkey "$pub" --authorized-keys "$ak" >/dev/null 2>&1
+    run grep -c 'trigger-remote' "$ak"
+    assert_output_contains "1"    # exactly one, not two
+    rm -f "$pub"
+}
+
+@test "--tor REFUSES when SSH password auth is on (would expose the whole sshd)" {
+    export DURESSD_SSHD_PASSWORD_AUTH=yes
+    export DURESSD_TOR_HSDIR="$DURESSD_TESTROOT/hs" DURESSD_TORRC="$DURESSD_TESTROOT/torrc" \
+           DURESSD_NO_TOR_RESTART=1
+    pub="$(mktemp)"; echo "ssh-ed25519 AAAATOR duressd-test" > "$pub"
+    run cmd_install_ssh_trigger --pubkey "$pub" --authorized-keys "$DURESSD_TESTROOT/ak" --tor
+    assert_fail
+    assert_output_contains "PasswordAuthentication is ON"
+    [ ! -f "$DURESSD_TORRC" ] || ! grep -q HiddenServiceDir "$DURESSD_TORRC"   # no onion configured
     rm -f "$pub"
 }

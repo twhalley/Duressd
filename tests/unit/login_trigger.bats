@@ -83,3 +83,28 @@ teardown() { teardown_stubs; }
     run cat "$DURESSD_PAM_FILE"
     assert_output_contains "auth optional pam_exec.so expose_authtok quiet"
 }
+
+# ── uninstall ─────────────────────────────────────────────────────────────────
+@test "install then --uninstall removes the pam_exec line + script, leaving the stack intact" {
+    : > "$DURESSD_CFGDIR/passphrase.luks"
+    install -Dm755 "$REPO_ROOT/pam/pam-duress" "$DURESSD_LIBDIR/pam-duress" 2>/dev/null || \
+        install -d "$DURESSD_LIBDIR"
+    orig="$(cat "$DURESSD_PAM_FILE")"
+    cmd_install_login_trigger            >/dev/null 2>&1   # adds the hook line
+    grep -q pam_exec.so "$DURESSD_PAM_FILE"                # sanity: it's in
+    run cmd_install_login_trigger --uninstall
+    assert_ok
+    run grep -c pam_exec.so "$DURESSD_PAM_FILE"
+    assert_output_contains "0"                             # hook line gone
+    grep -q 'pam_unix.so' "$DURESSD_PAM_FILE"              # the real authenticator remains
+    [ ! -e "$DURESSD_LIBDIR/pam-duress" ]                  # script removed
+    [ "$(cat "$DURESSD_PAM_FILE")" = "$orig" ]             # stack back to original
+}
+
+@test "login --uninstall is idempotent (no hook line → clean no-op)" {
+    printf 'auth required pam_unix.so\n' > "$DURESSD_PAM_FILE"
+    run cmd_install_login_trigger --uninstall
+    assert_ok
+    assert_output_contains "nothing to remove"
+    grep -q 'pam_unix.so' "$DURESSD_PAM_FILE"
+}

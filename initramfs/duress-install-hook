@@ -11,13 +11,38 @@ build() {
     add_binary stty
 
     # The Argon2id duress-passphrase oracle (same container the daemon uses).
-    local oracle="${DURESSD_CFGDIR:-/etc/duressd}/passphrase.luks"
+    local cfgdir="${DURESSD_CFGDIR:-/etc/duressd}"
+    local oracle="$cfgdir/passphrase.luks"
     if [[ -f "$oracle" ]]; then
         add_file "$oracle" /duress-oracle.luks
     else
-        error "duress: $oracle not found — configure a custom duress passphrase first"
-        return 1
+        # Fail SAFE — do NOT error/return 1: a missing oracle must never abort
+        # initramfs generation (that would block kernel updates and leave the box
+        # with no initramfs). Warn and skip baking the hook; with no oracle the
+        # runtime hook would self-disable at boot anyway. Arm it by running
+        # `duressd configure` (custom passphrase) and rebuilding the initramfs.
+        warning "duress: $oracle not found — boot duress trigger NOT armed (run 'duressd configure' with a custom passphrase, then rebuild the initramfs)"
+        return 0
     fi
+
+    # Boot-wipe depth, baked in for the runtime hook (root isn't mounted at boot, so
+    # it can't read the config then). BOOT_WIPE_DEPTH from the config:
+    #   header — luksErase + LUKS header + partition tables (fast; data unrecoverable)
+    #   traces — + head+tail scrub of every non-encrypted region (default; no trace, fast)
+    #   full   — overwrite the whole disk (slowest)
+    local depth="traces" line
+    if [[ -f "$cfgdir/config" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            case "$line" in
+                BOOT_WIPE_DEPTH=header|BOOT_WIPE_DEPTH=fast)  depth=header ;;
+                BOOT_WIPE_DEPTH=traces)                        depth=traces ;;
+                BOOT_WIPE_DEPTH=full)                          depth=full ;;
+            esac
+        done < "$cfgdir/config"
+    fi
+    local tmp; tmp="$(mktemp)"; printf '%s\n' "$depth" > "$tmp"
+    add_file "$tmp" /duress-wipe-depth
+    rm -f "$tmp"
 
     add_runscript
 }

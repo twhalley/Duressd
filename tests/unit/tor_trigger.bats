@@ -14,6 +14,12 @@ setup() {
            DURESSD_TORRC="$DURESSD_TESTROOT/torrc" \
            DURESSD_CFGDIR="$DURESSD_TESTROOT/cfg" \
            DURESSD_SSH_PORT=2222 DURESSD_TOR_USER="" DURESSD_NO_TOR_RESTART=1
+    # --tor now refuses when SSH password auth is on (it exposes the whole sshd);
+    # the realistic precondition for using --tor is password auth OFF.
+    export DURESSD_SSHD_PASSWORD_AUTH=no
+    # Pin the forced-command binary so the "command=..." assertion is deterministic
+    # whether or not a real duressd is installed (in the VM it IS → absolute path).
+    export DURESSD_SELF_BIN=duressd
     PUB="$(mktemp)"; echo "ssh-ed25519 AAAAFAKEKEY duress" > "$PUB"
 }
 teardown() { rm -f "${PUB:-}"; teardown_stubs; }
